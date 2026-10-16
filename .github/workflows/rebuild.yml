@@ -1,0 +1,87 @@
+name: Rebuild
+on:
+  workflow_dispatch:
+    inputs:
+      dl:
+        description: Artifact URL template; empty for the default
+        type: string
+        default: ""
+      ansible_core_ref:
+        description: An ansible-core tag or branch to re-extract ansible.builtin from; empty to keep it
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    name: rebuild
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: r2
+    permissions:
+      contents: read
+      actions: write  # to pause the sync schedule
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+    # The release to run, not main: see "Releases" in docs/sync.md.
+    - name: Check the release
+      env:
+        REF: ${{ vars.GALAXY_SYNC_REF }}
+      run: |
+        if [ -z "$REF" ]; then
+          echo "::error::set the GALAXY_SYNC_REF repository variable to the tag to run"
+          exit 1
+        fi
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        ref: ${{ vars.GALAXY_SYNC_REF }}
+        persist-credentials: false
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      if: inputs.ansible_core_ref != ''
+      with:
+        repository: ansible/ansible
+        ref: ${{ inputs.ansible_core_ref }}
+        path: ansible-core
+        persist-credentials: false
+
+    - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+
+    # A rebuild can't share the sync's concurrency group: a scheduled sync
+    # would replace it while it waited. So it pauses the schedule instead and
+    # waits for any sync still running.
+    - name: Pause syncs
+      run: |
+        gh workflow disable sync.yml --repo "$GITHUB_REPOSITORY"
+        while [ -n "$(gh run list --repo "$GITHUB_REPOSITORY" --workflow sync.yml --json status \
+            --jq '.[] | select(.status != "completed") | .status')" ]; do
+          sleep 30
+        done
+
+    - name: Rebuild
+      run: |
+        args=()
+        if [ -n "$DL" ]; then
+          args+=(--dl "$DL")
+        fi
+        if [ -d ansible-core ]; then
+          args+=(--builtin ansible-core)
+        fi
+        uv run --locked galaxy-sync rebuild --r2 "${args[@]}"
+      env:
+        DL: ${{ inputs.dl }}
+        R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        ALAI_INDEX_BUCKET: ${{ vars.ALAI_INDEX_BUCKET }}
+        ALAI_DL_BUCKET: ${{ vars.ALAI_DL_BUCKET }}
+        ALAI_GALAXY_BUCKET: ${{ vars.ALAI_GALAXY_BUCKET }}
+        ALAI_STATE_BUCKET: ${{ vars.ALAI_STATE_BUCKET }}
+
+    - name: Resume syncs
+      if: always()
+      run: gh workflow enable sync.yml --repo "$GITHUB_REPOSITORY"

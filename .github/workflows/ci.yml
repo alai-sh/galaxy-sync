@@ -1,0 +1,61 @@
+name: Test galaxy-sync
+on:
+  push:
+    branches:
+    - main
+
+  pull_request:
+    branches:
+    - main
+
+# Jobs get a read-only token unless they ask for more.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  sanity:
+    name: run sanity checks
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        persist-credentials: false
+
+    - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+
+    - name: Run sanity tests
+      run: uv run tox run -e sanity
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        persist-credentials: false
+
+    - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+
+    # Tests talk to a local mock of Galaxy and never reach the network or R2.
+    - name: Test
+      run: uv run tox run -e py315-tests
+      env:
+        PYTEST_ADDOPTS: --color=yes --junitxml junit/test-results.xml
+
+    - name: Upload Test Results
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+      with:
+        name: Unit Test Results
+        path: ./junit/test-results.xml
+
+    - name: Upload Coverage Results
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+      with:
+        name: Coverage Results
+        path: ./coverage.xml

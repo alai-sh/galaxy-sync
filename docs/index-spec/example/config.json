@@ -1,0 +1,11 @@
+{
+  "formats": {
+    "1": {
+      "index": "index/",
+      "collections": "collections.json",
+      "plugins": "plugins.jsonl"
+    }
+  },
+  "dl": "https://dl.alai.sh/sha256/{sha256-prefix}/{sha256-checksum}.tar.gz",
+  "moved-to": null
+}

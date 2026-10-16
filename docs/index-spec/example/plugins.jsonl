@@ -1,0 +1,7 @@
+{"v":1,"type":"module","name":"thing","collection":"alai_example.demo","since":"0.1.0","short_description":"Manage things"}
+{"v":1,"type":"module","name":"old_thing","collection":"alai_example.demo","since":"0.1.0","until":"0.2.0","routing":{"redirect":"alai_example.demo.thing"}}
+{"v":1,"type":"filter","name":"to_seconds","collection":"alai_example.demo","since":"0.1.0","short_description":"Convert a duration string to seconds"}
+{"v":1,"type":"filter","name":"to_minutes","collection":"alai_example.demo","since":"0.2.0","short_description":"Convert a duration string to minutes"}
+{"v":1,"type":"lookup","name":"legacy","collection":"alai_example.demo","since":"0.1.0","until":"0.2.0","routing":{"tombstone":{"removal_version":"0.2.0","warning_text":"Use the alai_example.demo.thing module instead."}}}
+{"v":1,"type":"role","name":"setup","collection":"alai_example.demo","since":"0.2.0","short_description":"Install and configure the demo service"}
+{"v":1,"type":"playbook","name":"site","collection":"alai_example.demo","since":"0.2.0"}

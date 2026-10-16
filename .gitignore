@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+out/
+.pytest_cache/
+.env
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+coverage.xml
+junit/
+dist/
+notes/

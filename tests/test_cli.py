@@ -1,0 +1,555 @@
+import json
+import re
+
+import pytest
+from helpers import DETAIL, FEED, LISTING, REPO_METADATA, UNAVAILABLE, tarball
+
+from galaxy_sync import cli
+from galaxy_sync import store as store_mod
+from galaxy_sync.storage import Buckets, LocalBackend
+from galaxy_sync.store import DEFAULT_DL, Store
+
+
+@pytest.fixture
+def run(galaxy, tmp_path, monkeypatch):
+    # Retries in the CLI's client back off for real; the tests don't wait.
+    monkeypatch.setattr(cli.GalaxyClient, "__init__", _fast_client(cli.GalaxyClient.__init__))
+
+    def run(command, *args):
+        options = ["--store", str(tmp_path)]
+        if command == "sync":
+            options += ["--galaxy-url", galaxy.url]
+        return cli.main([command, *options, *args])
+
+    return run
+
+
+@pytest.fixture
+def refresh(run):
+    """`refresh`, then the `sync` that carries it out."""
+
+    def refresh(*args, sync=()):
+        assert run("refresh", *args) == 0
+        return run("sync", *sync)
+
+    return refresh
+
+
+def _fast_client(init):
+    def wrapped(self, base_url, **kwargs):
+        init(self, base_url, **{**kwargs, "backoff": 0, "retries": 2})
+
+    return wrapped
+
+
+def index_file(tmp_path, name):
+    return (tmp_path / "index-root" / name).read_text()
+
+
+def test_sync_writes_the_index(galaxy, run, tmp_path, capsys, refresh):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    assert refresh("ns.coll") == 0
+    out = capsys.readouterr().out
+    assert "ns.coll: +1" in out
+    assert "failures: 0 outstanding" in out
+
+    config = json.loads(index_file(tmp_path, "config.json"))
+    assert config["dl"] == DEFAULT_DL
+    assert config["formats"]["1"]["plugins"] == "plugins.jsonl"
+    collections = json.loads(index_file(tmp_path, "collections.json"))
+    assert list(collections["namespaces"]) == ["ns"]
+    assert "updated" in collections["namespaces"]["ns"]["coll"]
+    assert json.loads(index_file(tmp_path, "plugins.jsonl")) == {
+        "v": 1,
+        "type": "module",
+        "name": "thing",
+        "collection": "ns.coll",
+        "since": "1.0.0",
+        "short_description": "A thing",
+    }
+    assert (tmp_path / "index-root" / "index" / "ns" / "coll.jsonl").is_file()
+    assert len(list((tmp_path / "dl-root" / "sha256").rglob("*.tar.gz"))) == 1
+
+
+def _plugin_collections(tmp_path):
+    return sorted(json.loads(line)["collection"] for line in index_file(tmp_path, "plugins.jsonl").splitlines())
+
+
+def test_plugins_jsonl_is_patched(galaxy, tmp_path, run):
+    galaxy.add_collection("ns", "one", ["1.0.0"])
+    galaxy.add_collection("ns", "two", ["1.0.0"])
+    assert run("sync") == 0
+    assert _plugin_collections(tmp_path) == ["ns.one", "ns.two"]
+    one = tmp_path / "state" / "plugins" / "ns" / "one.jsonl"
+    assert json.loads(one.read_text())["name"] == "thing"
+
+    # The next run merges only what it reconciled, keeping the rest as is.
+    one.unlink()
+    galaxy.add_collection("ns", "two", ["1.0.0", "1.1.0"])
+    assert run("refresh", "ns.two") == 0
+    assert run("sync") == 0
+    assert _plugin_collections(tmp_path) == ["ns.one", "ns.two"]
+    assert "plugins_pending" not in Store(Buckets.local(tmp_path)).state
+
+    # rebuild makes every collection's plugin lines again from its extractions.
+    (tmp_path / "index-root" / "plugins.jsonl").unlink()
+    assert run("rebuild") == 0
+    assert one.is_file()
+    assert _plugin_collections(tmp_path) == ["ns.one", "ns.two"]
+
+
+def test_plugins_merge_after_a_stopped_run(galaxy, tmp_path, run):
+    galaxy.add_collection("ns", "one", ["1.0.0"])
+    assert run("sync") == 0
+    # As if a run had stopped after reconciling ns.one, before merging it.
+    store = Store(Buckets.local(tmp_path))
+    store.state["plugins_pending"] = ["ns.one"]
+    store.save_state()
+    (tmp_path / "index-root" / "plugins.jsonl").write_text("")
+    galaxy.add_collection("ns", "two", ["1.0.0"])
+    assert run("refresh", "ns.two") == 0
+    assert run("sync") == 0
+    assert _plugin_collections(tmp_path) == ["ns.one", "ns.two"]
+
+
+def test_sync_reports_each_kind_of_change(galaxy, run, tmp_path, capsys, refresh):
+    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
+    assert refresh("ns.coll") == 0
+
+    store = Store(Buckets.local(tmp_path), "")
+    (line, _) = store.read_index("ns", "coll")
+    store.save_extraction(line["cksum"], {"format": 0, "plugins": [], "routing": {}})
+    galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})
+    capsys.readouterr()
+    assert refresh("--revalidate", "ns.coll") == 0
+    out = capsys.readouterr().out
+    assert "ns.coll: +0 yanked 1.1.0 CONFLICT 1.0.0 re-extracted 1.0.0\n" in out
+    assert "1 conflicts to inspect" in out
+
+    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
+    assert refresh("ns.coll", sync=["--strict"]) == 1
+    assert "unyanked 1.1.0" in capsys.readouterr().out
+
+
+def test_failures_are_recorded_and_retried(galaxy, run, tmp_path, capsys, refresh):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    good = galaxy.routes[DETAIL.format("1.0.0")]
+    galaxy.routes[DETAIL.format("1.0.0")] = UNAVAILABLE
+    galaxy.routes["/api/v3/collections/ns/broken/"] = (403, b"", {})
+
+    assert refresh("ns.coll", "ns.broken") == 0
+    captured = capsys.readouterr()
+    assert "ns.coll: +0 1 errors" in captured.out
+    assert "ns.broken: FAILED" in captured.err
+    assert "failures: 2 outstanding, 2 new" in captured.out
+    failures = json.loads((tmp_path / "state" / "failures.json").read_text())
+    assert {(f["collection"], f["kind"]) for f in failures["outstanding"]} == {
+        ("ns.coll", "galaxy_unavailable"),
+        ("ns.broken", "galaxy_http_403"),
+    }
+    # The scheduled sync retries outstanding failures.
+    galaxy.routes[DETAIL.format("1.0.0")] = good
+    galaxy.add_collection("ns", "broken", [])
+    capsys.readouterr()
+    assert run("sync", "--strict") == 0
+    assert "failures: 0 outstanding, 0 new, 2 resolved" in capsys.readouterr().out
+
+
+def test_unexpected_errors_are_recorded(galaxy, run, capsys, monkeypatch, refresh):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+
+    def boom(*args, **kwargs):
+        raise KeyError("surprise")
+
+    monkeypatch.setattr(cli, "reconcile", boom)
+    assert refresh("ns.coll") == 0
+    assert "FAILED unexpectedly (KeyError: 'surprise')" in capsys.readouterr().err
+    assert run("sync", "--strict") == 1
+
+
+def test_sync_namespace(galaxy, run, capsys, refresh):
+    galaxy.json(
+        "/api/v3/plugin/ansible/content/published/collections/index/?limit=100&namespace=ns",
+        {"data": [{"namespace": "ns", "name": "coll"}], "links": {"next": None}},
+    )
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    assert refresh("ns") == 0
+    assert "ns.coll: +1" in capsys.readouterr().out
+
+
+def test_sync_retries_failures_and_reads_nothing_on_failure(galaxy, run, tmp_path, capsys):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    assert run("sync") == 0  # sets the cursor and timestamp
+
+    # Nothing changed and no failures: one request, no files rewritten.
+    collections = tmp_path / "index-root" / "collections.json"
+    before = collections.stat().st_mtime_ns
+    galaxy.requests.clear()
+    assert run("sync") == 0
+    assert galaxy.requests == [REPO_METADATA]
+    assert collections.stat().st_mtime_ns == before
+
+    # Outstanding failures are retried even when the repo hasn't changed.
+    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
+    good = galaxy.routes[DETAIL.format("1.1.0")]
+    galaxy.routes[DETAIL.format("1.1.0")] = UNAVAILABLE
+    assert run("sync") == 0
+    galaxy.routes[DETAIL.format("1.1.0")] = good
+    capsys.readouterr()
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert "hasn't changed" in out
+    assert "retrying 1 collections with outstanding failures" in out
+    assert "failures: 0 outstanding" in out
+
+    # If neither the feed nor the listing can be read, nothing is reconciled
+    # and nothing is saved, so the next run looks again.
+    galaxy.add_collection("ns", "new", ["1.0.0"])
+    galaxy.routes[FEED] = UNAVAILABLE
+    galaxy.routes[LISTING] = UNAVAILABLE
+    state = json.loads((tmp_path / "state" / "state.json").read_text())
+    assert run("sync") == 0
+    assert "sync failed" in capsys.readouterr().err
+    after = json.loads((tmp_path / "state" / "state.json").read_text())
+    assert (after["feed_cursor"], after["repo_published"]) == (state["feed_cursor"], state["repo_published"])
+    assert sorted((f["collection"], f["version"]) for f in after["failures"].values()) == [
+        ("*", "feed"),
+        ("*", "listing"),
+    ]
+
+
+def _module(path, name, version_added):
+    doc = f"module: {name}\\nshort_description: The {name} module\\n"
+    if version_added is not None:
+        doc += f"version_added: {version_added}\\n"
+    (path / f"{name}.py").write_text(f'DOCUMENTATION = "{doc}"\n')
+
+
+def test_rebuild_builtin(run, tmp_path, capsys):
+    src = tmp_path / "ansible"
+    modules = src / "lib" / "ansible" / "modules"
+    modules.mkdir(parents=True)
+    _module(modules, "ping", "historical")
+    _module(modules, "pong", '\\"2.15\\"')
+    _module(modules, "unquoted", "2.18")  # YAML reads this as a number
+    _module(modules, "undated", None)
+    (src / "lib" / "ansible" / "plugins" / "filter").mkdir(parents=True)
+    (src / "lib" / "ansible" / "plugins" / "filter" / "odd.py").write_text("x = 1\n")
+    (src / "lib" / "ansible" / "config").mkdir(parents=True)
+    (src / "lib" / "ansible" / "config" / "ansible_builtin_runtime.yml").write_text(
+        "plugin_routing:\n  modules:\n    gone:\n      tombstone:\n        removal_version: '2.10'\n"
+    )
+    (src / "lib" / "ansible" / "release.py").write_text("__version__ = '2.20.0'\n")
+    store_dir = tmp_path / "store"
+    assert cli.main(["rebuild", "--store", str(store_dir), "--builtin", str(src)]) == 0
+    out = capsys.readouterr().out
+    assert "ansible.builtin 2.20.0: 4 entries {'module': 4}, 2 with version_added, 1 routing-only" in out
+    assert "unresolved filter/test files: ['plugins/filter/odd.py']" in out
+    assert "rebuilt 0 collections (5 plugin lines)" in out
+
+    # `since` is each plugin's version_added, not the release extracted.
+    Store(Buckets.local(store_dir), "").write_plugins()
+    lines = {
+        line["name"]: line
+        for line in map(json.loads, (store_dir / "index-root" / "plugins.jsonl").read_text().splitlines())
+    }
+    assert {name: line.get("since") for name, line in lines.items()} == {
+        "gone": None,
+        "ping": None,
+        "pong": "2.15",
+        "undated": None,
+        "unquoted": "2.18",
+    }
+    assert lines["pong"]["short_description"] == "The pong module"
+    assert lines["gone"]["routing"] == {"tombstone": {"removal_version": "2.10"}}
+    assert all(line["collection"] == "ansible.builtin" and "until" not in line for line in lines.values())
+
+
+def test_usage_errors(run, tmp_path, capsys, monkeypatch):
+    with pytest.raises(SystemExit) as e:
+        run("rebuild", "--builtin", str(tmp_path / "missing.tar.gz"))
+    assert e.value.code == 2
+    assert "can't extract" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit):
+        run("refresh", "--revalidate")
+    assert "--revalidate needs NS or NS.NAME targets" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit):
+        run("refresh", "Bad.Name")
+    assert "invalid collection name Bad.Name" in capsys.readouterr().err
+
+    for var in ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID"):
+        monkeypatch.delenv(var, raising=False)
+    with pytest.raises(SystemExit):
+        cli.main(["sync", "--r2"])
+    assert "R2 storage needs these environment variables set: R2_ACCOUNT_ID" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit):
+        cli.main(["sync", "--r2", "--store", "x"])
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_verbose_logging(run):
+    assert run("sync", "-v", "--dry-run") == 0
+
+
+def test_sync(galaxy, run, tmp_path, capsys, refresh):
+    galaxy.add_collection("ns", "coll", ["1.0.0", "2.0.0"])
+    assert run("sync", "--dry-run") == 0
+    assert "1 collections new or changed (from the upload feed and listing)\n  ns.coll\n" in capsys.readouterr().out
+    assert not (tmp_path / "index-root").exists()
+
+    assert run("sync") == 0
+    assert "ns.coll: +2" in capsys.readouterr().out
+    assert (
+        tmp_path / "galaxy-root" / "api" / "v3" / "collections" / "ns" / "coll" / "versions" / "index.html"
+    ).is_file()
+    assert json.loads((tmp_path / "galaxy-root" / "index.html").read_text())["available_versions"] == {"v3": "api/v3/"}
+    state = json.loads((tmp_path / "state" / "state.json").read_text())
+    assert state["feed_cursor"] == galaxy.uploaded[("ns", "coll", "2.0.0")]
+
+    assert state["repo_published"] == "2026-04-01T00:00:01.000000Z"
+
+    # Nothing changed: one request, and no count check.
+    galaxy.requests.clear()
+    assert run("sync") == 0
+    assert "the published repo hasn't changed since 2026-04-01T00:00:01.000000Z" in capsys.readouterr().out
+    assert galaxy.requests == [REPO_METADATA]
+
+    # A backport comes from the feed alone.
+    galaxy.add_collection("ns", "coll", ["1.0.0", "2.0.0", "1.1.0"])
+    galaxy.requests.clear()
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert "(from the upload feed)" in out
+    assert "ns.coll: +1" in out
+    assert not any("collections/index/" in r for r in galaxy.requests)
+
+    # Deleting a version below the highest only shows in the count.
+    galaxy.add_collection("ns", "coll", ["1.0.0", "2.0.0"])
+    assert run("sync") == 0
+    assert "1 versions are gone from Galaxy but not yet yanked; the next sweep finds them" in capsys.readouterr().out
+    state = json.loads((tmp_path / "state" / "state.json").read_text())
+    assert [f["kind"] for f in state["failures"].values()] == ["deletions_suspected"]
+
+    assert refresh() == 0
+    out = capsys.readouterr().out
+    assert "reconciling 1 collections" in out
+    assert "ns.coll: +0 yanked 1.1.0" in out
+    assert "failures: 0 outstanding" in out
+
+
+def test_rebuild(galaxy, run, tmp_path, capsys, refresh):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    assert refresh("ns.coll") == 0
+    config_file = tmp_path / "index-root" / "config.json"
+    pages = tmp_path / "galaxy-root" / "api" / "v3" / "collections" / "ns" / "coll" / "versions"
+
+    def urls():
+        """config.json's template and every Galaxy page's download URL."""
+        return json.loads(config_file.read_text())["dl"], {
+            json.loads(page.read_text())["download_url"].split("/")[2] for page in pages.glob("*/index.html")
+        }
+
+    assert urls() == (DEFAULT_DL, {"dl.alai.sh"})
+
+    # rebuild --dl moves every URL at once, and later runs keep it.
+    assert run("rebuild", "--dl", "https://moved.example/{sha256-checksum}") == 0
+    assert "rebuilt 1 collections (1 plugin lines)" in capsys.readouterr().out
+    assert urls() == ("https://moved.example/{sha256-checksum}", {"moved.example"})
+    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
+    assert refresh("ns.coll") == 0
+    assert run("sync") == 0
+    assert urls() == ("https://moved.example/{sha256-checksum}", {"moved.example"})
+
+    # A plain rebuild resets it.
+    assert run("rebuild") == 0
+    assert urls() == (DEFAULT_DL, {"dl.alai.sh"})
+
+
+def state(tmp_path):
+    return json.loads((tmp_path / "state" / "state.json").read_text())
+
+
+def test_refresh(galaxy, run, tmp_path, capsys, refresh):
+    galaxy.add_collection("ns", "a", ["1.0.0", "1.1.0", "2.0.0"])
+    galaxy.add_collection("ns", "b", ["1.0.0"])
+    assert run("sync") == 0
+    galaxy.add_collection("ns", "a", ["1.0.0", "2.0.0"])
+    capsys.readouterr()
+
+    # A refresh without targets asks the next sync to sweep, which queues what differs.
+    assert refresh() == 0
+    out = capsys.readouterr().out
+    assert "sweep: Galaxy publishes 3 versions; 1 mirrored versions are gone from it and 0 aren't mirrored" in out
+    assert "  gone: ns.a 1.1.0\n" in out
+    assert "ns.a: +0 yanked 1.1.0" in out
+    assert not list((tmp_path / "state" / "requests").iterdir())
+
+    # The sweep runs once a day.
+    assert run("sync") == 0
+    assert "sweep:" not in capsys.readouterr().out
+    current = state(tmp_path)
+    current["last_sweep"] = "2026-01-01T00:00:00Z"
+    (tmp_path / "state" / "state.json").write_text(json.dumps(current))
+    assert run("sync") == 0
+    assert "sweep: Galaxy publishes 3 versions" in capsys.readouterr().out
+
+    # With targets, the next sync reconciles them first, without a sweep.
+    assert refresh("ns.b", "ns.a") == 0
+    out = capsys.readouterr().out
+    assert "[1/2] ns.a" in out
+    assert "[2/2] ns.b" in out
+    assert "sweep:" not in out
+
+    # A failed listing still applies the sweep.
+    galaxy.add_collection("ns", "a", ["1.0.0"])
+    galaxy.routes[LISTING] = UNAVAILABLE
+    assert refresh() == 0
+    captured = capsys.readouterr()
+    assert "listing collections failed; deprecation changes wait for the next sweep" in captured.err
+    assert "ns.a: +0 yanked 2.0.0" in captured.out
+    galaxy.add_collection("ns", "a", ["1.0.0"])
+
+    # A failed walk queues nothing, and the next sync sweeps again.
+    galaxy.routes[FEED] = UNAVAILABLE
+    assert refresh() == 0
+    assert "the sweep couldn't read the upload feed" in capsys.readouterr().err
+    after = state(tmp_path)
+    assert "last_sweep" not in after
+    assert {f["version"] for f in after["failures"].values()} >= {"feed", "sweep"}
+
+
+def test_refresh_requests(galaxy, run, tmp_path, capsys):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    assert run("sync") == 0
+    galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})
+
+    # A namespace is expanded by the sync; a failed expansion keeps the request.
+    namespace = "/api/v3/plugin/ansible/content/published/collections/index/?limit=100&namespace=ns"
+    galaxy.routes[namespace] = UNAVAILABLE
+    assert run("refresh", "--revalidate", "ns") == 0
+    capsys.readouterr()
+    assert run("sync") == 0
+    assert ": ns, revalidating; kept for the next run" in capsys.readouterr().err
+    assert "galaxy_unavailable" in json.dumps(state(tmp_path)["failures"])
+    assert len(list((tmp_path / "state" / "requests").iterdir())) == 1
+
+    galaxy.json(namespace, {"data": [{"namespace": "ns", "name": "coll"}], "links": {"next": None}})
+    capsys.readouterr()
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert re.search(
+        r"^request requests/\S+\.json from \S+: ns, revalidating; queued 1 collections ahead", out, re.MULTILINE
+    )
+    assert "ns.coll: +0 CONFLICT 1.0.0" in out
+    assert not list((tmp_path / "state" / "requests").iterdir())
+    assert not state(tmp_path)["failures"]
+
+    # A request written by hand with a bad name is dropped.
+    store = Store(Buckets.local(tmp_path))
+    _ = store.add_request(["Bad"], False)
+    assert run("sync") == 0
+    assert "; dropped: invalid" in capsys.readouterr().err
+    assert not list((tmp_path / "state" / "requests").iterdir())
+
+
+def test_budget(galaxy, run, tmp_path, capsys):
+    galaxy.add_collection("ns", "a", ["1.0.0"])
+    galaxy.add_collection("ns", "b", ["1.0.0"])
+
+    # Out of time: what was found stays queued, and the cursor still moves.
+    assert run("sync", "--budget", "0") == 0
+    assert "out of time: 2 collections left for the next run" in capsys.readouterr().out
+    saved = state(tmp_path)
+    assert sorted(saved["pending"]) == ["ns.a", "ns.b"]
+    assert {p["source"] for p in saved["pending"].values()} == {"listed"}  # the initial import
+    assert saved["feed_cursor"]
+
+    # A requested collection keeps to the budget too, staying first in the queue.
+    assert run("refresh", "ns.b") == 0
+    assert run("sync", "--budget", "0") == 0
+    assert "out of time: 1 collections left for the next run" in capsys.readouterr().out
+    assert state(tmp_path)["pending"]["ns.b"]["source"] == "requested"
+
+    # The next run works the queue though nothing changed on Galaxy, what
+    # was requested first and ahead of the sweep.
+    store = Store(Buckets.local(tmp_path))
+    del store.state["last_sweep"]
+    store.save_state()
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert "the published repo hasn't changed" in out
+    assert out.index("[1/1] ns.b: +1") < out.index("sweep:") < out.index("[1/1] ns.a: +1")
+    assert not state(tmp_path)["pending"]
+
+
+def test_alerts(galaxy, run, tmp_path, capsys):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    alerts = tmp_path / "alerts.md"
+    assert run("sync", "--alerts", str(alerts)) == 0
+    assert alerts.read_text() == ""
+
+    # A new conflict alerts once.
+    galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})
+    assert run("refresh", "--revalidate", "ns.coll") == 0
+    assert run("sync", "--alerts", str(alerts)) == 0
+    assert alerts.read_text() == "galaxy-sync: 1 new conflicts; see failures.md in the state bucket.\n"
+    assert run("refresh", "--revalidate", "ns.coll") == 0
+    assert run("sync", "--alerts", str(alerts)) == 0
+    assert alerts.read_text() == ""
+
+    # So does a failure once it has been outstanding for a day.
+    galaxy.add_collection("ns", "other", ["1.0.0"])
+    galaxy.routes[DETAIL.replace("ns/coll", "ns/other").format("1.0.0")] = UNAVAILABLE
+    assert run("sync", "--alerts", str(alerts)) == 0
+    assert alerts.read_text() == ""
+    current = state(tmp_path)
+    for failure in current["failures"].values():
+        failure["first_seen"] = "2026-01-01T00:00:00Z"
+    (tmp_path / "state" / "state.json").write_text(json.dumps(current))
+    assert run("sync", "--alerts", str(alerts)) == 0
+    assert (
+        alerts.read_text()
+        == "galaxy-sync: 1 failures outstanding for over a day; see failures.md in the state bucket.\n"
+    )
+    assert run("sync", "--alerts", str(alerts)) == 0
+    assert alerts.read_text() == ""
+
+
+def test_state_is_saved_after_enough_work(galaxy, run, monkeypatch):
+    for name in ("a", "b", "c"):
+        galaxy.add_collection("ns", name, ["1.0.0"])
+    saves: list[bytes] = []
+    replace = LocalBackend.replace
+
+    def recorded(self, key, data, previous):
+        saves.append(data)
+        replace(self, key, data, previous)
+
+    monkeypatch.setattr(LocalBackend, "replace", recorded)
+    assert run("sync") == 0
+    assert len(saves) == 2  # once the changes are queued, and at the end; not per collection
+
+    saves.clear()
+    for name in ("a", "b", "c"):
+        galaxy.add_collection("ns", name, ["1.0.0", "1.1.0"])
+    monkeypatch.setattr(store_mod, "SAVE_EVERY", 2)
+    assert run("refresh", "ns") == 0
+    assert run("sync") == 0
+    assert len(saves) > 3
+
+
+def test_sync_summary(galaxy, run, capsys):
+    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
+    galaxy.add_collection("ns", "broken", ["1.0.0"])
+    galaxy.routes["/api/v3/collections/ns/broken/"] = (403, b"", {})
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    summary = out[out.index("reconciled 2 collections in ") :]
+    assert re.match(r"reconciled 2 collections in \d+s: 2 versions mirrored \(\d+\.\d MB\), 1 failed\n", summary)
+    assert re.search(r"^  ns\.broken +FAILED +galaxy_http_403$", summary, re.MULTILINE)
+    assert re.search(r"^  ns\.coll +\+2 +2/2$", summary, re.MULTILINE)
+    assert "queue: 0 collections left (0 requested, 0 uploaded, 0 listed, 0 swept)" in summary
+    assert "mirror: 2 of 3 versions Galaxy publishes (66.7%)" in summary

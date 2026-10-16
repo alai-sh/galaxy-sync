@@ -1,0 +1,79 @@
+name: Sync
+on:
+  schedule:
+  - cron: "*/10 * * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run at a time, never cancelled part way. GitHub keeps only the newest
+# waiting run, which loses nothing: what to do is queued in the state bucket,
+# so every run picks up where the last one stopped.
+concurrency:
+  group: galaxy-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: sync
+    # Setting the release to run starts the schedule.
+    if: vars.GALAXY_SYNC_REF != ''
+    runs-on: ubuntu-latest
+    # The run stops starting work after --budget (45 minutes); the daily sweep
+    # and the last collection can take it past that.
+    timeout-minutes: 120
+    environment: r2
+    permissions:
+      contents: read
+      issues: write
+    steps:
+    # The release to run, not main: see "Releases" in docs/sync.md.
+    - name: Check the release
+      env:
+        REF: ${{ vars.GALAXY_SYNC_REF }}
+      run: |
+        if [ -z "$REF" ]; then
+          echo "::error::set the GALAXY_SYNC_REF repository variable to the tag to run"
+          exit 1
+        fi
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        ref: ${{ vars.GALAXY_SYNC_REF }}
+        persist-credentials: false
+
+    - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+
+    - name: Sync
+      run: uv run --locked galaxy-sync sync --r2 --alerts alerts.md
+      env:
+        R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        ALAI_INDEX_BUCKET: ${{ vars.ALAI_INDEX_BUCKET }}
+        ALAI_DL_BUCKET: ${{ vars.ALAI_DL_BUCKET }}
+        ALAI_GALAXY_BUCKET: ${{ vars.ALAI_GALAXY_BUCKET }}
+        ALAI_STATE_BUCKET: ${{ vars.ALAI_STATE_BUCKET }}
+
+    # Counts only; the details stay in failures.md in the state bucket. A
+    # comment notifies the issue's subscribers.
+    - name: Notify
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ISSUE: ${{ vars.TRACKING_ISSUE }}
+      run: |
+        if [ -s alerts.md ] && [ -n "$ISSUE" ]; then
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file alerts.md
+        fi
+
+    # A dead man's switch (e.g. healthchecks.io) alerts when these pings stop:
+    # the job failing, the schedule being disabled, or GitHub not running it.
+    - name: Heartbeat
+      env:
+        HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
+      run: |
+        if [ -n "$HEARTBEAT_URL" ]; then
+          curl -fsS -m 10 --retry 3 -o /dev/null "$HEARTBEAT_URL"
+        fi

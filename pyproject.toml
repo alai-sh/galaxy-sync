@@ -1,0 +1,165 @@
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"
+
+[project]
+name = "alai-galaxy-sync"
+version = "0.0.1"
+description = "Mirrors galaxy.ansible.com into the alai static index."
+readme = "README.md"
+requires-python = ">=3.15"
+authors = [{ name = "Jordan Borean", email = "jborean93@gmail.com" }]
+dependencies = [
+    "alai-plugin-extractor",
+    "boto3>=1.43.114",
+]
+
+[project.scripts]
+galaxy-sync = "galaxy_sync.cli:main"
+
+[dependency-groups]
+dev = [
+    "basedpyright >= 1.40.2",
+    "coverage[toml] >= 5.3",  # Support for source_pkgs
+    "ruff >= 0.17.0",
+    "pre-commit",
+    "pytest >= 8",
+    "pytest-xdist",
+    "tox-uv",
+    "types-boto3[s3]>=1.43.114",
+]
+
+[tool.uv.build-backend]
+module-name = "galaxy_sync"
+
+[tool.uv.sources]
+# Not on PyPI yet, so pinned to a commit. Bump `rev` to pick up extractor
+# changes, and switch to a version pin once it's published.
+alai-plugin-extractor = { git = "https://github.com/alai-sh/alai-plugin-extractor", rev = "87a37d83f9122847fc03303a7888aa144b82189a" }
+
+[tool.uv]
+# Rebuild/reinstall the project when source files change (or are deleted),
+# not just when pyproject.toml changes. Without this, tox envs keep stale
+# copies of removed modules in site-packages which show up in coverage.
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]
+
+[tool.basedpyright]
+include = ["src"]
+pythonVersion = "3.15"
+exclude = ["tests"]
+reportAny = false
+reportPrivateUsage = false
+reportUnannotatedClassAttribute = false
+reportUnknownArgumentType = false
+reportUnknownMemberType = false
+
+executionEnvironments = [
+    { root = "tests", reportUntypedFunctionDecorator = false }
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "A",     # flake8-builtins, shadowing a builtin
+    "B",     # flake8-bugbear, likely bugs
+    "C4",    # flake8-comprehensions
+    "DTZ",   # flake8-datetimez, naive datetime usage
+    "E4",    # pycodestyle imports, E501 is left to the formatter
+    "E7",    # pycodestyle statements
+    "E9",    # pycodestyle runtime errors
+    "F",     # pyflakes, unused imports and undefined names
+    "FURB",  # refurb, outdated patterns
+    "G",     # flake8-logging-format
+    "I",     # isort
+    "ISC",   # flake8-implicit-str-concat
+    "PERF",  # perflint
+    "PIE",   # flake8-pie
+    "PTH",   # flake8-use-pathlib
+    "RET",   # flake8-return
+    "RSE",   # flake8-raise
+    "RUF",   # ruff specific rules
+    "S",     # flake8-bandit
+    "SIM",   # flake8-simplify
+    "T20",   # flake8-print
+    "UP",    # pyupgrade
+    "W",     # pycodestyle warnings
+]
+
+ignore = [
+    # ISC003 wants an implicit concatenation which basedpyright rejects under
+    # reportImplicitStringConcatenation, so an explicit + is the only way to split a
+    # message across lines.
+    "ISC003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# assert is how pytest tests are written and the mutable class attributes are
+# parametrize data on classes that are never used to hold instance state.
+"tests/**" = ["S101", "RUF012"]
+# The CLI reports progress and results to the user with print.
+"src/galaxy_sync/cli.py" = ["T201"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["galaxy_sync"]
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+pythonpath = ["tests"]
+testpaths = "tests"
+junit_family = "xunit2"
+
+[tool.coverage.paths]
+source = ["src", ".tox/py*/**/site-packages"]
+
+[tool.coverage.run]
+branch = true
+# Needed as tests run with a different cwd, env is set in tox
+data_file = "${PROJECT_ROOT}/.coverage"
+disable_warnings = ["module-not-imported", "no-data-collected"]
+source_pkgs = ["galaxy_sync"]
+parallel = true
+
+[tool.coverage.report]
+skip_covered = true
+show_missing = true
+
+[tool.tox]
+legacy_tox_ini = """
+[tox]
+env_list =
+    sanity
+    py315-tests
+min_version = 4.0
+
+[testenv]
+package = wheel
+wheel_build_env = .pkg
+runner = uv-venv-lock-runner
+
+passenv =
+    PYTEST_ADDOPTS
+
+set_env =
+    tests: COVERAGE_PROCESS_START={toxinidir}/pyproject.toml
+    tests: PROJECT_ROOT={toxinidir}
+
+commands_pre =
+    tests: python -c 'import pathlib; pathlib.Path("{env_site_packages_dir}/cov.pth").write_text("import coverage; coverage.process_startup()")'
+
+commands =
+    sanity: python -m ruff check .
+    sanity: python -m ruff format . --check
+    sanity: python -m basedpyright --warnings
+    tests: python -m coverage run -m pytest -v {posargs:-n auto}
+
+commands_post =
+    tests: python -m coverage combine --quiet
+    tests: python -m coverage report
+    tests: python -m coverage xml
+
+[testenv:sanity]
+# As sanity has no pyXY factor in the name, we tell it what intepreter to use
+base_python = py315
+"""

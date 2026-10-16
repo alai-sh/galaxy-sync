@@ -1,0 +1,62 @@
+name: Refresh
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: Space-separated NS or NS.NAME to reconcile first; empty to run the sweep now
+        type: string
+        default: ""
+      revalidate:
+        description: Also check every mirrored artifact against the one Galaxy publishes now (needs targets)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# No shared concurrency group: a refresh only writes its own request object,
+# which the next sync takes, so it can run alongside one.
+
+jobs:
+  refresh:
+    name: refresh
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: r2
+    steps:
+    # The release to run, not main: see "Releases" in docs/sync.md.
+    - name: Check the release
+      env:
+        REF: ${{ vars.GALAXY_SYNC_REF }}
+      run: |
+        if [ -z "$REF" ]; then
+          echo "::error::set the GALAXY_SYNC_REF repository variable to the tag to run"
+          exit 1
+        fi
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        ref: ${{ vars.GALAXY_SYNC_REF }}
+        persist-credentials: false
+
+    - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+
+    - name: Queue the request
+      # Inputs go through the environment, never into the script itself.
+      run: |
+        read -ra targets <<< "$TARGETS"
+        args=()
+        if [ "$REVALIDATE" = "true" ]; then
+          args+=(--revalidate)
+        fi
+        uv run --locked galaxy-sync refresh --r2 "${args[@]}" -- "${targets[@]}"
+      env:
+        TARGETS: ${{ inputs.targets }}
+        REVALIDATE: ${{ inputs.revalidate }}
+        R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        ALAI_INDEX_BUCKET: ${{ vars.ALAI_INDEX_BUCKET }}
+        ALAI_DL_BUCKET: ${{ vars.ALAI_DL_BUCKET }}
+        ALAI_GALAXY_BUCKET: ${{ vars.ALAI_GALAXY_BUCKET }}
+        ALAI_STATE_BUCKET: ${{ vars.ALAI_STATE_BUCKET }}
