@@ -71,7 +71,7 @@ jobs:
         if [ -d ansible-core ]; then
           args+=(--builtin ansible-core)
         fi
-        uv run --locked galaxy-sync rebuild --r2 "${args[@]}"
+        uv run --locked galaxy-sync rebuild --r2 -v "${args[@]}"
       env:
         DL: ${{ inputs.dl }}
         R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}

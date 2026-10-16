@@ -49,7 +49,7 @@ jobs:
         if [ "$REVALIDATE" = "true" ]; then
           args+=(--revalidate)
         fi
-        uv run --locked galaxy-sync refresh --r2 "${args[@]}" -- "${targets[@]}"
+        uv run --locked galaxy-sync refresh --r2 -v "${args[@]}" -- "${targets[@]}"
       env:
         TARGETS: ${{ inputs.targets }}
         REVALIDATE: ${{ inputs.revalidate }}

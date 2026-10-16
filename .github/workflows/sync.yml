@@ -47,7 +47,7 @@ jobs:
     - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
 
     - name: Sync
-      run: uv run --locked galaxy-sync sync --r2 --alerts alerts.md
+      run: uv run --locked galaxy-sync sync --r2 --alerts alerts.md -v
       env:
         R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
