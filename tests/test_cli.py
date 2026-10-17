@@ -358,7 +358,9 @@ def test_rebuild(galaxy, run, tmp_path, capsys, refresh):
 
     # rebuild --dl moves every URL at once, and later runs keep it.
     assert run("rebuild", "--dl", "https://moved.example/{sha256-checksum}") == 0
-    assert "rebuilt 1 collections (1 plugin lines)" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "[1/1] ns.coll: 1 versions, Galaxy view: 1 pages written, 1 plugin lines\n" in out
+    assert "rebuilt 1 collections (1 plugin lines)\n" in out
     assert urls() == ("https://moved.example/{sha256-checksum}", {"moved.example"})
     galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
     assert refresh("ns.coll") == 0

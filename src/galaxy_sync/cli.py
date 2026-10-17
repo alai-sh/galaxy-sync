@@ -362,12 +362,29 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
     store.dl_url = args.dl or DEFAULT_DL  # rebuild is the one place the artifact URL changes
     if args.builtin is not None:
         _extract_builtin(store, args.builtin)
-    count = store.rebuild_galaxy()
+    collections = store.index_collections()
+    width = len(str(len(collections)))
+    moved = 0
+    for i, (ns, name) in enumerate(collections):
+        res = store.rebuild_collection(ns, name)
+        parts = [
+            f"{res.versions} versions",
+            f"Galaxy view: {res.pages} pages written" if res.pages else "Galaxy view unchanged",
+        ]
+        if res.moved:
+            parts.append(f"extractions moved from {res.moved} per-artifact objects")
+        parts.append(f"{res.plugins} plugin lines")
+        print(f"[{i + 1:{width}}/{len(collections)}] {ns}.{name}: {', '.join(parts)}")
+        moved += res.moved
+    store.write_galaxy_root()
     store.write_config()
     store.write_collections()
-    plugins = store.rebuild_plugins()
+    plugins = store.merge_plugins()
     store.save_state()
-    print(f"rebuilt {count} collections ({plugins} plugin lines)")
+    summary = f"rebuilt {len(collections)} collections ({plugins} plugin lines)"
+    if moved:
+        summary += f"; moved {moved} extractions to one object per collection"
+    print(summary)
     return 0
 
 

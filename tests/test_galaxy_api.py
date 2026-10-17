@@ -102,7 +102,9 @@ def test_rebuild_galaxy(galaxy, client, store):
     reconcile(client, store, "ns", "coll")
 
     moved = Store(store.buckets, "https://moved.example/{sha256-checksum}.tar.gz")
-    assert moved.rebuild_galaxy() == 1
+    assert moved.rebuild_collection("ns", "coll").pages == 1  # the version page, which has the download URL
+    assert moved.rebuild_collection("ns", "coll").pages == 0
+    moved.write_galaxy_root()
     v = page(moved, "/api/v3/collections/ns/coll/versions/1.0.0/")
     assert v["download_url"].startswith("https://moved.example/")
     assert page(moved, "/api/")["available_versions"] == {"v3": "v3/"}

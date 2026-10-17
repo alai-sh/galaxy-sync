@@ -231,7 +231,7 @@ The workflows are in `.github/workflows/`:
 |---|---|---|
 | `sync.yml` | every 10 minutes, once `GALAXY_SYNC_REF` is set | `sync --alerts`, then the notification and heartbeat |
 | `refresh.yml` | manual, with targets and `revalidate` | `refresh`, which only writes a request |
-| `rebuild.yml` | manual, with `dl` and an ansible-core ref | pauses the sync schedule, waits for a running sync, `rebuild`, resumes |
+| `rebuild.yml` | manual, with `dl` and an ansible-core ref | pauses the sync schedule, waits for a running sync, `rebuild`, resumes; a schedule already paused by hand stays paused |
 
 Syncs share one concurrency group that never cancels a running job. Runs
 must not overlap: each reads `state.json` and writes it back whole, and

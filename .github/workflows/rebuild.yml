@@ -53,10 +53,18 @@ jobs:
 
     # A rebuild can't share the sync's concurrency group: a scheduled sync
     # would replace it while it waited. So it pauses the schedule instead and
-    # waits for any sync still running.
+    # waits for any sync still running. A schedule that was already paused,
+    # e.g. by hand for a deploy, is left paused afterwards.
     - name: Pause syncs
+      id: pause
       run: |
-        gh workflow disable sync.yml --repo "$GITHUB_REPOSITORY"
+        state=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/sync.yml" --jq .state)
+        if [ "$state" = "active" ]; then
+          gh workflow disable sync.yml --repo "$GITHUB_REPOSITORY"
+          echo "paused=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "the sync schedule is already paused ($state); leaving it paused"
+        fi
         while [ -n "$(gh run list --repo "$GITHUB_REPOSITORY" --workflow sync.yml --json status \
             --jq '.[] | select(.status != "completed") | .status')" ]; do
           sleep 30
@@ -83,5 +91,5 @@ jobs:
         ALAI_STATE_BUCKET: ${{ vars.ALAI_STATE_BUCKET }}
 
     - name: Resume syncs
-      if: always()
+      if: always() && steps.pause.outputs.paused == 'true'
       run: gh workflow enable sync.yml --repo "$GITHUB_REPOSITORY"

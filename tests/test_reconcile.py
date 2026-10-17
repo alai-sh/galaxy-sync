@@ -477,5 +477,5 @@ def test_rebuild_moves_extractions_over(galaxy, client, store):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     reconcile(client, store, "ns", "coll")
     later = _to_legacy(store, "ns", "coll")
-    assert later.rebuild_plugins() == 1
+    assert later.rebuild_collection("ns", "coll").moved == 1
     assert list(later.state_bucket.list("extract/")) == ["extract/ns/coll.json.zst"]

@@ -15,6 +15,7 @@ import logging
 import secrets
 from collections.abc import Collection, Iterable, Sequence
 from compression import zstd
+from dataclasses import dataclass
 from typing import cast
 
 from . import galaxy_api, report
@@ -94,6 +95,16 @@ def ordered_line(line: IndexLine) -> dict[str, object]:
     out = {k: fields[k] for k in LINE_FIELDS if k in fields}
     out.update({k: v for k, v in fields.items() if k not in out})
     return out
+
+
+@dataclass(frozen=True)
+class Rebuilt:
+    """What `rebuild` did for one collection."""
+
+    versions: int
+    pages: int  # Galaxy view pages that changed
+    moved: int  # per-artifact extraction objects moved into the collection's one
+    plugins: int  # plugin lines
 
 
 class StateChanged(StorageError):
@@ -361,17 +372,22 @@ class Store:
         self._legacy_extractions[fqcn] = legacy
         return found
 
-    def save_extractions(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> None:
-        """Save a collection's extractions, unless they're what `load_extractions` read."""
+    def save_extractions(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> int:
+        """Save a collection's extractions, unless they're what `load_extractions` read.
+
+        Returns how many per-artifact objects this replaced and removed.
+        """
         fqcn = f"{namespace}.{name}"
         if not extractions and fqcn not in self._saved_extractions:
-            return  # nothing extracted yet, e.g. every version failed
+            return 0  # nothing extracted yet, e.g. every version failed
         data = zstd.compress((_dump(dict(sorted(extractions.items()))) + "\n").encode(), EXTRACTIONS_LEVEL)
         if data != self._saved_extractions.get(fqcn):
             self.state_bucket.write(self._extractions_key(namespace, name), data)
             self._saved_extractions[fqcn] = data
-        for key in self._legacy_extractions.pop(fqcn, []):
+        legacy = self._legacy_extractions.pop(fqcn, [])
+        for key in legacy:
             self.state_bucket.delete(key)
+        return len(legacy)
 
     def save_builtin(self, lines: list[PluginLine]) -> None:
         """Plugin lines for ansible.builtin, merged into every plugins.jsonl."""
@@ -417,47 +433,64 @@ class Store:
         if changed:
             self.collection_state(f"{namespace}.{name}")["updated"] = now()
         if changed or view:
-            self.write_galaxy_collection(namespace, name, lines, added, partial=partial)
+            _ = self.write_galaxy_collection(namespace, name, lines, added, partial=partial)
         return changed
 
-    def _write_galaxy_page(self, path: str, body: dict[str, object], *, new: bool = False) -> None:
+    def _write_galaxy_page(self, path: str, body: dict[str, object], *, new: bool = False) -> bool:
+        """Write one page, returning False if it was already the same."""
+        key = galaxy_api.page_key(path)
         text = json.dumps(body, ensure_ascii=False) + "\n"
         if new:
-            self.galaxy.write(galaxy_api.page_key(path), text.encode())
-        else:
-            _ = _write(self.galaxy, galaxy_api.page_key(path), text)
+            self.galaxy.write(key, text.encode())
+        elif not _write(self.galaxy, key, text):
+            return False
+        log.debug("wrote %s", key)
+        return True
 
     def write_galaxy_collection(
         self, namespace: str, name: str, lines: list[IndexLine], added: Collection[str] = (), *, partial: bool = False
-    ) -> None:
-        """Write one collection's Galaxy v3 pages from its index lines.
+    ) -> int:
+        """Write one collection's Galaxy v3 pages from its index lines; returns how many changed.
 
         Version pages come first, so the listing never names a page that isn't
         written yet. Yanked versions keep their page but leave the listing.
         """
+        written = 0
         for line in (line for line in lines if line["vers"] in added) if partial else lines:
-            self._write_galaxy_page(
+            written += self._write_galaxy_page(
                 galaxy_api.version_path(namespace, name, line["vers"]),
                 galaxy_api.version(line, self.dl_url),
                 new=line["vers"] in added,
             )
-        self._write_galaxy_page(galaxy_api.versions_path(namespace, name), galaxy_api.versions(namespace, name, lines))
+        written += self._write_galaxy_page(
+            galaxy_api.versions_path(namespace, name), galaxy_api.versions(namespace, name, lines)
+        )
         updated = self.collection_state(f"{namespace}.{name}").get("updated") or now()
-        self._write_galaxy_page(
+        written += self._write_galaxy_page(
             galaxy_api.collection_path(namespace, name), galaxy_api.collection(namespace, name, lines, updated)
         )
+        return written
 
     def write_galaxy_root(self) -> None:
         for path in (galaxy_api.SERVER_ROOT, galaxy_api.API_ROOT):
-            self._write_galaxy_page(path, galaxy_api.root(path))
+            _ = self._write_galaxy_page(path, galaxy_api.root(path))
 
-    def rebuild_galaxy(self) -> int:
-        """Rewrite the whole Galaxy v3 view from the index, e.g. after the `dl` URL changed."""
-        collections = self.index_collections()
-        for ns, name in collections:
-            self.write_galaxy_collection(ns, name, self.read_index(ns, name))
-        self.write_galaxy_root()
-        return len(collections)
+    def rebuild_collection(self, namespace: str, name: str) -> Rebuilt:
+        """Rewrite one collection's Galaxy view and plugin lines from its index file and extractions.
+
+        `rebuild` runs this for every collection, then `merge_plugins`. It
+        also moves the collection's extractions off per-artifact objects.
+        """
+        lines = self.read_index(namespace, name)
+        pages = self.write_galaxy_collection(namespace, name, lines)
+        extractions = self.load_extractions(namespace, name, (line["cksum"] for line in lines))
+        moved = self.save_extractions(namespace, name, extractions)
+        plugins = self.write_collection_plugins(
+            namespace,
+            name,
+            {line["vers"]: extractions[line["cksum"]] for line in lines if line["cksum"] in extractions},
+        )
+        return Rebuilt(len(lines), pages, moved, plugins)
 
     def write_config(self) -> None:
         config = {
@@ -479,7 +512,7 @@ class Store:
         namespace, _, name = fqcn.partition(".")
         return f"plugins/{namespace}/{name}.jsonl"
 
-    def write_collection_plugins(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> None:
+    def write_collection_plugins(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> int:
         """Write one collection's plugin lines, from each version's extraction, for `write_plugins` to merge.
 
         Every reconcile marks its collection for merging, changed or not: a
@@ -492,6 +525,7 @@ class Store:
         pending = self.state.setdefault("plugins_pending", [])
         if fqcn not in pending:
             pending.append(fqcn)
+        return len(lines)
 
     def _collection_plugins(self, fqcn: str) -> list[PluginLine]:
         if (lines := self._plugin_lines.get(fqcn)) is not None:
@@ -518,21 +552,6 @@ class Store:
         for ns, name in self.index_collections():
             lines.extend(self._collection_plugins(f"{ns}.{name}"))
         return self._write_plugins(lines)
-
-    def rebuild_plugins(self) -> int:
-        """Rebuild every collection's plugin lines from its stored extractions, then plugins.jsonl.
-
-        Reads every index file and every collection's extractions, so only
-        `rebuild` does this.
-        """
-        for ns, name in self.index_collections():
-            lines = self.read_index(ns, name)
-            extractions = self.load_extractions(ns, name, (line["cksum"] for line in lines))
-            self.save_extractions(ns, name, extractions)  # moves a collection off per-artifact objects
-            self.write_collection_plugins(
-                ns, name, {line["vers"]: extractions[line["cksum"]] for line in lines if line["cksum"] in extractions}
-            )
-        return self.merge_plugins()
 
     def _write_plugins(self, lines: list[PluginLine]) -> int:
         lines.sort(key=lambda line: (line["type"], line["name"], line["collection"]))
