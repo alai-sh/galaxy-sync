@@ -27,7 +27,9 @@ uv run tox                        # sanity plus tests with coverage
 
 All checks must pass before work is done. Tooling config follows
 `~/dev/msauthlib`. CI (`.github/workflows/ci.yml`) runs the same tox
-environments.
+environments, and builds the scheduler Worker in `scheduler/` with
+`npx wrangler@<version in ci.yml> deploy --dry-run` (no credentials needed;
+run it from `scheduler/` after changing the Worker).
 
 Tests never reach the network: `tests/conftest.py` runs `MockGalaxy`, a local
 HTTP server answering like Galaxy (including the upload feed and listing),

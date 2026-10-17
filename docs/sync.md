@@ -314,7 +314,11 @@ meanwhile lose nothing: the work is in the queue.
 #### Changing the Worker
 
 Changes to `wrangler.toml` or `src/index.js` take effect on the next
-`npx wrangler deploy` from `scheduler/`, not on merge. A deploy replaces the
+`npx wrangler deploy` from `scheduler/`, not on merge. CI builds the Worker
+on every push and pull request with `wrangler deploy --dry-run`, which needs
+no Cloudflare credentials and deploys nothing, so a broken change fails
+before it's merged. It pins the wrangler version in `ci.yml`; deploy with the
+same one, e.g. `npx wrangler@4.151.1 deploy`. A deploy replaces the
 Worker in place and keeps its token. Vars and the cron schedule always come
 from `wrangler.toml`, so dashboard edits to them are lost on the next deploy.
 Renaming the Worker (`name`) creates a second one: delete the old one with
