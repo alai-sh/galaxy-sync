@@ -117,8 +117,10 @@ def test_sync_reports_each_kind_of_change(galaxy, run, tmp_path, capsys, refresh
     assert refresh("ns.coll") == 0
 
     store = Store(Buckets.local(tmp_path), "")
-    (line, _) = store.read_index("ns", "coll")
-    store.save_extraction(line["cksum"], {"format": 0, "plugins": [], "routing": {}})
+    lines = store.read_index("ns", "coll")
+    extractions = store.load_extractions("ns", "coll", (line["cksum"] for line in lines))
+    extractions[lines[0]["cksum"]] = {"format": 0, "plugins": [], "routing": {}}
+    store.save_extractions("ns", "coll", extractions)
     galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})
     capsys.readouterr()
     assert refresh("--revalidate", "ns.coll") == 0

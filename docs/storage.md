@@ -42,7 +42,7 @@ state bucket
   requests/<time>-<id>.json    `refresh` requests waiting for the next sync
   failures.json, failures.md   the failure report
   builtin.jsonl                ansible.builtin's plugin lines (rebuild --builtin)
-  extract/<aa>/<sha256>.json   each artifact's stored extraction
+  extract/<ns>/<name>.json.zst each collection's stored extractions, by artifact sha256
   plugins/<ns>/<name>.jsonl    each collection's plugin lines, merged into plugins.jsonl
   conflicts/<aa>/<sha256>.tar.gz  Galaxy's artifact for each conflict
 ```
@@ -52,8 +52,8 @@ and [galaxy-v3-view.md](galaxy-v3-view.md). The Galaxy view needs one rewrite
 rule on its host, described there.
 
 Every write is skipped when the stored content is already the same, so an
-unchanged run writes nothing. Objects known to be new, a new version's
-Galaxy page and each new extraction, are written without that check.
+unchanged run writes nothing. A new version's Galaxy page is written
+without that check, since it can't exist yet.
 
 ## state.json
 
@@ -110,16 +110,32 @@ works on:
   bucket from the extractions it already read, and queues the collection in
   `plugins_pending`. The run ends by reading `plugins.jsonl`, replacing those
   collections' lines and writing it back. Only `rebuild` reads every
-  extraction (~53k once the mirror is full) to make them all again.
+  collection's extractions (~4.6k objects once the mirror is full) to make
+  them all again.
+- **Extractions are one object per collection**, Zstandard-compressed JSON
+  keyed by artifact sha256. Reconcile needs every version's extraction, to
+  re-extract outdated ones and to build the plugin lines, so it reads one
+  object rather than one per version, and writes it once if anything
+  changed. Versions repeat each other's plugins and routing, which
+  Zstandard's long window finds and gzip's 32 KB one doesn't:
+  community.general's 243 versions are 41 MB of JSON, 5.3 MB gzipped and
+  0.27 MB as stored.
 - **Unchanged writes are skipped** by reading each object first. A change to
   a collection reads every one of its existing version pages, which is
   bounded by the size of the collections that changed. New versions' pages
-  and extractions skip the read, so mirroring a version takes four calls:
-  `HEAD` and `PUT` for the artifact (the `HEAD` skips re-uploading one left
-  by a run that stopped before writing its index file), and a `PUT` each for
-  the extraction and the Galaxy page.
+  skip the read, so mirroring a version takes three calls: `HEAD` and `PUT`
+  for the artifact (the `HEAD` skips re-uploading one left by a run that
+  stopped before writing its index file), and a `PUT` for the Galaxy page.
 - **A run with nothing to do** reads `config.json` and `state.json`, lists
   `requests/`, and writes nothing.
+
+### Moving extractions to one object per collection
+
+Releases before this layout stored each artifact's extraction as
+`extract/<aa>/<sha256>.json`. They're still read when a collection has no
+combined object yet, and removed once it's saved, so a collection moves
+over the next time it's reconciled. After deploying, run `rebuild` once to
+move every collection; the fallback can then be removed in a later release.
 
 ## Trying the output locally
 

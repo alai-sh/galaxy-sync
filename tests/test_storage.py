@@ -171,6 +171,7 @@ def test_r2_exists_delete_and_list(r2):
     ("key", "expected"),
     [
         ("sha256/aa/aa.tar.gz", "application/gzip"),
+        ("extract/ns/coll.json.zst", "application/zstd"),
         ("failures.md", "text/markdown; charset=utf-8"),
         ("plugins.jsonl", "text/plain; charset=utf-8"),
         ("other.bin", "application/octet-stream"),

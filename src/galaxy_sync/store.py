@@ -13,7 +13,8 @@ import datetime
 import json
 import logging
 import secrets
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterable, Sequence
+from compression import zstd
 from typing import cast
 
 from . import galaxy_api, report
@@ -35,6 +36,12 @@ GLOBAL = "*"
 # asked for, then new uploads, then the listing's and the sweep's findings
 # (which include the initial import's backlog).
 SOURCES = ("requested", "uploaded", "listed", "swept")
+
+# Zstandard level for each collection's extractions. Versions repeat each
+# other's plugins and routing, which Zstandard's long window finds: on
+# community.general's 243 versions, 41 MB of JSON becomes 0.27 MB in 0.04 s,
+# where gzip only gets it to 5.3 MB.
+EXTRACTIONS_LEVEL = 10
 
 # State is saved after this much work: each version mirrored or rechecked
 # counts one, and so does each collection reconciled.
@@ -113,6 +120,10 @@ class Store:
         self._new_conflicts = 0
         # Plugin lines written this run, so merging them needn't read them back.
         self._plugin_lines: dict[str, list[PluginLine]] = {}
+        # Each collection's extractions object as read or last saved, to skip
+        # unchanged saves, and the per-artifact objects it replaces.
+        self._saved_extractions: dict[str, bytes] = {}
+        self._legacy_extractions: dict[str, list[str]] = {}
         self._unsaved_work = 0
 
     def _configured_dl(self) -> str | None:
@@ -320,17 +331,47 @@ class Store:
         return self.dl.read(self.artifact_key(cksum))
 
     @staticmethod
-    def _extraction_key(cksum: str) -> str:
+    def _extractions_key(namespace: str, name: str) -> str:
+        return f"extract/{namespace}/{name}.json.zst"
+
+    @staticmethod
+    def _legacy_extraction_key(cksum: str) -> str:
         return f"extract/{cksum[:2]}/{cksum}.json"
 
-    def save_extraction(self, cksum: str, data: ExtractionData) -> None:
-        # Only called with a new result: for a new artifact, or replacing a
-        # missing or outdated one. So there's nothing to compare with.
-        self.state_bucket.write(self._extraction_key(cksum), (_dump(data) + "\n").encode())
+    def load_extractions(self, namespace: str, name: str, cksums: Iterable[str]) -> dict[str, ExtractionData]:
+        """A collection's stored extractions, by artifact sha256: one object for the whole collection.
 
-    def load_extraction(self, cksum: str) -> ExtractionData | None:
-        data = self.state_bucket.read(self._extraction_key(cksum))
-        return json.loads(data) if data is not None else None
+        Earlier releases stored each artifact's extraction as its own object
+        (`extract/<aa>/<sha256>.json`). Those are read when a collection has
+        no combined object yet, and removed once it's saved. A `rebuild`
+        moves every collection over.
+        """
+        fqcn = f"{namespace}.{name}"
+        data = self.state_bucket.read(self._extractions_key(namespace, name))
+        if data is not None:
+            self._saved_extractions[fqcn] = data
+            return json.loads(zstd.decompress(data))
+        found: dict[str, ExtractionData] = {}
+        legacy: list[str] = []
+        for cksum in cksums:
+            key = self._legacy_extraction_key(cksum)
+            if (old := self.state_bucket.read(key)) is not None:
+                found[cksum] = json.loads(old)
+                legacy.append(key)
+        self._legacy_extractions[fqcn] = legacy
+        return found
+
+    def save_extractions(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> None:
+        """Save a collection's extractions, unless they're what `load_extractions` read."""
+        fqcn = f"{namespace}.{name}"
+        if not extractions and fqcn not in self._saved_extractions:
+            return  # nothing extracted yet, e.g. every version failed
+        data = zstd.compress((_dump(dict(sorted(extractions.items()))) + "\n").encode(), EXTRACTIONS_LEVEL)
+        if data != self._saved_extractions.get(fqcn):
+            self.state_bucket.write(self._extractions_key(namespace, name), data)
+            self._saved_extractions[fqcn] = data
+        for key in self._legacy_extractions.pop(fqcn, []):
+            self.state_bucket.delete(key)
 
     def save_builtin(self, lines: list[PluginLine]) -> None:
         """Plugin lines for ansible.builtin, merged into every plugins.jsonl."""
@@ -481,15 +522,16 @@ class Store:
     def rebuild_plugins(self) -> int:
         """Rebuild every collection's plugin lines from its stored extractions, then plugins.jsonl.
 
-        Reads every index file and extraction, so only `rebuild` does this.
+        Reads every index file and every collection's extractions, so only
+        `rebuild` does this.
         """
         for ns, name in self.index_collections():
-            extractions = {
-                line["vers"]: extraction
-                for line in self.read_index(ns, name)
-                if (extraction := self.load_extraction(line["cksum"])) is not None
-            }
-            self.write_collection_plugins(ns, name, extractions)
+            lines = self.read_index(ns, name)
+            extractions = self.load_extractions(ns, name, (line["cksum"] for line in lines))
+            self.save_extractions(ns, name, extractions)  # moves a collection off per-artifact objects
+            self.write_collection_plugins(
+                ns, name, {line["vers"]: extractions[line["cksum"]] for line in lines if line["cksum"] in extractions}
+            )
         return self.merge_plugins()
 
     def _write_plugins(self, lines: list[PluginLine]) -> int:

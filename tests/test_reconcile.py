@@ -2,9 +2,10 @@
 
 import hashlib
 import json
+from compression import zstd
 
 import pytest
-from helpers import DETAIL, UNAVAILABLE, artifact
+from helpers import DETAIL, UNAVAILABLE, artifact, extraction
 
 from galaxy_sync import reconcile as reconcile_mod
 from galaxy_sync import store as store_mod
@@ -42,7 +43,7 @@ def test_new_versions_are_mirrored(galaxy, client, store):
         "published": rfc3339(galaxy.uploaded[("ns", "coll", "1.0.0")]),
     }
     assert store.read_artifact(first["cksum"]) == blob
-    assert store.load_extraction(first["cksum"])["plugins"] == [
+    assert extraction(store, first["cksum"])["plugins"] == [
         {"type": "module", "name": "thing", "short_description": "A thing"}
     ]
 
@@ -93,14 +94,14 @@ def test_extraction_failure_still_mirrors_and_heals(galaxy, client, store, monke
     assert res.added == ["1.0.0"]  # the artifact is mirrored regardless
     (line,) = store.read_index("ns", "coll")
     assert store.read_artifact(line["cksum"]) is not None
-    assert store.load_extraction(line["cksum"]) is None
+    assert extraction(store, line["cksum"]) is None
     (failure,) = store.state["failures"].values()
     assert failure["kind"] == "extract_error"
 
     monkeypatch.setattr(reconcile_mod.ext, "extract_bytes", real_extract)
     res = reconcile(client, store, "ns", "coll")
     assert res.reextracted == ["1.0.0"]
-    assert store.load_extraction(line["cksum"])["plugins"] == [
+    assert extraction(store, line["cksum"])["plugins"] == [
         {"type": "module", "name": "thing", "short_description": "A thing"}
     ]
     assert store.state["failures"] == {}
@@ -125,7 +126,7 @@ def test_outdated_extractions_are_rerun(galaxy, client, store):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     reconcile(client, store, "ns", "coll")
     (line,) = store.read_index("ns", "coll")
-    current = store.load_extraction(line["cksum"])
+    current = extraction(store, line["cksum"])
     assert current["format"] == EXTRACTION_FORMAT
 
     # Up to date: left alone.
@@ -133,9 +134,9 @@ def test_outdated_extractions_are_rerun(galaxy, client, store):
 
     # An older format, or from before results had one.
     for stale in ({**current, "format": 0}, {"extractor": 2, "plugins": [], "routing": {}}):
-        store.save_extraction(line["cksum"], stale)
+        store.save_extractions("ns", "coll", {line["cksum"]: stale})
         assert reconcile(client, store, "ns", "coll").reextracted == ["1.0.0"]
-        assert store.load_extraction(line["cksum"]) == current
+        assert extraction(store, line["cksum"]) == current
 
 
 def test_bad_and_mismatched_artifacts_are_not_mirrored(galaxy, client, store):
@@ -398,11 +399,10 @@ def test_new_objects_are_written_without_reading_them(galaxy, client, store, mon
     for backend in (store.galaxy, store.state_bucket):
         monkeypatch.setattr(backend, "read", _recording(backend.read, reads))
     assert reconcile(client, store, "ns", "coll").added == ["1.1.0"]
-    # The existing version's page is compared; the new one's and the new extraction aren't.
+    # The existing version's page is compared; the new one's isn't.
     assert "api/v3/collections/ns/coll/versions/1.0.0/index.html" in reads
     assert "api/v3/collections/ns/coll/versions/1.1.0/index.html" not in reads
-    line = store.read_index("ns", "coll")[1]
-    assert f"extract/{line['cksum'][:2]}/{line['cksum']}.json" not in reads
+    assert reads.count("extract/ns/coll.json.zst") == 1  # every extraction in one read
 
 
 def _recording(read, reads):
@@ -450,3 +450,32 @@ def test_lost_version_state_is_recorded_again(galaxy, client, store):
     res = reconcile(client, store, "ns", "coll")
     assert not res.changed
     assert store.collection_state("ns.coll")["versions"]["1.0.0"] == {"created_at": created}
+
+
+def _to_legacy(store, ns, name):
+    """Store a collection's extractions the way earlier releases did: one object per artifact."""
+    key = f"extract/{ns}/{name}.json.zst"
+    for cksum, data in json.loads(zstd.decompress(store.state_bucket.read(key))).items():
+        store.state_bucket.write(f"extract/{cksum[:2]}/{cksum}.json", json.dumps(data).encode())
+    store.state_bucket.delete(key)
+    return Store(store.buckets, store.dl_url)
+
+
+def test_per_artifact_extractions_are_moved_over(galaxy, client, store):
+    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
+    reconcile(client, store, "ns", "coll")
+    before = store.load_extractions("ns", "coll", [line["cksum"] for line in store.read_index("ns", "coll")])
+    later = _to_legacy(store, "ns", "coll")
+
+    # Read as they are, not re-extracted, then saved together and removed.
+    assert reconcile(client, later, "ns", "coll").reextracted == []
+    assert list(later.state_bucket.list("extract/")) == ["extract/ns/coll.json.zst"]
+    assert later.load_extractions("ns", "coll", []) == before
+
+
+def test_rebuild_moves_extractions_over(galaxy, client, store):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    reconcile(client, store, "ns", "coll")
+    later = _to_legacy(store, "ns", "coll")
+    assert later.rebuild_plugins() == 1
+    assert list(later.state_bucket.list("extract/")) == ["extract/ns/coll.json.zst"]

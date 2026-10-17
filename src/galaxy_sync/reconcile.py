@@ -17,7 +17,7 @@ import alai_plugin_extractor as ext
 from . import semver
 from .artifacts import contents_digest, describe_changes, manifest_info
 from .galaxy import GalaxyClient, GalaxyError, NotFound
-from .models import Conflict, ExtractionData, GalaxyVersion, GalaxyVersionDetail, IndexLine, VersionState
+from .models import Conflict, GalaxyVersion, GalaxyVersionDetail, IndexLine, VersionState
 from .plugins import EXTRACTION_FORMAT, extraction_data
 from .store import Store
 from .times import now, rfc3339
@@ -110,7 +110,7 @@ class _Reconcile:
         self.cstate = store.collection_state(self.fqcn)
         self.lines = store.read_index(namespace, name)
         # Each mirrored artifact's extraction, by cksum, for the plugin lines.
-        self.extractions: dict[str, ExtractionData] = {}
+        self.extractions = store.load_extractions(namespace, name, (line["cksum"] for line in self.lines))
         # New versions to mirror, and how many have been tried, for the progress log.
         self.missing = 0
         self.attempted = 0
@@ -185,6 +185,7 @@ class _Reconcile:
         if self.lines or not self.res.deferred:  # no empty index file for an import that hasn't started
             # After saving progress, the whole view is rewritten: yanks,
             # deprecation and rechecks can have changed lines already written.
+            self.store.save_extractions(self.namespace, self.name, self.extractions)
             changed = self.store.write_index(
                 self.namespace, self.name, self.lines, self.unwritten, view=self.saved_progress
             )
@@ -200,6 +201,7 @@ class _Reconcile:
         here; the end of the reconcile writes the rest of the view.
         """
         log.info("%s: saving progress, %d of %d new versions done", self.fqcn, self.attempted, self.missing)
+        self.store.save_extractions(self.namespace, self.name, self.extractions)
         _ = self.store.write_index(self.namespace, self.name, lines, self.unwritten, partial=True)
         self._write_plugins(lines)
         self.store.save_state()
@@ -237,9 +239,7 @@ class _Reconcile:
     def _heal_extractions(self) -> None:
         """Re-extract mirrored versions with no stored result, or one in an older format."""
         for line in self.lines:
-            stored = self.store.load_extraction(line["cksum"])
-            if stored is not None:
-                self.extractions[line["cksum"]] = stored
+            stored = self.extractions.get(line["cksum"])
             if (
                 (stored is None or stored.get("format", 0) < EXTRACTION_FORMAT)
                 and (data := self.store.read_artifact(line["cksum"])) is not None
@@ -262,6 +262,7 @@ class _Reconcile:
             if not line["yanked"]:
                 line["yanked"] = True
                 self.res.yanked.append(line["vers"])
+        self.store.save_extractions(self.namespace, self.name, self.extractions)
         self.res.changed = self.store.write_index(self.namespace, self.name, self.lines) if self.lines else False
         self._write_plugins(self.lines)
         _ = self.cstate.pop("upstream_updated", None)  # the listing check stops looking for it
@@ -441,6 +442,5 @@ class _Reconcile:
             return False
         log.debug("%s %s: %s, %d plugins", self.fqcn, vers, done, len(result.plugins))
         self.extractions[cksum] = extraction_data(result)
-        self.store.save_extraction(cksum, self.extractions[cksum])
         self.store.clear_failures(self.fqcn, vers, kinds=("extract_error",))
         return True
