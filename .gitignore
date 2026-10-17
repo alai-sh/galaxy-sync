@@ -11,3 +11,5 @@ coverage.xml
 junit/
 dist/
 notes/
+.wrangler/
+node_modules/

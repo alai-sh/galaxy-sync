@@ -22,7 +22,7 @@ jobs:
     environment: r2
     permissions:
       contents: read
-      actions: write  # to pause the sync schedule
+      actions: write  # to pause the syncs
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -51,10 +51,12 @@ jobs:
 
     - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
 
-    # A rebuild can't share the sync's concurrency group: a scheduled sync
-    # would replace it while it waited. So it pauses the schedule instead and
-    # waits for any sync still running. A schedule that was already paused,
-    # e.g. by hand for a deploy, is left paused afterwards.
+    # A rebuild can't share the sync's concurrency group: the next dispatched
+    # sync would replace it while it waited. So it disables sync.yml instead,
+    # which the scheduler checks before dispatching, and waits for any sync
+    # still running. The first wait covers a dispatch sent just before the
+    # disable whose run isn't listed yet. A sync that was already paused, e.g.
+    # by hand for a deploy, is left paused afterwards.
     - name: Pause syncs
       id: pause
       run: |
@@ -63,8 +65,9 @@ jobs:
           gh workflow disable sync.yml --repo "$GITHUB_REPOSITORY"
           echo "paused=true" >> "$GITHUB_OUTPUT"
         else
-          echo "the sync schedule is already paused ($state); leaving it paused"
+          echo "syncs are already paused ($state); leaving them paused"
         fi
+        sleep 30
         while [ -n "$(gh run list --repo "$GITHUB_REPOSITORY" --workflow sync.yml --json status \
             --jq '.[] | select(.status != "completed") | .status')" ]; do
           sleep 30

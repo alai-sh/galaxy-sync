@@ -229,31 +229,105 @@ The workflows are in `.github/workflows/`:
 
 | Workflow | Trigger | Runs |
 |---|---|---|
-| `sync.yml` | every 10 minutes, once `GALAXY_SYNC_REF` is set | `sync --alerts`, then the notification and heartbeat |
+| `sync.yml` | dispatched every 10 minutes by the scheduler; runs once `GALAXY_SYNC_REF` is set | `sync --alerts`, then the notification and heartbeat |
 | `refresh.yml` | manual, with targets and `revalidate` | `refresh`, which only writes a request |
-| `rebuild.yml` | manual, with `dl` and an ansible-core ref | pauses the sync schedule, waits for a running sync, `rebuild`, resumes; a schedule already paused by hand stays paused |
+| `rebuild.yml` | manual, with `dl` and an ansible-core ref | pauses syncs by disabling `sync.yml`, waits for a running sync, `rebuild`, resumes; syncs already paused by hand stay paused |
+
+GitHub's `schedule` trigger runs late or not at all too often to rely on, so
+`sync.yml` has none. A Cloudflare Worker with a cron trigger, in
+`scheduler/`, sends it a `workflow_dispatch` every 10 minutes instead,
+unless the workflow is disabled. A dispatch starts within seconds. To pause
+syncs, disable `sync.yml` (`gh workflow disable sync.yml`); to run one now,
+dispatch it by hand.
 
 Syncs share one concurrency group that never cancels a running job. Runs
 must not overlap: each reads `state.json` and writes it back whole, and
 reconcile rewrites index files the same way. GitHub keeps only the newest
 waiting run in a group and cancels the others. For syncs that loses nothing,
 because the work is in the queue. It's why `refresh` writes a request instead
-of queueing a job, and why `rebuild` pauses the schedule rather than joining
-the group.
+of queueing a job, and why `rebuild` pauses syncs rather than joining the
+group.
 
 As a last guard, `save_state` refuses to save if `state.json` changed since
 the run read it, e.g. because of a run started by hand. On R2 that's a
 conditional write, so it can't race. The run that's refused stops with an
 error, and its work stays queued for the next.
 
+### The scheduler
+
+The Worker reads `sync.yml`'s state and dispatches it on `main`, using a
+fine-grained personal access token limited to this repository with
+**Actions: Read and write** and nothing else. It fits Cloudflare's free
+plan: one of its 5 cron triggers per account, 144 of its 100,000 requests a
+day, and two API calls per run, well inside the CPU limit since waiting on
+GitHub doesn't count. The Worker has no R2 bindings or credentials.
+
+To set it up, with Node.js installed:
+
+1. Create the token under GitHub *Settings > Developer settings >
+   Fine-grained tokens*, with resource owner `alai-sh` and only this
+   repository selected.
+2. From `scheduler/`, log in to the Cloudflare account that holds the R2
+   buckets and deploy:
+
+   ```bash
+   npx wrangler login
+   npx wrangler deploy
+   npx wrangler secret put GITHUB_TOKEN
+   ```
+
+   Cron triggers need the account to have a workers.dev subdomain, even
+   though this Worker isn't served on it. On an account that has never
+   used Workers, the deploy fails with code 10063 until you open *Workers &
+   Pages* in the dashboard once, which creates one; then deploy again.
+   Where there's no browser for `wrangler login`, set `CLOUDFLARE_API_TOKEN`
+   (an API token from the "Edit Cloudflare Workers" template) and
+   `CLOUDFLARE_ACCOUNT_ID` instead.
+3. Within 10 minutes a `Sync` run appears with the event `workflow_dispatch`.
+   The Worker's *Logs* tab in the Cloudflare dashboard shows each trigger,
+   or follow them live with `npx wrangler tail`.
+
+A failed dispatch fails the cron event in the Worker's logs, and the
+heartbeat alerts once syncs stop.
+
+#### Replacing the token
+
+GitHub emails the token's owner before it expires. To replace it:
+
+1. On the token's page under *Fine-grained tokens*, choose **Regenerate
+   token** and pick a new expiry. The repository and permission stay the
+   same. The old token stops working straight away; a trigger that fires
+   before the next step fails harmlessly and the following one catches up.
+2. From `scheduler/`, store the new token:
+
+   ```bash
+   npx wrangler secret put GITHUB_TOKEN
+   ```
+
+   It's used from the next trigger on, with no deploy needed.
+3. Check that the next `Sync` run appears, or that `npx wrangler tail`
+   shows `dispatched sync.yml on main`.
+
+A token that has already expired is replaced the same way. Syncs missed
+meanwhile lose nothing: the work is in the queue.
+
+#### Changing the Worker
+
+Changes to `wrangler.toml` or `src/index.js` take effect on the next
+`npx wrangler deploy` from `scheduler/`, not on merge. A deploy replaces the
+Worker in place and keeps its token. Vars and the cron schedule always come
+from `wrangler.toml`, so dashboard edits to them are lost on the next deploy.
+Renaming the Worker (`name`) creates a second one: delete the old one with
+`npx wrangler delete --name <old name>` and set the token on the new one.
+
 ### Releases
 
-Scheduled workflows always run from `main`, so the workflows check out the
+The workflows always run from `main`, so they check out the
 code at the `GALAXY_SYNC_REF` repository variable instead: a release tag such
 as `v0.3.0`, or a commit. A merge to `main` changes nothing until the
 variable is moved. To release, tag the commit, push the tag, and set the
-variable; to roll back, set it to the previous tag. Until it's set, the
-schedule doesn't run and the manual workflows fail. Dependencies come from
+variable; to roll back, set it to the previous tag. Until it's set, syncs
+are skipped and the manual workflows fail. Dependencies come from
 that ref's `uv.lock` (`uv run --locked`).
 
 Only the code is pinned. The workflow files themselves always come from

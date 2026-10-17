@@ -1,0 +1,21 @@
+# Cloudflare Worker that starts the sync workflow; see "Scheduling" in
+# docs/sync.md. Deploy with `npx wrangler deploy` from this directory, and set
+# the token with `npx wrangler secret put GITHUB_TOKEN`.
+name = "galaxy-sync-scheduler"
+main = "src/index.js"
+compatibility_date = "2026-06-01"
+
+# Cron only: no workers.dev URL or routes, so nothing can call it over HTTP.
+workers_dev = false
+preview_urls = false
+
+[triggers]
+crons = ["*/10 * * * *"]
+
+[vars]
+GITHUB_REPO = "alai-sh/galaxy-sync"
+WORKFLOW = "sync.yml"
+REF = "main"
+
+[observability]
+enabled = true

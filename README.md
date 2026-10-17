@@ -48,7 +48,7 @@ The workflows are described in [scheduling](docs/sync.md#scheduling).
 
 | Trigger | Workflow | Why |
 |---|---|---|
-| Every 10 minutes | `sync.yml` | Picks up new versions, deletions and deprecations; sweeps once a day for what that can't see quickly; works through the initial import 45 minutes at a time |
+| Every 10 minutes, dispatched by the scheduler in `scheduler/` | `sync.yml` | Picks up new versions, deletions and deprecations; sweeps once a day for what that can't see quickly; works through the initial import 45 minutes at a time |
 | Manual | `refresh.yml` with targets | Resyncs specific collections on the next run, ahead of any backlog: a release needed urgently, a collection that looks out of date, or a version that keeps failing |
 | Manual | `refresh.yml` without targets | Sweeps on the next run, e.g. after `deletions_suspected`, instead of waiting for the daily one |
 | After moving the artifacts or changing the Galaxy view format | `rebuild.yml` with `dl` | Rewrites every derived file |

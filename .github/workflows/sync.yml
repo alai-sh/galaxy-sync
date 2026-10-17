@@ -1,8 +1,8 @@
 name: Sync
+# Started every 10 minutes by the Cloudflare Worker in scheduler/, not a
+# schedule trigger: GitHub runs those late or not at all. See "Scheduling" in
+# docs/sync.md.
 on:
-  schedule:
-  - cron: "*/10 * * * *"
-
   workflow_dispatch:
 
 permissions:
@@ -18,7 +18,7 @@ concurrency:
 jobs:
   sync:
     name: sync
-    # Setting the release to run starts the schedule.
+    # Setting the release to run starts the syncs.
     if: vars.GALAXY_SYNC_REF != ''
     runs-on: ubuntu-latest
     # The run stops starting work after --budget (45 minutes). A sweep started
@@ -69,7 +69,8 @@ jobs:
         fi
 
     # A dead man's switch (e.g. healthchecks.io) alerts when these pings stop:
-    # the job failing, the schedule being disabled, or GitHub not running it.
+    # the job failing, the workflow being disabled, or the scheduler not
+    # starting it.
     - name: Heartbeat
       env:
         HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
