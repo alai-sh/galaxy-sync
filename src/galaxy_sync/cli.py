@@ -364,27 +364,20 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
         _extract_builtin(store, args.builtin)
     collections = store.index_collections()
     width = len(str(len(collections)))
-    moved = 0
     for i, (ns, name) in enumerate(collections):
         res = store.rebuild_collection(ns, name)
         parts = [
             f"{res.versions} versions",
             f"Galaxy view: {res.pages} pages written" if res.pages else "Galaxy view unchanged",
         ]
-        if res.moved:
-            parts.append(f"extractions moved from {res.moved} per-artifact objects")
         parts.append(f"{res.plugins} plugin lines")
         print(f"[{i + 1:{width}}/{len(collections)}] {ns}.{name}: {', '.join(parts)}")
-        moved += res.moved
     store.write_galaxy_root()
     store.write_config()
     store.write_collections()
     plugins = store.merge_plugins()
     store.save_state()
-    summary = f"rebuilt {len(collections)} collections ({plugins} plugin lines)"
-    if moved:
-        summary += f"; moved {moved} extractions to one object per collection"
-    print(summary)
+    print(f"rebuilt {len(collections)} collections ({plugins} plugin lines)")
     return 0
 
 

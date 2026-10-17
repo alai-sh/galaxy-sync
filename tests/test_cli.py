@@ -80,10 +80,11 @@ def test_plugins_jsonl_is_patched(galaxy, tmp_path, run):
     galaxy.add_collection("ns", "two", ["1.0.0"])
     assert run("sync") == 0
     assert _plugin_collections(tmp_path) == ["ns.one", "ns.two"]
-    one = tmp_path / "state" / "plugins" / "ns" / "one.jsonl"
-    assert json.loads(one.read_text())["name"] == "thing"
 
-    # The next run merges only what it reconciled, keeping the rest as is.
+    # The next run merges only what it reconciled, keeping the rest as is,
+    # even with ns.one's extractions gone.
+    one = tmp_path / "state" / "extract" / "ns" / "one.json.zst"
+    saved = one.read_bytes()
     one.unlink()
     galaxy.add_collection("ns", "two", ["1.0.0", "1.1.0"])
     assert run("refresh", "ns.two") == 0
@@ -91,10 +92,10 @@ def test_plugins_jsonl_is_patched(galaxy, tmp_path, run):
     assert _plugin_collections(tmp_path) == ["ns.one", "ns.two"]
     assert "plugins_pending" not in Store(Buckets.local(tmp_path)).state
 
-    # rebuild makes every collection's plugin lines again from its extractions.
+    # rebuild works every collection's plugin lines out again from its extractions.
+    _ = one.write_bytes(saved)
     (tmp_path / "index-root" / "plugins.jsonl").unlink()
     assert run("rebuild") == 0
-    assert one.is_file()
     assert _plugin_collections(tmp_path) == ["ns.one", "ns.two"]
 
 
@@ -118,7 +119,7 @@ def test_sync_reports_each_kind_of_change(galaxy, run, tmp_path, capsys, refresh
 
     store = Store(Buckets.local(tmp_path), "")
     lines = store.read_index("ns", "coll")
-    extractions = store.load_extractions("ns", "coll", (line["cksum"] for line in lines))
+    extractions = store.load_extractions("ns", "coll")
     extractions[lines[0]["cksum"]] = {"format": 0, "plugins": [], "routing": {}}
     store.save_extractions("ns", "coll", extractions)
     galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})

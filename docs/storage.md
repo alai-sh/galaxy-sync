@@ -43,7 +43,6 @@ state bucket
   failures.json, failures.md   the failure report
   builtin.jsonl                ansible.builtin's plugin lines (rebuild --builtin)
   extract/<ns>/<name>.json.zst each collection's stored extractions, by artifact sha256
-  plugins/<ns>/<name>.jsonl    each collection's plugin lines, merged into plugins.jsonl
   conflicts/<aa>/<sha256>.tar.gz  Galaxy's artifact for each conflict
 ```
 
@@ -105,13 +104,14 @@ writes.
 Class B reads are what a run costs most of, so a run reads only what it
 works on:
 
-- **`plugins.jsonl`** is patched, not rebuilt. Reconcile writes each
-  collection's plugin lines to `plugins/<ns>/<name>.jsonl` in the state
-  bucket from the extractions it already read, and queues the collection in
-  `plugins_pending`. The run ends by reading `plugins.jsonl`, replacing those
-  collections' lines and writing it back. Only `rebuild` reads every
-  collection's extractions (~4.6k objects once the mirror is full) to make
-  them all again.
+- **`plugins.jsonl`** is patched, not rebuilt. Reconcile works out each
+  collection's plugin lines from the extractions it already read, and
+  queues the collection in `plugins_pending`. The run ends by reading
+  `plugins.jsonl`, replacing those collections' lines and writing it back.
+  A collection left pending by a run that stopped before merging has its
+  lines worked out again from its index file and extractions. Only
+  `rebuild` reads every collection's (~4.6k of each once the mirror is
+  full) to make them all again.
 - **Extractions are one object per collection**, Zstandard-compressed JSON
   keyed by artifact sha256. Reconcile needs every version's extraction, to
   re-extract outdated ones and to build the plugin lines, so it reads one
@@ -128,14 +128,6 @@ works on:
   stopped before writing its index file), and a `PUT` for the Galaxy page.
 - **A run with nothing to do** reads `config.json` and `state.json`, lists
   `requests/`, and writes nothing.
-
-### Moving extractions to one object per collection
-
-Releases before this layout stored each artifact's extraction as
-`extract/<aa>/<sha256>.json`. They're still read when a collection has no
-combined object yet, and removed once it's saved, so a collection moves
-over the next time it's reconciled. After deploying, run `rebuild` once to
-move every collection; the fallback can then be removed in a later release.
 
 ## Trying the output locally
 

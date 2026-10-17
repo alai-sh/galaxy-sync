@@ -46,4 +46,4 @@ def artifact(ns, name, vers, mtime=0, modules=("thing",)):
 
 def extraction(store, cksum, ns="ns", name="coll"):
     """The stored extraction for one artifact, or None."""
-    return store.load_extractions(ns, name, [cksum]).get(cksum)
+    return store.load_extractions(ns, name).get(cksum)

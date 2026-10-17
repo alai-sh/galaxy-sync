@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-from compression import zstd
 
 import pytest
 from helpers import DETAIL, UNAVAILABLE, artifact, extraction
@@ -450,32 +449,3 @@ def test_lost_version_state_is_recorded_again(galaxy, client, store):
     res = reconcile(client, store, "ns", "coll")
     assert not res.changed
     assert store.collection_state("ns.coll")["versions"]["1.0.0"] == {"created_at": created}
-
-
-def _to_legacy(store, ns, name):
-    """Store a collection's extractions the way earlier releases did: one object per artifact."""
-    key = f"extract/{ns}/{name}.json.zst"
-    for cksum, data in json.loads(zstd.decompress(store.state_bucket.read(key))).items():
-        store.state_bucket.write(f"extract/{cksum[:2]}/{cksum}.json", json.dumps(data).encode())
-    store.state_bucket.delete(key)
-    return Store(store.buckets, store.dl_url)
-
-
-def test_per_artifact_extractions_are_moved_over(galaxy, client, store):
-    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
-    reconcile(client, store, "ns", "coll")
-    before = store.load_extractions("ns", "coll", [line["cksum"] for line in store.read_index("ns", "coll")])
-    later = _to_legacy(store, "ns", "coll")
-
-    # Read as they are, not re-extracted, then saved together and removed.
-    assert reconcile(client, later, "ns", "coll").reextracted == []
-    assert list(later.state_bucket.list("extract/")) == ["extract/ns/coll.json.zst"]
-    assert later.load_extractions("ns", "coll", []) == before
-
-
-def test_rebuild_moves_extractions_over(galaxy, client, store):
-    galaxy.add_collection("ns", "coll", ["1.0.0"])
-    reconcile(client, store, "ns", "coll")
-    later = _to_legacy(store, "ns", "coll")
-    assert later.rebuild_collection("ns", "coll").moved == 1
-    assert list(later.state_bucket.list("extract/")) == ["extract/ns/coll.json.zst"]

@@ -3,7 +3,7 @@
     index bucket   config.json, collections.json, plugins.jsonl, index/
     dl bucket      sha256/<aa>/<sha256>.tar.gz
     galaxy bucket  the static Galaxy v3 view (galaxy_api.py)
-    state bucket   state.json, failures.json/.md, builtin.jsonl, extract/, plugins/, conflicts/, requests/
+    state bucket   state.json, failures.json/.md, builtin.jsonl, extract/, conflicts/, requests/
 
 See docs/storage.md. Writes go through `_write`, which skips objects whose
 content hasn't changed, except where the object is known to be new.
@@ -13,7 +13,7 @@ import datetime
 import json
 import logging
 import secrets
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Sequence
 from compression import zstd
 from dataclasses import dataclass
 from typing import cast
@@ -103,7 +103,6 @@ class Rebuilt:
 
     versions: int
     pages: int  # Galaxy view pages that changed
-    moved: int  # per-artifact extraction objects moved into the collection's one
     plugins: int  # plugin lines
 
 
@@ -131,10 +130,8 @@ class Store:
         self._new_conflicts = 0
         # Plugin lines written this run, so merging them needn't read them back.
         self._plugin_lines: dict[str, list[PluginLine]] = {}
-        # Each collection's extractions object as read or last saved, to skip
-        # unchanged saves, and the per-artifact objects it replaces.
+        # Each collection's extractions object as read or last saved, to skip unchanged saves.
         self._saved_extractions: dict[str, bytes] = {}
-        self._legacy_extractions: dict[str, list[str]] = {}
         self._unsaved_work = 0
 
     def _configured_dl(self) -> str | None:
@@ -345,49 +342,23 @@ class Store:
     def _extractions_key(namespace: str, name: str) -> str:
         return f"extract/{namespace}/{name}.json.zst"
 
-    @staticmethod
-    def _legacy_extraction_key(cksum: str) -> str:
-        return f"extract/{cksum[:2]}/{cksum}.json"
-
-    def load_extractions(self, namespace: str, name: str, cksums: Iterable[str]) -> dict[str, ExtractionData]:
-        """A collection's stored extractions, by artifact sha256: one object for the whole collection.
-
-        Earlier releases stored each artifact's extraction as its own object
-        (`extract/<aa>/<sha256>.json`). Those are read when a collection has
-        no combined object yet, and removed once it's saved. A `rebuild`
-        moves every collection over.
-        """
-        fqcn = f"{namespace}.{name}"
+    def load_extractions(self, namespace: str, name: str) -> dict[str, ExtractionData]:
+        """A collection's stored extractions, by artifact sha256: one object for the whole collection."""
         data = self.state_bucket.read(self._extractions_key(namespace, name))
-        if data is not None:
-            self._saved_extractions[fqcn] = data
-            return json.loads(zstd.decompress(data))
-        found: dict[str, ExtractionData] = {}
-        legacy: list[str] = []
-        for cksum in cksums:
-            key = self._legacy_extraction_key(cksum)
-            if (old := self.state_bucket.read(key)) is not None:
-                found[cksum] = json.loads(old)
-                legacy.append(key)
-        self._legacy_extractions[fqcn] = legacy
-        return found
+        if data is None:
+            return {}
+        self._saved_extractions[f"{namespace}.{name}"] = data
+        return json.loads(zstd.decompress(data))
 
-    def save_extractions(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> int:
-        """Save a collection's extractions, unless they're what `load_extractions` read.
-
-        Returns how many per-artifact objects this replaced and removed.
-        """
+    def save_extractions(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> None:
+        """Save a collection's extractions, unless they're what `load_extractions` read."""
         fqcn = f"{namespace}.{name}"
         if not extractions and fqcn not in self._saved_extractions:
-            return 0  # nothing extracted yet, e.g. every version failed
+            return  # nothing extracted yet, e.g. every version failed
         data = zstd.compress((_dump(dict(sorted(extractions.items()))) + "\n").encode(), EXTRACTIONS_LEVEL)
         if data != self._saved_extractions.get(fqcn):
             self.state_bucket.write(self._extractions_key(namespace, name), data)
             self._saved_extractions[fqcn] = data
-        legacy = self._legacy_extractions.pop(fqcn, [])
-        for key in legacy:
-            self.state_bucket.delete(key)
-        return len(legacy)
 
     def save_builtin(self, lines: list[PluginLine]) -> None:
         """Plugin lines for ansible.builtin, merged into every plugins.jsonl."""
@@ -478,19 +449,17 @@ class Store:
     def rebuild_collection(self, namespace: str, name: str) -> Rebuilt:
         """Rewrite one collection's Galaxy view and plugin lines from its index file and extractions.
 
-        `rebuild` runs this for every collection, then `merge_plugins`. It
-        also moves the collection's extractions off per-artifact objects.
+        `rebuild` runs this for every collection, then `merge_plugins`.
         """
         lines = self.read_index(namespace, name)
         pages = self.write_galaxy_collection(namespace, name, lines)
-        extractions = self.load_extractions(namespace, name, (line["cksum"] for line in lines))
-        moved = self.save_extractions(namespace, name, extractions)
-        plugins = self.write_collection_plugins(
+        extractions = self.load_extractions(namespace, name)
+        plugins = self.set_collection_plugins(
             namespace,
             name,
             {line["vers"]: extractions[line["cksum"]] for line in lines if line["cksum"] in extractions},
         )
-        return Rebuilt(len(lines), pages, moved, plugins)
+        return Rebuilt(len(lines), pages, plugins)
 
     def write_config(self) -> None:
         config = {
@@ -507,35 +476,40 @@ class Store:
             namespaces.setdefault(ns, {})[name] = {"updated": updated}
         _ = _write(self.index, "collections.json", json.dumps({"v": 1, "namespaces": namespaces}, indent=1) + "\n")
 
-    @staticmethod
-    def _plugins_key(fqcn: str) -> str:
-        namespace, _, name = fqcn.partition(".")
-        return f"plugins/{namespace}/{name}.jsonl"
+    def set_collection_plugins(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> int:
+        """Work out one collection's plugin lines, from each version's extraction, for `write_plugins` to merge.
 
-    def write_collection_plugins(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> int:
-        """Write one collection's plugin lines, from each version's extraction, for `write_plugins` to merge.
-
-        Every reconcile marks its collection for merging, changed or not: a
-        run that stopped before saving state reconciles it again.
+        Returns how many there are. Every reconcile marks its collection for
+        merging, changed or not: a run that stopped before saving state
+        reconciles it again.
         """
         fqcn = f"{namespace}.{name}"
-        lines = plugin_lines(fqcn, extractions)
-        _ = _write(self.state_bucket, self._plugins_key(fqcn), _jsonl(lines))
-        self._plugin_lines[fqcn] = lines
+        lines = self._plugin_lines[fqcn] = plugin_lines(fqcn, extractions)
         pending = self.state.setdefault("plugins_pending", [])
         if fqcn not in pending:
             pending.append(fqcn)
         return len(lines)
 
     def _collection_plugins(self, fqcn: str) -> list[PluginLine]:
+        """A collection's plugin lines: from this run, or worked out from its index file and extractions."""
         if (lines := self._plugin_lines.get(fqcn)) is not None:
             return lines
-        return cast(list[PluginLine], _read_jsonl(self.state_bucket.read(self._plugins_key(fqcn))))
+        namespace, _, name = fqcn.partition(".")
+        extractions = self.load_extractions(namespace, name)
+        return plugin_lines(
+            fqcn,
+            {
+                line["vers"]: extractions[line["cksum"]]
+                for line in self.read_index(namespace, name)
+                if line["cksum"] in extractions
+            },
+        )
 
     def write_plugins(self) -> int:
         """Merge the collections reconciled since the last merge into plugins.jsonl; returns its line count.
 
-        Reads only plugins.jsonl and those collections' plugin lines. A store
+        Reads only plugins.jsonl, and for a collection reconciled by a run that
+        stopped before merging, its index file and extractions. A store
         without plugins.jsonl gets it built from every collection's.
         """
         if (merged := self.index.read("plugins.jsonl")) is None:

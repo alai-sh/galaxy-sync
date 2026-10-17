@@ -110,7 +110,7 @@ class _Reconcile:
         self.cstate = store.collection_state(self.fqcn)
         self.lines = store.read_index(namespace, name)
         # Each mirrored artifact's extraction, by cksum, for the plugin lines.
-        self.extractions = store.load_extractions(namespace, name, (line["cksum"] for line in self.lines))
+        self.extractions = store.load_extractions(namespace, name)
         # New versions to mirror, and how many have been tried, for the progress log.
         self.missing = 0
         self.attempted = 0
@@ -185,7 +185,7 @@ class _Reconcile:
         if self.lines or not self.res.deferred:  # no empty index file for an import that hasn't started
             # After saving progress, the whole view is rewritten: yanks,
             # deprecation and rechecks can have changed lines already written.
-            _ = self.store.save_extractions(self.namespace, self.name, self.extractions)
+            self.store.save_extractions(self.namespace, self.name, self.extractions)
             changed = self.store.write_index(
                 self.namespace, self.name, self.lines, self.unwritten, view=self.saved_progress
             )
@@ -201,7 +201,7 @@ class _Reconcile:
         here; the end of the reconcile writes the rest of the view.
         """
         log.info("%s: saving progress, %d of %d new versions done", self.fqcn, self.attempted, self.missing)
-        _ = self.store.save_extractions(self.namespace, self.name, self.extractions)
+        self.store.save_extractions(self.namespace, self.name, self.extractions)
         _ = self.store.write_index(self.namespace, self.name, lines, self.unwritten, partial=True)
         self._write_plugins(lines)
         self.store.save_state()
@@ -249,7 +249,7 @@ class _Reconcile:
 
     def _write_plugins(self, lines: list[IndexLine]) -> None:
         if lines:
-            _ = self.store.write_collection_plugins(
+            _ = self.store.set_collection_plugins(
                 self.namespace,
                 self.name,
                 {line["vers"]: self.extractions[line["cksum"]] for line in lines if line["cksum"] in self.extractions},
@@ -262,7 +262,7 @@ class _Reconcile:
             if not line["yanked"]:
                 line["yanked"] = True
                 self.res.yanked.append(line["vers"])
-        _ = self.store.save_extractions(self.namespace, self.name, self.extractions)
+        self.store.save_extractions(self.namespace, self.name, self.extractions)
         self.res.changed = self.store.write_index(self.namespace, self.name, self.lines) if self.lines else False
         self._write_plugins(self.lines)
         _ = self.cstate.pop("upstream_updated", None)  # the listing check stops looking for it
