@@ -310,7 +310,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
     # Requested collections go before the sweep, which can take most of the budget.
     worked: dict[str, Result | str] = {}
     _work(client, store, deadline, worked, requested=True)
-    swept = _sweep_due(store) and _sweep(client, store)
+    # Once started, the sweep runs to the end, so it isn't started after the
+    # budget has run out; the next run starts with it instead.
+    swept = time.monotonic() < deadline and _sweep_due(store) and _sweep(client, store)
     _work(client, store, deadline, worked)
     if res.unchanged and not (requests or swept or worked):
         return _exit_code(store, args)  # nothing changed: skip rewriting the aggregate files

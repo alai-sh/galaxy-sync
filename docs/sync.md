@@ -23,7 +23,11 @@ uses:
    now is compared with the mirrored artifact's, but only when the version
    is yanked, when `--revalidate` asks, or when Galaxy's `created_at`
    changed (see [Artifact checks](#artifact-checks)).
-4. **Versions the index has that Galaxy no longer lists:** yanked.
+4. **Versions the index has that Galaxy no longer lists:** yanked, once
+   the version's own detail page returns 404. A delete while a long listing
+   is paged can shift another version past the reader, so the listing alone
+   is never enough. A version whose page is still there is kept, and one
+   Galaxy can't answer for is kept and retried as a failure.
 5. **Deprecation** is copied from the collection onto every line.
 
 Writes go artifacts, then index files, then aggregate files, so the index
@@ -63,7 +67,9 @@ same work, so it doesn't matter which run picks it up. Each `sync`:
    the next run.
 3. **Works what was requested,** ahead of everything else.
 4. **Sweeps** once a day (below), queueing everything that differs. It comes
-   after the requested collections, since it can take most of the budget.
+   after the requested collections, since it can take most of the budget,
+   and isn't started once the budget has run out: it runs to the end once
+   started, so the next run does it instead.
 5. **Works the rest of the queue** in order: new uploads, then what the
    listing and the sweep found, which includes the initial import's backlog.
    Collections with outstanding failures come last. A collection leaves the

@@ -478,6 +478,10 @@ def test_budget(galaxy, run, tmp_path, capsys):
     store = Store(Buckets.local(tmp_path))
     del store.state["last_sweep"]
     store.save_state()
+    # A sweep that's due isn't started once the budget has run out.
+    assert run("sync", "--budget", "0") == 0
+    assert "sweep:" not in capsys.readouterr().out
+    assert "last_sweep" not in state(tmp_path)
     assert run("sync") == 0
     out = capsys.readouterr().out
     assert "the published repo hasn't changed" in out

@@ -17,7 +17,7 @@ guaranteed, and the only ones `reconcile` uses.
 |---|---|
 | `GET /api/v3/collections/<ns>/<name>/` | `created_at`, `updated_at`, `deprecated` (best effort). A 404 means the collection is deleted |
 | `GET /api/v3/collections/<ns>/<name>/versions/?limit=100` | `data[]` (or `results[]`) `.version`, `.created_at`, `.requires_ansible`; follow `links.next`. A missing collection returns an empty list, never a 404 |
-| `GET /api/v3/collections/<ns>/<name>/versions/<ver>/` | `artifact.sha256`, `download_url`, `metadata.dependencies`, `created_at` |
+| `GET /api/v3/collections/<ns>/<name>/versions/<ver>/` | `artifact.sha256`, `download_url`, `metadata.dependencies`, `created_at`. A 404 means the version is deleted |
 | `GET <download_url>` | 302 to a signed, time-limited URL; the bare content URL is 403 |
 
 `artifact.size`, `manifest`, `files` and `deprecated` aren't in the contract:

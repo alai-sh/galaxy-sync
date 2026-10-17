@@ -16,7 +16,7 @@ import alai_plugin_extractor as ext
 
 from . import semver
 from .artifacts import contents_digest, describe_changes, manifest_info
-from .galaxy import GalaxyClient, GalaxyError
+from .galaxy import GalaxyClient, GalaxyError, NotFound
 from .models import Conflict, ExtractionData, GalaxyVersion, GalaxyVersionDetail, IndexLine, VersionState
 from .plugins import EXTRACTION_FORMAT, extraction_data
 from .store import Store
@@ -155,8 +155,7 @@ class _Reconcile:
 
         upstream_vers = {v["version"] for v in upstream}
         for line in self.lines:
-            if line["vers"] not in upstream_vers and not line["yanked"]:
-                log.info("%s %s: no longer listed by Galaxy, yanking", self.fqcn, line["vers"])
+            if line["vers"] not in upstream_vers and not line["yanked"] and self._deleted_upstream(line["vers"]):
                 line["yanked"] = True
                 self.res.yanked.append(line["vers"])
         # Versions that failed but are no longer on Galaxy don't need retrying.
@@ -206,6 +205,34 @@ class _Reconcile:
         self.store.save_state()
         self.unwritten = []
         self.saved_progress = True
+
+    def _deleted_upstream(self, vers: str) -> bool:
+        """Whether a version the listing left out is really gone: its own page returns 404.
+
+        A delete while a long listing is paged can shift a row past us, so the
+        listing alone never yanks anything.
+        """
+        try:
+            _ = self.client.version_detail(self.namespace, self.name, vers)
+        except NotFound:
+            log.info("%s %s: deleted from Galaxy, yanking", self.fqcn, vers)
+            self.store.clear_failures(self.fqcn, vers, exclude=("extract_error",))
+            return True
+        except GalaxyError as e:
+            self.store.record_failure(self.fqcn, vers, e.kind, f"checking whether it was deleted: {e}")
+            self.res.errors.append(f"{vers}: {e.kind}: {e}")
+            return False
+        log.info("%s %s: missing from the listing but still on Galaxy, keeping it", self.fqcn, vers)
+        # An earlier check that couldn't reach Galaxy is over; a recheck's
+        # failures for this version aren't.
+        mine = (
+            e["kind"]
+            for e in self.store.state["failures"].values()
+            if (e["collection"], e["version"]) == (self.fqcn, vers)
+        )
+        if kinds := tuple({k for k in mine if k == "galaxy_unavailable" or k.startswith("galaxy_http_")}):
+            self.store.clear_failures(self.fqcn, vers, kinds=kinds)
+        return False
 
     def _heal_extractions(self) -> None:
         """Re-extract mirrored versions with no stored result, or one in an older format."""

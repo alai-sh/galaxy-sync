@@ -87,6 +87,7 @@ class MockGalaxy:
         self.listed[(ns, name)] = coll
         for key in [k for k in self.uploaded if k[:2] == (ns, name) and k[2] not in versions]:
             del self.uploaded[key]
+            _ = self.routes.pop(f"{base}/versions/{urllib.parse.quote(key[2], safe='')}/", None)  # deleted
         for v in versions:
             if (ns, name, v) not in self.uploaded:
                 self.uploaded[(ns, name, v)] = self.upload_time()

@@ -21,9 +21,9 @@ jobs:
     # Setting the release to run starts the schedule.
     if: vars.GALAXY_SYNC_REF != ''
     runs-on: ubuntu-latest
-    # The run stops starting work after --budget (45 minutes); the daily sweep
-    # and the last collection can take it past that.
-    timeout-minutes: 120
+    # The run stops starting work after --budget (45 minutes). A sweep started
+    # just before that runs to the end, 30-40 minutes or more on a slow day.
+    timeout-minutes: 90
     environment: r2
     permissions:
       contents: read

@@ -177,6 +177,28 @@ def test_deleted_versions_are_yanked_and_restored(galaxy, client, store):
     assert [line["yanked"] for line in store.read_index("ns", "coll")] == [False, False]
 
 
+def test_a_version_missing_from_the_listing_is_checked_before_yanking(galaxy, client, store):
+    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
+    reconcile(client, store, "ns", "coll")
+    listing = "/api/v3/collections/ns/coll/versions/?limit=100"
+    rows = galaxy.routes[listing][1]["data"]
+
+    # Paging shifted 1.1.0 past us, but its own page is still there: kept.
+    galaxy.json(listing, {"data": [r for r in rows if r["version"] == "1.0.0"], "links": {"next": None}})
+    assert reconcile(client, store, "ns", "coll").yanked == []
+
+    # Galaxy can't say: kept, and the check is retried.
+    galaxy.routes[DETAIL.format("1.1.0")] = UNAVAILABLE
+    res = reconcile(client, store, "ns", "coll")
+    assert (res.yanked, len(res.errors)) == ([], 1)
+    assert [e["version"] for e in store.state["failures"].values()] == ["1.1.0"]
+
+    # Deleted: its page is a 404.
+    del galaxy.routes[DETAIL.format("1.1.0")]
+    assert reconcile(client, store, "ns", "coll").yanked == ["1.1.0"]
+    assert not store.state["failures"]
+
+
 def test_deleted_collection_is_yanked(galaxy, client, store):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     reconcile(client, store, "ns", "coll")

@@ -66,8 +66,9 @@ gitignored.
   overwrite.
 - **Only reconcile changes the mirror, and only from contract endpoints.**
   Change detection only picks collections. Only a 404 from
-  `GET /api/v3/collections/<ns>/<name>/` counts as a deletion, so a flaky or
-  truncated feed or listing can't yank anything.
+  `GET /api/v3/collections/<ns>/<name>/`, or for one version from
+  `.../versions/<ver>/`, counts as a deletion, so a flaky, truncated or
+  shifting feed or listing can't yank anything.
 - **Request the CLI-shaped `/api/v3/collections/...` paths**, not the
   `plugin/ansible/content/published/...` paths they redirect to.
 - **Runs never overlap, and work lives in the queue.** Every run reads
