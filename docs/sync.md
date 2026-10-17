@@ -185,7 +185,8 @@ our contents again, which resolves it and clears the flag.
 ## Failures and conflicts
 
 A failure never stops a run. It's recorded in the ledger in `state.json`,
-retried by every `sync`, and cleared once it succeeds.
+retried by every `sync`, and cleared once it succeeds. Each `sync` starts by
+listing the outstanding failures, so a run's log shows what it will retry.
 Recorded failures exit 0; `--strict` exits 1.
 
 | Kind | Meaning |

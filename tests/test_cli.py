@@ -134,7 +134,7 @@ def test_sync_reports_each_kind_of_change(galaxy, run, tmp_path, capsys, refresh
     assert "unyanked 1.1.0" in capsys.readouterr().out
 
 
-def test_failures_are_recorded_and_retried(galaxy, run, tmp_path, capsys, refresh):
+def test_failures_are_recorded_and_retried(galaxy, run, tmp_path, capsys, refresh, monkeypatch):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     good = galaxy.routes[DETAIL.format("1.0.0")]
     galaxy.routes[DETAIL.format("1.0.0")] = UNAVAILABLE
@@ -154,8 +154,17 @@ def test_failures_are_recorded_and_retried(galaxy, run, tmp_path, capsys, refres
     galaxy.routes[DETAIL.format("1.0.0")] = good
     galaxy.add_collection("ns", "broken", [])
     capsys.readouterr()
+    monkeypatch.setattr(cli, "SHOW_FAILURES", 1)
     assert run("sync", "--strict") == 0
-    assert "failures: 0 outstanding, 0 new, 2 resolved" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert out.startswith(
+        "2 failures outstanding from earlier runs; collections are retried after the queue:\n  ns.broken *: galaxy_http_403, 1 attempts since "
+    )
+    assert "\n  and 1 more; see failures.md in the state bucket\n" in out
+    assert "failures: 0 outstanding, 0 new, 2 resolved" in out
+    # Nothing outstanding: nothing listed.
+    assert run("sync") == 0
+    assert "failures outstanding" not in capsys.readouterr().out
 
 
 def test_unexpected_errors_are_recorded(galaxy, run, capsys, monkeypatch, refresh):

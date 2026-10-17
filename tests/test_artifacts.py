@@ -18,6 +18,14 @@ from galaxy_sync.artifacts import contents_digest, describe_changes, manifest_in
         pytest.param({"MANIFEST.json": b"[1]"}, {}, id="not-an-object"),
         pytest.param({"MANIFEST.json": b'{"collection_info": "c"}'}, {}, id="info-not-an-object"),
         pytest.param({"plugins/x.py": b""}, {}, id="missing"),
+        pytest.param(
+            {
+                "MANIFEST.json": b'{"collection_info": {"version": "1.0.0"}}',
+                "./MANIFEST.json": b'{"collection_info": {"version": "1.0.1"}}',
+            },
+            {"version": "1.0.1"},
+            id="appended-twice",
+        ),
     ],
 )
 def test_manifest_info(members, expected):

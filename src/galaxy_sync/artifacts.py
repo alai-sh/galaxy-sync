@@ -32,17 +32,23 @@ def manifest_info(data: bytes) -> dict[str, object]:
     Raises tarfile.TarError or ValueError if the tarball or the JSON can't be
     read. Extraction never blocks mirroring, so this is what checks that the
     download is the collection version it claims to be.
+
+    A tarball can hold MANIFEST.json more than once (appended with `tar -r`).
+    The last one is read, as tar, ansible-galaxy and alai-plugin-extractor do.
     """
     with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        found = None
         for member in tar:
             if member.isfile() and _member_name(member) == "MANIFEST.json":
-                if member.size > _MAX_MANIFEST:
-                    raise ValueError(f"MANIFEST.json is {member.size} bytes")
-                f = tar.extractfile(member)
-                manifest: object = json.loads(f.read()) if f else None
-                info = cast(dict[str, object], manifest).get("collection_info") if isinstance(manifest, dict) else None
-                return cast(dict[str, object], info) if isinstance(info, dict) else {}
-    return {}
+                found = member
+        if found is None:
+            return {}
+        if found.size > _MAX_MANIFEST:
+            raise ValueError(f"MANIFEST.json is {found.size} bytes")
+        f = tar.extractfile(found)
+        manifest: object = json.loads(f.read()) if f else None
+        info = cast(dict[str, object], manifest).get("collection_info") if isinstance(manifest, dict) else None
+        return cast(dict[str, object], info) if isinstance(info, dict) else {}
 
 
 def _sha256(f: IO[bytes]) -> str:

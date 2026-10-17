@@ -112,6 +112,26 @@ def _print_summary(store: Store, worked: dict[str, Result | str], elapsed: float
         print(f"mirror: {mirrored} of {published} versions Galaxy publishes ({mirrored / published:.1%})")
 
 
+# How many outstanding failures a run lists when it starts; the rest are in failures.md.
+SHOW_FAILURES = 20
+
+
+def _print_outstanding(store: Store) -> None:
+    """List the failures earlier runs left, which this run retries once the queue is worked."""
+    failures = sorted(store.state["failures"].values(), key=lambda e: (e["collection"], e["version"] or "", e["kind"]))
+    if not failures:
+        return
+    print(f"{len(failures)} failures outstanding from earlier runs; collections are retried after the queue:")
+    for e in failures[:SHOW_FAILURES]:
+        message = e["message"].replace("\n", " ")
+        print(
+            f"  {e['collection']} {e['version'] or '*'}: {e['kind']}, {e['attempts']} attempts "
+            + f"since {e['first_seen']}: {message[:200]}"
+        )
+    if len(failures) > SHOW_FAILURES:
+        print(f"  and {len(failures) - SHOW_FAILURES} more; see failures.md in the state bucket")
+
+
 def _queue_requests(client: GalaxyClient, store: Store) -> int:
     """Queue every waiting `refresh` request and delete it; returns how many were taken."""
     taken = 0
@@ -275,6 +295,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     deadline = started + args.budget * 60
     client = GalaxyClient(args.galaxy_url)
     store = _open_store(args)
+    _print_outstanding(store)
     initial = "feed_cursor" not in store.state
     res = discover(client, store)
     if not res.ok:
