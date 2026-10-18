@@ -3,7 +3,7 @@
     index bucket   config.json, collections.json, plugins.jsonl, index/
     dl bucket      sha256/<aa>/<sha256>.tar.gz
     galaxy bucket  the static Galaxy v3 view (galaxy_api.py)
-    state bucket   state.json, failures.json/.md, builtin.jsonl, extract/, conflicts/, requests/
+    state bucket   state.json, failures.json, builtin.jsonl, extract/, conflicts/, requests/
 
 See docs/storage.md. Writes go through `_write`, which skips objects whose
 content hasn't changed, except where the object is known to be new.
@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from . import galaxy_api, report
-from .models import CollectionState, Conflict, ExtractionData, IndexLine, PluginLine, Request, SyncState
+from .models import CollectionState, Conflict, ExtractionData, Failure, IndexLine, PluginLine, Request, SyncState
 from .plugins import plugin_lines
 from .storage import Backend, Buckets, PreconditionFailed, StorageError
 from .times import now
@@ -127,7 +127,7 @@ class Store:
         # Ledger keys that appeared or cleared during this run, for the report.
         self._new_failures: set[str] = set()
         self._resolved_failures: set[str] = set()
-        self._new_conflicts = 0
+        self._new_conflicts: list[Conflict] = []
         # Plugin lines written this run, so merging them needn't read them back.
         self._plugin_lines: dict[str, list[PluginLine]] = {}
         # Each collection's extractions object as read or last saved, to skip unchanged saves.
@@ -292,7 +292,7 @@ class Store:
         if any((c["collection"], c["version"], c["upstream"]) == same for c in self.open_conflicts()):
             return False
         self.state["conflicts"].append(conflict)
-        self._new_conflicts += 1
+        self._new_conflicts.append(conflict)
         return True
 
     def resolve_conflicts(self, fqcn: str, vers: str) -> bool:
@@ -304,17 +304,18 @@ class Store:
                 found = True
         return found
 
-    def write_failure_report(self) -> report.Summary:
+    def write_failure_report(self) -> report.Report:
+        """Write failures.json and return the report, with the Markdown for the tracking issue."""
         failures = self.state["failures"]
         new = self._new_failures & {k for k, e in failures.items() if e["attempts"] == 1}
         generated = now()
         cutoff = datetime.datetime.fromisoformat(generated) - PERSISTENT
-        persistent = 0
+        persistent: list[Failure] = []
         for entry in failures.values():
             if "alerted" not in entry and datetime.datetime.fromisoformat(entry["first_seen"]) <= cutoff:
                 entry["alerted"] = generated
-                persistent += 1
-        as_json, as_md, summary = report.render(
+                persistent.append(entry)
+        result = report.render(
             failures,
             self.open_conflicts(),
             new,
@@ -322,9 +323,8 @@ class Store:
             generated,
             alerts=report.Alerts(self._new_conflicts, persistent),
         )
-        _ = _write(self.state_bucket, "failures.json", as_json)
-        _ = _write(self.state_bucket, "failures.md", as_md)
-        return summary
+        _ = _write(self.state_bucket, "failures.json", result.json)
+        return result
 
     @staticmethod
     def artifact_key(cksum: str) -> str:

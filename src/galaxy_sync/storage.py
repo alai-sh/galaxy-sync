@@ -144,7 +144,6 @@ CONTENT_TYPES = {
     ".json": "application/json",
     ".html": "application/json",
     ".jsonl": "text/plain; charset=utf-8",
-    ".md": "text/markdown; charset=utf-8",
     ".tar.gz": "application/gzip",
     ".zst": "application/zstd",
 }

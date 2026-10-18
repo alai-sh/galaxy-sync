@@ -204,18 +204,32 @@ with the version naming the check: `published`, `feed`, `listing`, `count`,
 `sweep` or `requests`. Each clears when that check next works.
 
 Conflicts aren't failures: they aren't retried, and they stay open until
-Galaxy serves our contents again. Every run writes `failures.json` and
-`failures.md` with the outstanding failures and open conflicts.
+Galaxy serves our contents again. Every run writes `failures.json` with the
+outstanding failures and open conflicts.
 
 ### Notifications
 
-The report stays in the private state bucket. A run notifies only about
-what newly needs a person: a conflict opened, or a failure outstanding for
-over a day (each failure once). `sync --alerts FILE` writes that as counts
-without names, e.g. "1 new conflicts; see failures.md in the state bucket",
-or leaves the file empty. The scheduled workflow posts it as a comment on a
-tracking issue, which emails the issue's subscribers. Transient failures that
-clear within a day never notify.
+`failures.json` stays in the private state bucket. People read the report on
+a tracking issue instead, in two parts:
+
+- `sync --report FILE` writes the outstanding failures and open conflicts as
+  a Markdown block, between `<!-- galaxy-sync:report -->` and
+  `<!-- /galaxy-sync:report -->` markers. The scheduled workflow keeps the
+  block at the top of the issue's description (`.github/scripts/issue_body.py`
+  replaces the previous block, or puts the first one above whatever is
+  there, so notes kept below it survive), editing it only when it changed.
+  The block has no timestamp or attempt counts, so it changes only when what
+  is outstanding does. Editing the description doesn't notify anyone, which
+  suits routine churn, and resolved failures just disappear from it.
+- `sync --alerts FILE` writes what a person should hear about: a conflict
+  opened, or a failure outstanding for over a day (each failure once), as a
+  Markdown comment listing just those entries, or leaves the file empty. The
+  workflow posts it as a comment, which emails the issue's subscribers.
+  Transient failures that clear within a day never notify.
+
+Both leave out what shouldn't be public: the state bucket key of a
+conflict's saved artifact, and URLs in `unexpected` messages, which can name
+the storage endpoint. `failures.json` has them.
 
 A run can't report that runs have stopped. So each successful run also pings
 a heartbeat URL, and the heartbeat service alerts when the pings stop. Set it
@@ -230,7 +244,7 @@ The workflows are in `.github/workflows/`:
 
 | Workflow | Trigger | Runs |
 |---|---|---|
-| `sync.yml` | dispatched every 10 minutes by the scheduler; runs once `GALAXY_SYNC_REF` is set | `sync --alerts`, then the notification and heartbeat |
+| `sync.yml` | dispatched every 10 minutes by the scheduler; runs once `GALAXY_SYNC_REF` is set | `sync --report --alerts`, then the tracking issue update, the notification and the heartbeat |
 | `refresh.yml` | manual, with targets and `revalidate` | `refresh`, which only writes a request |
 | `rebuild.yml` | manual, with `dl` and an ansible-core ref | pauses syncs by disabling `sync.yml`, waits for a running sync, `rebuild`, resumes; syncs already paused by hand stay paused |
 

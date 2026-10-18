@@ -111,14 +111,15 @@ def test_failure_report_counts(galaxy, client, store):
     good = galaxy.routes[DETAIL.format("1.0.0")]
     galaxy.routes[DETAIL.format("1.0.0")] = UNAVAILABLE
     reconcile(client, store, "ns", "coll")
-    assert store.write_failure_report() == Summary(outstanding=1, new=1, resolved=0, conflicts=0)
-    report = store.state_bucket.read("failures.md").decode()
-    assert "| ns.coll | 1.0.0 | galaxy_unavailable | 1 |" in report
+    report = store.write_failure_report()
+    assert report.summary == Summary(outstanding=1, new=1, resolved=0, conflicts=0)
+    assert "| ns.coll | 1.0.0 | galaxy_unavailable | 20" in report.markdown
+    assert json.loads(store.state_bucket.read("failures.json"))["outstanding"][0]["attempts"] == 1
 
     later = reload(store)
     galaxy.routes[DETAIL.format("1.0.0")] = good
     reconcile(client, later, "ns", "coll")
-    assert later.write_failure_report() == Summary(outstanding=0, new=0, resolved=1, conflicts=0)
+    assert later.write_failure_report().summary == Summary(outstanding=0, new=0, resolved=1, conflicts=0)
 
 
 def test_outdated_extractions_are_rerun(galaxy, client, store):
@@ -256,10 +257,11 @@ def test_changed_contents_are_a_conflict(galaxy, client, store):
     assert conflict["changes"] == "added plugins/modules/other.py; removed plugins/modules/thing.py"
     assert store.state_bucket.read(conflict["saved"]) == changed
     assert store.state["failures"] == {}  # reported as a conflict, not retried as a failure
-    store.write_failure_report()
-    report = store.state_bucket.read("failures.md").decode()
-    assert "## Conflicts to inspect" in report
-    assert f"| ns.coll | 1.0.0 | {original['cksum'][:12]} | {upstream[:12]} |" in report
+    report = store.write_failure_report()
+    assert "### Conflicts to inspect" in report.markdown
+    assert f"| ns.coll | 1.0.0 | {original['cksum'][:12]} | {upstream[:12]} |" in report.markdown
+    assert conflict["saved"] not in report.markdown  # the state bucket key stays private
+    assert report.summary.alerts.conflicts == [conflict]
 
     # Seen again: still one open conflict, and no new download.
     galaxy.requests.clear()

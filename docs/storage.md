@@ -40,7 +40,7 @@ Galaxy view bucket
 state bucket
   state.json                   cursors, the queue, per-collection state, the failure ledger, conflicts
   requests/<time>-<id>.json    `refresh` requests waiting for the next sync
-  failures.json, failures.md   the failure report
+  failures.json                the failure report
   builtin.jsonl                ansible.builtin's plugin lines (rebuild --builtin)
   extract/<ns>/<name>.json.zst each collection's stored extractions, by artifact sha256
   conflicts/<aa>/<sha256>.tar.gz  Galaxy's artifact for each conflict

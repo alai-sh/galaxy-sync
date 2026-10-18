@@ -47,7 +47,7 @@ jobs:
     - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
 
     - name: Sync
-      run: uv run --locked galaxy-sync sync --r2 --alerts alerts.md -v
+      run: uv run --locked galaxy-sync sync --r2 --report report.md --alerts alerts.md -v
       env:
         R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -57,14 +57,24 @@ jobs:
         ALAI_GALAXY_BUCKET: ${{ vars.ALAI_GALAXY_BUCKET }}
         ALAI_STATE_BUCKET: ${{ vars.ALAI_STATE_BUCKET }}
 
-    # Counts only; the details stay in failures.md in the state bucket. A
-    # comment notifies the issue's subscribers.
-    - name: Notify
+    # The report block is kept at the top of the tracking issue's description,
+    # edited only when it changed; edits don't notify anyone. Conflicts opened
+    # and failures that became persistent this run are posted as a comment,
+    # which notifies the issue's subscribers.
+    - name: Report
+      if: vars.TRACKING_ISSUE != ''
       env:
         GH_TOKEN: ${{ github.token }}
         ISSUE: ${{ vars.TRACKING_ISSUE }}
       run: |
-        if [ -s alerts.md ] && [ -n "$ISSUE" ]; then
+        if [ -f report.md ]; then
+          gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json body -q .body > body.md
+          python3 -I .github/scripts/issue_body.py body.md report.md > new-body.md
+          if [ -s new-body.md ]; then
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file new-body.md
+          fi
+        fi
+        if [ -s alerts.md ]; then
           gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file alerts.md
         fi
 

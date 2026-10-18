@@ -36,10 +36,11 @@ uv run galaxy-sync COMMAND [OPTIONS] ...
 | `-v` | all | Debug logging |
 | `--galaxy-url URL` | `sync` | Galaxy server (default `https://galaxy.ansible.com`) |
 | `--strict` | `sync` | Exit 1 while any failure or conflict is outstanding |
-| `--alerts FILE` | `sync` | Write what newly needs a person (counts only), or an empty file |
+| `--report FILE` | `sync` | Write the outstanding failures and conflicts as a Markdown block for the tracking issue |
+| `--alerts FILE` | `sync` | Write the conflicts opened and the failures that became persistent this run as a Markdown comment, or an empty file |
 
 A run never stops on a failure: it records it in the failure report
-(`failures.md` in the state bucket) and carries on, and exits 0 unless
+(`failures.json` in the state bucket) and carries on, and exits 0 unless
 `--strict` is given.
 
 ## Scheduled and manual runs
@@ -54,10 +55,10 @@ The workflows are described in [scheduling](docs/sync.md#scheduling).
 | After moving the artifacts or changing the Galaxy view format | `rebuild.yml` with `dl` | Rewrites every derived file |
 | After an ansible-core release | `rebuild.yml` with an ansible-core ref | Updates `ansible.builtin` in the plugin index |
 
-A new conflict, or a failure outstanding for over a day, is posted as a
-comment on a tracking issue, with counts only; the details are in
-`failures.md` in the state bucket. A heartbeat ping from every successful
-run catches the runs stopping.
+The scheduled run keeps the outstanding failures and conflicts at the top
+of a tracking issue's description, and posts a new conflict, or a failure
+outstanding for over a day, as a comment there. A heartbeat ping from every
+successful run catches the runs stopping.
 
 ## Documentation
 

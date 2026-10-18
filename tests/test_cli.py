@@ -2,7 +2,7 @@ import json
 import re
 
 import pytest
-from helpers import DETAIL, FEED, LISTING, REPO_METADATA, UNAVAILABLE, tarball
+from helpers import DETAIL, FEED, LISTING, REPO_METADATA, UNAVAILABLE, artifact, tarball
 
 from galaxy_sync import cli
 from galaxy_sync import store as store_mod
@@ -160,7 +160,7 @@ def test_failures_are_recorded_and_retried(galaxy, run, tmp_path, capsys, refres
     assert out.startswith(
         "2 failures outstanding from earlier runs; collections are retried after the queue:\n  ns.broken *: galaxy_http_403, 1 attempts since "
     )
-    assert "\n  and 1 more; see failures.md in the state bucket\n" in out
+    assert "\n  and 1 more; see failures.json in the state bucket\n" in out
     assert "failures: 0 outstanding, 0 new, 2 resolved" in out
     # Nothing outstanding: nothing listed.
     assert run("sync") == 0
@@ -513,7 +513,12 @@ def test_alerts(galaxy, run, tmp_path, capsys):
     galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})
     assert run("refresh", "--revalidate", "ns.coll") == 0
     assert run("sync", "--alerts", str(alerts)) == 0
-    assert alerts.read_text() == "galaxy-sync: 1 new conflicts; see failures.md in the state bucket.\n"
+    text = alerts.read_text()
+    assert text.startswith("**galaxy-sync: 1 new conflict**\n\nNew conflicts.")
+    assert "\n| Collection | Version | Ours | Galaxy | Seen | Changes |\n" in text
+    assert "\n| ns.coll | 1.0.0 | " in text
+    assert "conflicts/" not in text  # the state bucket key stays private
+    assert text.endswith("\nThe full current report is in this issue's description.\n")
     assert run("refresh", "--revalidate", "ns.coll") == 0
     assert run("sync", "--alerts", str(alerts)) == 0
     assert alerts.read_text() == ""
@@ -528,10 +533,12 @@ def test_alerts(galaxy, run, tmp_path, capsys):
         failure["first_seen"] = "2026-01-01T00:00:00Z"
     (tmp_path / "state" / "state.json").write_text(json.dumps(current))
     assert run("sync", "--alerts", str(alerts)) == 0
-    assert (
-        alerts.read_text()
-        == "galaxy-sync: 1 failures outstanding for over a day; see failures.md in the state bucket.\n"
+    text = alerts.read_text()
+    assert text.startswith(
+        "**galaxy-sync: 1 failure outstanding for over a day**\n\nFailures outstanding for over a day"
     )
+    assert "\n| Collection | Version | Kind | Attempts | First seen | Message |\n|---|---|---|---|---|---|\n" in text
+    assert "\n| ns.other | 1.0.0 | galaxy_unavailable | 2 | 2026-01-01T00:00:00Z | " in text
     assert run("sync", "--alerts", str(alerts)) == 0
     assert alerts.read_text() == ""
 
@@ -571,3 +578,55 @@ def test_sync_summary(galaxy, run, capsys):
     assert re.search(r"^  ns\.coll +\+2 +2/2$", summary, re.MULTILINE)
     assert "queue: 0 collections left (0 requested, 0 uploaded, 0 listed, 0 swept)" in summary
     assert "mirror: 2 of 3 versions Galaxy publishes (66.7%)" in summary
+
+
+def test_report(galaxy, run, tmp_path):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    report = tmp_path / "report.md"
+    assert run("sync", "--report", str(report)) == 0
+    assert report.read_text() == (
+        "<!-- galaxy-sync:report -->\n## galaxy-sync report\n\n"
+        + "No outstanding failures or open conflicts.\n<!-- /galaxy-sync:report -->\n"
+    )
+
+    # A failure and a conflict appear, without attempts or a timestamp, so
+    # the block only changes when what's outstanding does.
+    galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})
+    galaxy.add_collection("ns", "other", ["1.0.0"])
+    galaxy.routes[DETAIL.replace("ns/coll", "ns/other").format("1.0.0")] = UNAVAILABLE
+    assert run("refresh", "--revalidate", "ns.coll") == 0
+    assert run("sync", "--report", str(report)) == 0
+    text = report.read_text()
+    assert "\n1 failure outstanding, 1 conflict to inspect.\n" in text
+    assert "\n| Collection | Version | Kind | First seen | Message |\n|---|---|---|---|---|\n" in text
+    assert "\n| ns.other | 1.0.0 | galaxy_unavailable | 20" in text
+    assert "\n### Conflicts to inspect\n" in text
+    assert "\n| ns.coll | 1.0.0 | " in text
+    assert "conflicts/" not in text
+    report.unlink()
+    assert run("sync", "--report", str(report)) == 0
+    assert report.read_text() == text
+
+    # Resolved: back to nothing outstanding.
+    galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": artifact("ns", "coll", "1.0.0")})
+    galaxy.add_collection("ns", "other", ["1.0.0"])
+    assert run("refresh", "--revalidate", "ns.coll") == 0
+    assert run("sync", "--report", str(report)) == 0
+    assert "No outstanding failures or open conflicts." in report.read_text()
+
+
+def test_unexpected_failure_messages_lose_urls(galaxy, run, tmp_path, monkeypatch):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("Could not connect to the endpoint URL: https://abc123.r2.cloudflarestorage.com/state")
+
+    monkeypatch.setattr(cli, "reconcile", boom)
+    report = tmp_path / "report.md"
+    assert run("sync", "--report", str(report)) == 0
+    text = report.read_text()
+    assert "| ns.coll | * | unexpected | " in text
+    assert "RuntimeError: Could not connect to the endpoint URL: <url> |" in text
+    assert "cloudflarestorage" not in text
+    failures = json.loads((tmp_path / "state" / "failures.json").read_text())
+    assert "https://abc123.r2.cloudflarestorage.com/state" in failures["outstanding"][0]["message"]

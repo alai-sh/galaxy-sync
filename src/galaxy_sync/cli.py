@@ -7,7 +7,8 @@
     rebuild    regenerate the files derived from the index
 
 Recorded failures and conflicts don't fail a run; they're reported in
-failures.md in the state bucket. --strict exits 1 while any is outstanding.
+failures.json in the state bucket and, through --report and --alerts, on a
+tracking issue. --strict exits 1 while any is outstanding.
 """
 
 import argparse
@@ -112,7 +113,7 @@ def _print_summary(store: Store, worked: dict[str, Result | str], elapsed: float
         print(f"mirror: {mirrored} of {published} versions Galaxy publishes ({mirrored / published:.1%})")
 
 
-# How many outstanding failures a run lists when it starts; the rest are in failures.md.
+# How many outstanding failures a run lists when it starts; the rest are in failures.json.
 SHOW_FAILURES = 20
 
 
@@ -129,7 +130,7 @@ def _print_outstanding(store: Store) -> None:
             + f"since {e['first_seen']}: {message[:200]}"
         )
     if len(failures) > SHOW_FAILURES:
-        print(f"  and {len(failures) - SHOW_FAILURES} more; see failures.md in the state bucket")
+        print(f"  and {len(failures) - SHOW_FAILURES} more; see failures.json in the state bucket")
 
 
 def _queue_requests(client: GalaxyClient, store: Store) -> int:
@@ -267,26 +268,33 @@ def _report_count(client: GalaxyClient, store: Store) -> None:
 
 
 def _finish(
-    store: Store, client: GalaxyClient, alerts: Path | None, worked: dict[str, Result | str], elapsed: float
+    store: Store,
+    client: GalaxyClient,
+    args: argparse.Namespace,
+    worked: dict[str, Result | str],
+    elapsed: float,
 ) -> None:
     """Write the aggregate files, the failure report and the state, then the run's summary."""
     store.write_galaxy_root()
     store.write_config()
     store.write_collections()
     plugins = store.write_plugins()
-    summary = store.write_failure_report()
+    failures = store.write_failure_report()
+    summary = failures.summary
     store.save_state()
     _print_summary(store, worked, elapsed)
     print(f"plugin index: {plugins} lines")
     print(
         f"failures: {summary.outstanding} outstanding, {summary.new} new, {summary.resolved} resolved; "
-        + f"{summary.conflicts} conflicts to inspect (see failures.md in the state bucket)"
+        + f"{summary.conflicts} conflicts to inspect (see failures.json in the state bucket)"
     )
     print(f"{client.requests} Galaxy requests")
-    if text := summary.alerts.text():
-        print(text)
-    if alerts is not None:
-        _ = alerts.write_text(text + "\n" if text else "")
+    if headline := summary.alerts.headline():
+        print(headline)
+    if args.alerts is not None:
+        _ = args.alerts.write_text(summary.alerts.markdown())
+    if args.report is not None:
+        _ = args.report.write_text(failures.markdown)
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
@@ -339,7 +347,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return _exit_code(store, args)  # nothing changed: skip rewriting the aggregate files
     if not res.unchanged or swept:
         _report_count(client, store)
-    _finish(store, client, args.alerts, worked, time.monotonic() - started)
+    _finish(store, client, args, worked, time.monotonic() - started)
     return _exit_code(store, args)
 
 
@@ -436,7 +444,14 @@ def _parser() -> argparse.ArgumentParser:
         "--alerts",
         type=Path,
         metavar="FILE",
-        help="write what newly needs a person (counts only) here, or an empty file if nothing does",
+        help="write the conflicts opened and failures that became persistent this run here as a Markdown comment, "
+        + "or an empty file if there were none",
+    )
+    _ = p.add_argument(
+        "--report",
+        type=Path,
+        metavar="FILE",
+        help="write the outstanding failures and conflicts here as a Markdown block for the tracking issue",
     )
     _ = p.add_argument("--galaxy-url", default=BASE_URL, help=f"Galaxy server (default: {BASE_URL})")
     _ = p.add_argument("--strict", action="store_true", help="exit 1 if any failure or conflict is outstanding")
