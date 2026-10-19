@@ -3,7 +3,8 @@
     sync       every 10 minutes: queue what changed on Galaxy (and, once a
                day, everything that differs), then work the queue for up
                to --budget minutes
-    refresh    ask the next sync to reconcile NS[.NAME] first, or to sweep
+    refresh    ask the next sync to reconcile NS[.NAME] first, to sweep, or
+               to acknowledge a conflict
     rebuild    regenerate the files derived from the index
 
 Recorded failures and conflicts don't fail a run; they're reported in
@@ -24,7 +25,7 @@ from pathlib import Path
 
 import alai_plugin_extractor as ext
 
-from .changes import Collection, check_count, check_target, discover, resolve_targets, sweep
+from .changes import Collection, check_count, check_target, discover, resolve_targets, split_version_target, sweep
 from .galaxy import BASE_URL, GalaxyClient, GalaxyError
 from .plugins import builtin_lines
 from .reconcile import Result, reconcile
@@ -45,7 +46,7 @@ def _open_store(args: argparse.Namespace) -> Store:
 
 
 def _exit_code(store: Store, args: argparse.Namespace) -> int:
-    return 1 if args.strict and (store.state["failures"] or store.open_conflicts()) else 0
+    return 1 if args.strict and (store.state["failures"] or store.conflicts_to_inspect()) else 0
 
 
 def _changes(res: Result) -> list[str]:
@@ -141,7 +142,9 @@ def _queue_requests(client: GalaxyClient, store: Store) -> int:
         asked = ", ".join(request["targets"]) or "a sweep"
         flags = ", revalidating" if request["revalidate"] else ""
         what = f"request {key} from {request['requested']}: {asked}{flags}"
-        if not request["targets"]:
+        if acknowledge := request.get("acknowledge"):
+            _acknowledge(store, key, request["requested"], acknowledge, request.get("note", ""))
+        elif not request["targets"]:
             _ = store.state.pop("last_sweep", None)  # sweep this run
             print(f"{what}; sweeping this run")
         else:
@@ -165,6 +168,21 @@ def _queue_requests(client: GalaxyClient, store: Store) -> int:
     if not failed:
         store.clear_failures(GLOBAL, "requests")
     return taken
+
+
+def _acknowledge(store: Store, key: str, requested: str, targets: list[str], note: str) -> None:
+    """Acknowledge the conflicts a request names, so they're no longer reported."""
+    for target in targets:
+        what = f"request {key} from {requested}: acknowledge {target}"
+        try:
+            fqcn, vers = split_version_target(target)
+        except ValueError as e:  # `refresh` checks names, so only a hand-written request
+            print(f"{what}; dropped: {e}", file=sys.stderr)
+            continue
+        if store.acknowledge_conflict(fqcn, vers, note) is None:
+            print(f"{what}; dropped: it has no open conflict", file=sys.stderr)
+        else:
+            print(f"{what}; acknowledged: {note}")
 
 
 def _sweep_due(store: Store) -> bool:
@@ -279,6 +297,7 @@ def _finish(
     store.write_config()
     store.write_collections()
     plugins = store.write_plugins()
+    _ = store.write_conflict_records()
     failures = store.write_failure_report()
     summary = failures.summary
     store.save_state()
@@ -292,9 +311,20 @@ def _finish(
     if headline := summary.alerts.headline():
         print(headline)
     if args.alerts is not None:
-        _ = args.alerts.write_text(summary.alerts.markdown())
+        _write_alerts(args.alerts, summary.alerts.comments())
+    if args.acknowledged is not None:
+        _ = args.acknowledged.write_text(summary.alerts.acknowledged_json())
     if args.report is not None:
         _ = args.report.write_text(failures.markdown)
+
+
+def _write_alerts(directory: Path, comments: list[str]) -> None:
+    """Write each comment to its own file, in the order to post them, replacing any from before."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for old in directory.glob("*.md"):
+        old.unlink()
+    for i, comment in enumerate(comments, 1):
+        _ = (directory / f"{i:03}.md").write_text(comment)
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
@@ -355,14 +385,23 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     """Ask the next sync to reconcile collections first, or to sweep."""
     if args.revalidate and not args.targets:
         raise UsageError("--revalidate needs NS or NS.NAME targets")
-    for target in args.targets:
-        try:
+    if args.acknowledge and args.targets:
+        raise UsageError("--ack can't be combined with targets")
+    if bool(args.acknowledge) != bool(args.note):
+        raise UsageError("--ack and --note go together")
+    try:
+        for target in args.targets:
             check_target(target)
-        except ValueError as e:
-            raise UsageError(str(e)) from None
+        for target in args.acknowledge:
+            _ = split_version_target(target)
+    except ValueError as e:
+        raise UsageError(str(e)) from None
     store = _open_store(args)
-    key = store.add_request(args.targets, args.revalidate)
-    what = ", ".join(args.targets) if args.targets else "a full sweep"
+    key = store.add_request(args.targets, args.revalidate, args.acknowledge, args.note)
+    if args.acknowledge:
+        what = f"acknowledging {', '.join(args.acknowledge)}"
+    else:
+        what = ", ".join(args.targets) if args.targets else "a full sweep"
     print(f"queued {what} for the next sync ({key})")
     return 0
 
@@ -405,6 +444,7 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
     store.write_config()
     store.write_collections()
     plugins = store.merge_plugins()
+    _ = store.write_conflict_records(store.conflicted_collections())
     store.save_state()
     print(f"rebuilt {len(collections)} collections ({plugins} plugin lines)")
     return 0
@@ -443,9 +483,15 @@ def _parser() -> argparse.ArgumentParser:
     _ = p.add_argument(
         "--alerts",
         type=Path,
+        metavar="DIR",
+        help="write a Markdown comment per conflict opened this run, and one for the failures that became "
+        + "persistent, into this directory; none if there were none",
+    )
+    _ = p.add_argument(
+        "--acknowledged",
+        type=Path,
         metavar="FILE",
-        help="write the conflicts opened and failures that became persistent this run here as a Markdown comment, "
-        + "or an empty file if there were none",
+        help="write the conflicts acknowledged this run here as JSON lines of their alert comment's marker and note",
     )
     _ = p.add_argument(
         "--report",
@@ -461,7 +507,8 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "refresh",
         parents=[storage],
-        help="ask the next sync to reconcile NS[.NAME] first, or with no targets to run the sweep",
+        help="ask the next sync to reconcile NS[.NAME] first, with no targets to run the sweep, "
+        + "or to acknowledge conflicts",
     )
     _ = p.add_argument("targets", nargs="*", metavar="NS[.NAME]")
     _ = p.add_argument(
@@ -469,6 +516,15 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also check every mirrored artifact against the one Galaxy publishes now (needs targets)",
     )
+    _ = p.add_argument(
+        "--ack",
+        dest="acknowledge",
+        action="append",
+        default=[],
+        metavar="NS.NAME:VERSION",
+        help="acknowledge a version's open conflict, so it's no longer reported (repeatable; needs --note)",
+    )
+    _ = p.add_argument("--note", default="", help="why the conflicts are acknowledged; published with them")
     p.set_defaults(func=cmd_refresh)
 
     p = sub.add_parser("rebuild", parents=[storage], help="regenerate the files derived from the index")

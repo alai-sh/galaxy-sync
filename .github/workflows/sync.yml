@@ -47,7 +47,7 @@ jobs:
     - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
 
     - name: Sync
-      run: uv run --locked galaxy-sync sync --r2 --report report.md --alerts alerts.md -v
+      run: uv run --locked galaxy-sync sync --r2 --report report.md --alerts alerts --acknowledged acknowledged.jsonl -v
       env:
         R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -58,9 +58,11 @@ jobs:
         ALAI_STATE_BUCKET: ${{ vars.ALAI_STATE_BUCKET }}
 
     # The report block is kept at the top of the tracking issue's description,
-    # edited only when it changed; edits don't notify anyone. Conflicts opened
-    # and failures that became persistent this run are posted as a comment,
-    # which notifies the issue's subscribers.
+    # edited only when it changed; edits don't notify anyone. Each conflict
+    # opened this run is posted as its own comment, and failures that became
+    # persistent as one more, which notifies the issue's subscribers. A
+    # conflict acknowledged this run gets the note added to its comment,
+    # which is then marked resolved (minimized).
     - name: Report
       if: vars.TRACKING_ISSUE != ''
       env:
@@ -74,8 +76,22 @@ jobs:
             gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file new-body.md
           fi
         fi
-        if [ -s alerts.md ]; then
-          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file alerts.md
+        for comment in alerts/*.md; do
+          if [ -f "$comment" ]; then
+            gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file "$comment"
+          fi
+        done
+        if [ -s acknowledged.jsonl ]; then
+          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$ISSUE/comments" \
+            --jq '.[] | {id, node_id, body}' > comments.jsonl
+          python3 -I .github/scripts/resolve_comments.py comments.jsonl acknowledged.jsonl resolved \
+            | while read -r id node; do
+              gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F "body=@resolved/$id.md" --silent
+              gh api graphql --silent -f id="$node" -f query='
+                mutation($id: ID!) {
+                  minimizeComment(input: {subjectId: $id, classifier: RESOLVED}) { clientMutationId }
+                }'
+            done
         fi
 
     # A dead man's switch (e.g. healthchecks.io) alerts when these pings stop:

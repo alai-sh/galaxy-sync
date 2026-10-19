@@ -45,6 +45,15 @@ def check_target(target: str) -> None:
         raise ValueError(f"invalid namespace {target}")
 
 
+def split_version_target(target: str) -> tuple[str, str]:
+    """Split `ns.name:version` into the collection and version; ValueError if it isn't one."""
+    fqcn, _, vers = target.partition(":")
+    if "." not in fqcn or not vers:
+        raise ValueError(f"expected NS.NAME:VERSION, got {target}")
+    check_name(*fqcn.split(".", 1))
+    return fqcn, vers
+
+
 def resolve_targets(client: GalaxyClient, targets: list[str]) -> list[Collection]:
     """Expand `ns` or `ns.name` targets into collections. Raises ValueError for a bad name."""
     result: list[Collection] = []

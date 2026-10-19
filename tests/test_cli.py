@@ -291,6 +291,18 @@ def test_usage_errors(run, tmp_path, capsys, monkeypatch):
         run("refresh", "Bad.Name")
     assert "invalid collection name Bad.Name" in capsys.readouterr().err
 
+    with pytest.raises(SystemExit):
+        run("refresh", "--ack", "ns.coll:1.0.0")
+    assert "--ack and --note go together" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit):
+        run("refresh", "--ack", "ns.coll:1.0.0", "--note", "x", "ns.coll")
+    assert "--ack can't be combined with targets" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit):
+        run("refresh", "--ack", "ns.coll", "--note", "x")
+    assert "expected NS.NAME:VERSION, got ns.coll" in capsys.readouterr().err
+
     for var in ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID"):
         monkeypatch.delenv(var, raising=False)
     with pytest.raises(SystemExit):
@@ -503,51 +515,131 @@ def test_budget(galaxy, run, tmp_path, capsys):
     assert not state(tmp_path)["pending"]
 
 
+def comments(directory):
+    return [f.read_text() for f in sorted(directory.glob("*.md"))]
+
+
 def test_alerts(galaxy, run, tmp_path, capsys):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
-    alerts = tmp_path / "alerts.md"
+    alerts = tmp_path / "alerts"
     assert run("sync", "--alerts", str(alerts)) == 0
-    assert alerts.read_text() == ""
+    assert comments(alerts) == []
 
-    # A new conflict alerts once.
+    # A new conflict alerts once, in a comment of its own.
     galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})
     assert run("refresh", "--revalidate", "ns.coll") == 0
     assert run("sync", "--alerts", str(alerts)) == 0
-    text = alerts.read_text()
-    assert text.startswith("**galaxy-sync: 1 new conflict**\n\nNew conflicts.")
-    assert "\n| Collection | Version | Ours | Galaxy | Seen | Changes |\n" in text
-    assert "\n| ns.coll | 1.0.0 | " in text
+    (text,) = comments(alerts)
+    opened = state(tmp_path)["conflicts"][0]["opened"]
+    assert text.startswith(
+        f"<!-- galaxy-sync:conflict ns.coll 1.0.0 {opened} -->\n**galaxy-sync: new conflict in ns.coll 1.0.0**\n"
+    )
+    assert "`acknowledge: ns.coll:1.0.0`" in text
+    assert "\n| Ours | Galaxy | Uploaded to Galaxy | Seen |\n" in text
+    assert text.endswith("\n\nChanges: removed plugins/modules/thing.py; changed MANIFEST.json\n")
     assert "conflicts/" not in text  # the state bucket key stays private
-    assert text.endswith("\nThe full current report is in this issue's description.\n")
     assert run("refresh", "--revalidate", "ns.coll") == 0
     assert run("sync", "--alerts", str(alerts)) == 0
-    assert alerts.read_text() == ""
+    assert comments(alerts) == []
 
     # Galaxy serving different bytes again for the version doesn't alert again.
     galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "[]"})})
     assert run("refresh", "--revalidate", "ns.coll") == 0
     assert run("sync", "--alerts", str(alerts)) == 0
-    assert alerts.read_text() == ""
-    assert len(state(tmp_path)["conflicts"]) == 1
+    assert comments(alerts) == []
+    (conflict,) = state(tmp_path)["conflicts"]
+    assert len(conflict["observed"]) == 2
 
-    # So does a failure once it has been outstanding for a day.
+    # A failure does, once it has been outstanding for a day.
     galaxy.add_collection("ns", "other", ["1.0.0"])
     galaxy.routes[DETAIL.replace("ns/coll", "ns/other").format("1.0.0")] = UNAVAILABLE
     assert run("sync", "--alerts", str(alerts)) == 0
-    assert alerts.read_text() == ""
+    assert comments(alerts) == []
     current = state(tmp_path)
     for failure in current["failures"].values():
         failure["first_seen"] = "2026-01-01T00:00:00Z"
     (tmp_path / "state" / "state.json").write_text(json.dumps(current))
     assert run("sync", "--alerts", str(alerts)) == 0
-    text = alerts.read_text()
-    assert text.startswith(
-        "**galaxy-sync: 1 failure outstanding for over a day**\n\nFailures outstanding for over a day"
-    )
+    (text,) = comments(alerts)
+    assert text.startswith("**galaxy-sync: 1 failure outstanding for over a day**\n\nEach failure is reported once")
     assert "\n| Collection | Version | Kind | Attempts | First seen | Message |\n|---|---|---|---|---|---|\n" in text
     assert "\n| ns.other | 1.0.0 | galaxy_unavailable | 2 | 2026-01-01T00:00:00Z | " in text
+    assert text.endswith("\nThe full current report is in this issue's description.\n")
     assert run("sync", "--alerts", str(alerts)) == 0
-    assert alerts.read_text() == ""
+    assert comments(alerts) == []
+
+
+def test_acknowledge(galaxy, run, tmp_path, capsys):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    assert run("refresh", "ns.coll") == 0
+    assert run("sync") == 0
+    record = tmp_path / "index-root" / "conflicts" / "ns" / "coll.json"
+    assert not record.exists()
+
+    galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})
+    assert run("refresh", "--revalidate", "ns.coll") == 0
+    report, acknowledged = tmp_path / "report.md", tmp_path / "acknowledged.jsonl"
+    assert run("sync", "--strict", "--report", str(report), "--acknowledged", str(acknowledged)) == 1
+    assert "\n| ns.coll | 1.0.0 | " in report.read_text()
+    assert acknowledged.read_text() == ""
+    (conflict,) = state(tmp_path)["conflicts"]
+    (observed,) = conflict["observed"]
+    public = json.loads(record.read_text())
+    assert public == {
+        "collection": "ns.coll",
+        "conflicts": [
+            {
+                "version": "1.0.0",
+                "ours": conflict["ours"],
+                "opened": conflict["opened"],
+                "observed": [{k: observed[k] for k in ("sha256", "uploaded", "seen", "changes")}],
+            }
+        ],
+    }
+
+    # A version without an open conflict is dropped.
+    capsys.readouterr()
+    assert run("refresh", "--ack", "ns.coll:2.0.0", "--note", "typo") == 0
+    assert run("sync") == 0
+    assert "acknowledge ns.coll:2.0.0; dropped: it has no open conflict" in capsys.readouterr().err
+
+    # Acknowledged: off the report, and listed for the workflow to resolve its comment.
+    assert run("refresh", "--ack", "ns.coll:1.0.0", "--note", "the author republished 1.0.0") == 0
+    out = capsys.readouterr().out
+    assert "queued acknowledging ns.coll:1.0.0 for the next sync" in out
+    assert run("sync", "--strict", "--report", str(report), "--acknowledged", str(acknowledged)) == 0
+    assert "acknowledge ns.coll:1.0.0; acknowledged: the author republished 1.0.0" in capsys.readouterr().out
+    assert "No outstanding failures or conflicts to inspect." in report.read_text()
+    marker = f"<!-- galaxy-sync:conflict ns.coll 1.0.0 {conflict['opened']} -->"
+    assert json.loads(acknowledged.read_text()) == {"marker": marker, "note": "the author republished 1.0.0"}
+    (entry,) = json.loads(record.read_text())["conflicts"]
+    assert entry["acknowledged"]["note"] == "the author republished 1.0.0"
+    acknowledged.unlink()
+    assert run("refresh", "ns.coll") == 0
+    assert run("sync", "--acknowledged", str(acknowledged)) == 0
+    assert acknowledged.read_text() == ""  # once only
+
+    # Later builds are still recorded, silently.
+    galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "[]"})})
+    assert run("refresh", "--revalidate", "ns.coll") == 0
+    alerts = tmp_path / "alerts"
+    assert run("sync", "--strict", "--alerts", str(alerts)) == 0
+    assert comments(alerts) == []
+    (entry,) = json.loads(record.read_text())["conflicts"]
+    assert len(entry["observed"]) == 2
+
+    # Resolved once Galaxy serves our contents again, and kept in the record.
+    galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": artifact("ns", "coll", "1.0.0")})
+    assert run("refresh", "--revalidate", "ns.coll") == 0
+    assert run("sync") == 0
+    (entry,) = json.loads(record.read_text())["conflicts"]
+    assert "resolved" in entry
+    assert entry["acknowledged"]["note"] == "the author republished 1.0.0"
+
+    # rebuild writes the records again.
+    record.unlink()
+    assert run("rebuild") == 0
+    assert json.loads(record.read_text())["conflicts"] == [entry]
 
 
 def test_state_is_saved_after_enough_work(galaxy, run, monkeypatch):
@@ -593,7 +685,7 @@ def test_report(galaxy, run, tmp_path):
     assert run("sync", "--report", str(report)) == 0
     assert report.read_text() == (
         "<!-- galaxy-sync:report -->\n## galaxy-sync report\n\n"
-        + "No outstanding failures or open conflicts.\n<!-- /galaxy-sync:report -->\n"
+        + "No outstanding failures or conflicts to inspect.\n<!-- /galaxy-sync:report -->\n"
     )
 
     # A failure and a conflict appear, without attempts or a timestamp, so
@@ -619,7 +711,7 @@ def test_report(galaxy, run, tmp_path):
     galaxy.add_collection("ns", "other", ["1.0.0"])
     assert run("refresh", "--revalidate", "ns.coll") == 0
     assert run("sync", "--report", str(report)) == 0
-    assert "No outstanding failures or open conflicts." in report.read_text()
+    assert "No outstanding failures or conflicts to inspect." in report.read_text()
 
 
 def test_unexpected_failure_messages_lose_urls(galaxy, run, tmp_path, monkeypatch):

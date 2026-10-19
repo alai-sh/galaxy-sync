@@ -175,16 +175,34 @@ class CollectionState(TypedDict):
     upstream_count: NotRequired[int]  # versions Galaxy listed at the last reconcile
 
 
+class Observation(TypedDict):
+    """One artifact Galaxy served for a conflicted version."""
+
+    sha256: str
+    uploaded: str | None  # Galaxy's created_at for that upload
+    seen: str  # when a reconcile first compared it
+    changes: str  # files added, removed and changed from ours, or why they couldn't be compared
+    saved: str  # state bucket key of the artifact; never published
+
+
+class Acknowledgement(TypedDict):
+    at: str
+    note: str
+
+
 class Conflict(TypedDict):
-    """Galaxy serves different contents for a mirrored version. Ours is kept."""
+    """Galaxy serves different contents for a mirrored version. Ours is kept.
+
+    A version has at most one unresolved conflict, which collects every
+    differing artifact Galaxy serves until it's resolved.
+    """
 
     collection: str
     version: str
     ours: str  # sha256 in the index
-    upstream: str  # sha256 Galaxy serves
-    seen: str
-    changes: str  # files added, removed and changed, or why they couldn't be compared
-    saved: str  # state bucket key of Galaxy's artifact
+    opened: str
+    observed: list[Observation]  # oldest first
+    acknowledged: NotRequired[Acknowledgement]  # a person looked at it; no longer reported
     resolved: NotRequired[str]  # when Galaxy served our contents again
 
 
@@ -215,5 +233,7 @@ class Request(TypedDict):
     """A `refresh` asking the next sync to reconcile collections, or to sweep."""
 
     requested: str
-    targets: list[str]  # NS or NS.NAME; empty for a sweep
+    targets: list[str]  # NS or NS.NAME; empty for a sweep, unless it acknowledges
     revalidate: bool
+    acknowledge: NotRequired[list[str]]  # NS.NAME:VERSION conflicts to acknowledge, instead of targets
+    note: NotRequired[str]  # why, for the acknowledgements

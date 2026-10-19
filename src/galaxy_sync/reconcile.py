@@ -17,7 +17,7 @@ import alai_plugin_extractor as ext
 from . import semver
 from .artifacts import contents_digest, describe_changes, manifest_info
 from .galaxy import GalaxyClient, GalaxyError, NotFound
-from .models import Conflict, GalaxyVersion, GalaxyVersionDetail, IndexLine, VersionState
+from .models import GalaxyVersion, GalaxyVersionDetail, IndexLine, Observation, VersionState
 from .plugins import EXTRACTION_FORMAT, extraction_data
 from .store import Store
 from .times import now, rfc3339
@@ -354,7 +354,7 @@ class _Reconcile:
             log.info(
                 "%s %s: Galaxy serves sha256 %s, ours is %s; comparing contents", self.fqcn, vers, sha, line["cksum"]
             )
-            same = self._compare(line, detail)
+            same = self._compare(line, detail, state["created_at"])
             log.info(
                 "%s %s: %s", self.fqcn, vers, "same contents, a repack" if same else "different contents, a conflict"
             )
@@ -377,27 +377,25 @@ class _Reconcile:
             self.res.unyanked.append(vers)
         self.cstate["versions"][vers] = state
 
-    def _compare(self, line: IndexLine, detail: GalaxyVersionDetail) -> bool:
+    def _compare(self, line: IndexLine, detail: GalaxyVersionDetail, uploaded: str | None) -> bool:
         """Whether Galaxy's artifact has the same contents as ours.
 
         An artifact with different contents (or one that can't be compared)
-        opens a conflict, with Galaxy's artifact saved for inspection.
+        is saved for inspection and added to the version's conflict.
         """
         data = self._download(detail, "download for comparison")
         changes = self._changes(line["cksum"], data)
         if changes is None:
             return True
         sha = detail["artifact"]["sha256"]
-        conflict: Conflict = {
-            "collection": self.fqcn,
-            "version": line["vers"],
-            "ours": line["cksum"],
-            "upstream": sha,
+        observation: Observation = {
+            "sha256": sha,
+            "uploaded": uploaded,
             "seen": now(),
             "changes": changes,
             "saved": self.store.save_upstream_artifact(sha, data),
         }
-        _ = self.store.open_conflict(conflict)
+        _ = self.store.record_conflict(self.fqcn, line["vers"], line["cksum"], observation)
         return False
 
     def _changes(self, cksum: str, theirs: bytes) -> str | None:

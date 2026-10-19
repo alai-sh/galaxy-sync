@@ -253,14 +253,17 @@ def test_changed_contents_are_a_conflict(galaxy, client, store):
     assert line["upstream_conflict"] is True
     (conflict,) = store.open_conflicts()
     upstream = hashlib.sha256(changed).hexdigest()
-    assert conflict["upstream"] == upstream
-    assert conflict["changes"] == "added plugins/modules/other.py; removed plugins/modules/thing.py"
-    assert store.state_bucket.read(conflict["saved"]) == changed
+    (observed,) = conflict["observed"]
+    assert observed["sha256"] == upstream
+    assert observed["uploaded"] == rfc3339(galaxy.uploaded[("ns", "coll", "1.0.0")])
+    assert observed["changes"] == "added plugins/modules/other.py; removed plugins/modules/thing.py"
+    assert store.state_bucket.read(observed["saved"]) == changed
+    assert conflict["opened"] == observed["seen"]
     assert store.state["failures"] == {}  # reported as a conflict, not retried as a failure
     report = store.write_failure_report()
     assert "### Conflicts to inspect" in report.markdown
     assert f"| ns.coll | 1.0.0 | {original['cksum'][:12]} | {upstream[:12]} |" in report.markdown
-    assert conflict["saved"] not in report.markdown  # the state bucket key stays private
+    assert observed["saved"] not in report.markdown  # the state bucket key stays private
     assert report.summary.alerts.conflicts == [conflict]
 
     # Seen again: still one open conflict, and no new download.
@@ -269,15 +272,24 @@ def test_changed_contents_are_a_conflict(galaxy, client, store):
     assert len(store.state["conflicts"]) == 1
     assert not any("/pulp/content/" in r for r in galaxy.requests)
 
-    # Different bytes again before it's resolved: the open conflict takes them.
+    # Different bytes again before it's resolved: added to the open conflict.
     again = artifact("ns", "coll", "1.0.0", modules=("third",))
     galaxy.replace("ns", "coll", "1.0.0", again)
     assert reconcile(client, store, "ns", "coll").conflicts == ["1.0.0"]
     (updated,) = store.state["conflicts"]
-    assert updated["upstream"] == hashlib.sha256(again).hexdigest()
-    assert updated["changes"] == "added plugins/modules/third.py; removed plugins/modules/thing.py"
-    assert store.state_bucket.read(updated["saved"]) == again
-    assert updated["seen"] == conflict["seen"]
+    first, latest = updated["observed"]
+    assert first == observed
+    assert latest["sha256"] == hashlib.sha256(again).hexdigest()
+    assert latest["changes"] == "added plugins/modules/third.py; removed plugins/modules/thing.py"
+    assert store.state_bucket.read(latest["saved"]) == again
+    assert updated["opened"] == conflict["opened"]
+    report = store.write_failure_report()
+    assert f"| ns.coll | 1.0.0 | {original['cksum'][:12]} | {latest['sha256'][:12]} | 2 |" in report.markdown
+
+    # Back to a build already observed: compared again, but not repeated.
+    galaxy.replace("ns", "coll", "1.0.0", changed)
+    assert reconcile(client, store, "ns", "coll").conflicts == ["1.0.0"]
+    assert [o["sha256"] for o in store.state["conflicts"][0]["observed"]] == [upstream, latest["sha256"]]
 
     # Galaxy serves our artifact again (re-uploading it brings back its old upload time).
     galaxy.replace("ns", "coll", "1.0.0", first_blob, uploaded=first_upload)
@@ -315,15 +327,17 @@ def test_conflict_comparison_failures(galaxy, client, store, monkeypatch):
     unreadable = b"not a tarball"
     galaxy.replace("ns", "coll", "1.0.0", unreadable)
     reconcile(client, store, "ns", "coll")
-    assert store.open_conflicts()[-1]["changes"].startswith("Galaxy's artifact can't be read")
+    assert store.open_conflicts()[-1]["observed"][-1]["changes"].startswith("Galaxy's artifact can't be read")
     galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", modules=("fourth",)))
     monkeypatch.setattr(store, "read_artifact", lambda cksum: None)
     reconcile(client, store, "ns", "coll")
-    assert store.open_conflicts()[-1]["changes"] == f"the mirror's artifact {original['cksum']} is missing"
+    assert (
+        store.open_conflicts()[-1]["observed"][-1]["changes"] == f"the mirror's artifact {original['cksum']} is missing"
+    )
     monkeypatch.setattr(store, "read_artifact", lambda cksum: b"corrupt")
     galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", modules=("fifth",)))
     reconcile(client, store, "ns", "coll")
-    assert store.open_conflicts()[-1]["changes"].startswith("the mirror's artifact can't be read")
+    assert store.open_conflicts()[-1]["observed"][-1]["changes"].startswith("the mirror's artifact can't be read")
 
 
 def test_old_conflict_failures_are_cleared(galaxy, client, store):

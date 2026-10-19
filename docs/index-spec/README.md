@@ -31,6 +31,7 @@ An index has two roots, which MAY be on different hosts:
   config.json                            how to read this index
   collections.json                       every collection, with last-updated times
   index/<namespace>/<name>.jsonl         one line per collection version
+  conflicts/<namespace>/<name>.json      mirrors: why versions differ from the origin
 
 <artifact root>                          e.g. https://dl.alai.sh/
   sha256/<aa>/<sha256>.tar.gz            collection tarballs, content-addressed
@@ -177,7 +178,7 @@ publication**, so clients MUST NOT assume they're sorted by version.
 | `deprecated` | `true` or string | no | The version is deprecated. A string is a message to show the user. Galaxy deprecation is collection-level, so for `galaxy` origin it appears on every line |
 | `origin` | string | yes | Where the version was published: `galaxy` (mirrored from galaxy.ansible.com) or `native` (published to this index directly). Other indexes MAY define their own values, and clients MUST treat unknown values as opaque |
 | `published` | string | yes | When this version was first published at its origin (RFC 3339). For `galaxy` origin this is Galaxy's `created_at`, which for versions published before Galaxy's 2023-05 migration is the migration time, not the real publication time |
-| `upstream_conflict` | bool | no | `true` if the origin now serves a different artifact for this version whose contents differ from the one at `cksum`. A repack of the same files doesn't count. The index keeps the original. Clients SHOULD warn |
+| `upstream_conflict` | bool | no | `true` if the origin now serves a different artifact for this version whose contents differ from the one at `cksum`. A repack of the same files doesn't count. The index keeps the original. Clients SHOULD warn, and MAY point to the collection's [conflict record](#conflict-records) |
 
 ### `deps` entries
 
@@ -231,6 +232,46 @@ A version's `cksum` never changes, for any reason.
 - **Removed:** for takedowns (malware, leaked secrets, legal requests), the
   line is deleted and the artifact removed. Lock files that pin it will fail
   to install. That's intended.
+
+## Conflict records
+
+A mirror that sets `upstream_conflict` SHOULD publish a conflict record for
+the collection at `conflicts/<namespace>/<name>.json`, so anyone can see why
+the index's artifact differs from the origin's. A record lists every
+conflict the collection has had, including settled ones, and entries are
+never removed. A collection that never had one has no record (404).
+
+```json
+{
+ "collection": "ns.coll",
+ "conflicts": [
+  {
+   "version": "1.0.0",
+   "ours": "1ec07d4f...",
+   "opened": "2026-10-18T23:20:18Z",
+   "observed": [
+    {"sha256": "31526b65...", "uploaded": "2026-10-18T23:05:51Z", "seen": "2026-10-18T23:20:18Z", "changes": "added playbooks/a.yml; changed roles/b/meta/main.yml"},
+    {"sha256": "8caedf6f...", "uploaded": "2026-10-18T23:42:26Z", "seen": "2026-10-19T00:06:49Z", "changes": "added playbooks/a.yml"}
+   ],
+   "acknowledged": {"at": "2026-10-19T09:00:00Z", "note": "The author republished 1.0.0 with new content"}
+  }
+ ]
+}
+```
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `collection` | string | yes | `<namespace>.<name>` |
+| `conflicts[].version` | string | yes | The version |
+| `conflicts[].ours` | string | yes | The index's `cksum` for it |
+| `conflicts[].opened` | string | yes | When the mirror first saw the origin serve different contents |
+| `conflicts[].observed` | array | yes | Each differing artifact the origin served, oldest first: `sha256`, `uploaded` (the origin's upload time, or `null` if unknown), `seen` (when the mirror first compared it), and `changes` (the files added, removed and changed from ours, or why they couldn't be compared) |
+| `conflicts[].acknowledged` | object | no | The mirror's operators inspected it and keep the original: `at`, and a `note` saying why |
+| `conflicts[].resolved` | string | no | When the origin served the original's contents again. The line's `upstream_conflict` is cleared then |
+
+A version has at most one conflict without `resolved`. The index line's
+`upstream_conflict` reflects whether the origin currently differs;
+acknowledging doesn't change it.
 
 ## Index completeness
 

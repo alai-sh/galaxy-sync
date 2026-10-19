@@ -49,7 +49,7 @@ never a real bucket.
 | `plugins.py` | What's stored from an extraction, and how it becomes plugin index lines |
 | `galaxy_api.py` | The static Galaxy v3 view, built from index lines only |
 | `store.py` | The mirror's files and state on top of the backends; the queue, `refresh` requests, the failure ledger and conflicts |
-| `report.py` | Rendering `failures.json` and `failures.md`, and the count-only alerts |
+| `report.py` | Rendering `failures.json`, the tracking issue's report block and alert comments, and the public conflict records |
 | `storage.py` | The `Backend` interface (one per bucket), `LocalBackend` and `R2Backend` |
 | `models.py` | TypedDicts for Galaxy responses, index and plugin lines, and state |
 | `semver.py`, `times.py` | SemVer 2.0.0 precedence; RFC 3339 timestamps |

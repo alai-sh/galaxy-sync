@@ -27,6 +27,7 @@ uv run galaxy-sync COMMAND [OPTIONS] ...
 |---|---|
 | `sync [--budget MINUTES] [--dry-run]` | Find what changed on Galaxy and queue it, reconcile `refresh` requests first, sweep once a day, then reconcile the rest of the queue until the budget (default 45 minutes) runs out. The rest stays queued for the next run, so the initial import is built up over many runs. `--dry-run` only reports what changed |
 | `refresh [NS[.NAME]...] [--revalidate]` | Ask the next `sync` to reconcile these namespaces or collections ahead of everything else, or with no targets to sweep: compare every published version with the mirror. `--revalidate` also checks every mirrored version's artifact against the one Galaxy publishes now. Writes a request and returns; it doesn't contact Galaxy |
+| `refresh --ack NS.NAME:VERSION... --note TEXT` | Ask the next `sync` to acknowledge these versions' conflicts once a person has inspected them, so they're no longer reported. The note is published with the conflict ([conflicts](docs/sync.md#conflicts)) |
 | `rebuild [--dl TEMPLATE] [--builtin SRC]` | Regenerate the files derived from the index without contacting Galaxy. `--dl` sets the artifact URL template used by `config.json` and the Galaxy view (default: `dl.alai.sh`); later runs keep it, and a plain `rebuild` resets it. `--builtin` first re-extracts `ansible.builtin`'s plugins from an ansible-core checkout or sdist |
 
 | Option | Commands | |
@@ -35,9 +36,10 @@ uv run galaxy-sync COMMAND [OPTIONS] ...
 | `--r2` | all | Write to the R2 buckets, configured from the environment ([storage](docs/storage.md)) |
 | `-v` | all | Debug logging |
 | `--galaxy-url URL` | `sync` | Galaxy server (default `https://galaxy.ansible.com`) |
-| `--strict` | `sync` | Exit 1 while any failure or conflict is outstanding |
-| `--report FILE` | `sync` | Write the outstanding failures and conflicts as a Markdown block for the tracking issue |
-| `--alerts FILE` | `sync` | Write the conflicts opened and the failures that became persistent this run as a Markdown comment, or an empty file |
+| `--strict` | `sync` | Exit 1 while any failure or unacknowledged conflict is outstanding |
+| `--report FILE` | `sync` | Write the outstanding failures and unacknowledged conflicts as a Markdown block for the tracking issue |
+| `--alerts DIR` | `sync` | Write a Markdown comment per conflict opened this run, and one for the failures that became persistent, into `DIR` |
+| `--acknowledged FILE` | `sync` | Write the conflicts acknowledged this run, so the workflow can mark their comments resolved |
 
 A run never stops on a failure: it records it in the failure report
 (`failures.json` in the state bucket) and carries on, and exits 0 unless
@@ -52,13 +54,14 @@ The workflows are described in [scheduling](docs/sync.md#scheduling).
 | Every 10 minutes, dispatched by the scheduler in `scheduler/` | `sync.yml` | Picks up new versions, deletions and deprecations; sweeps once a day for what that can't see quickly; works through the initial import 45 minutes at a time |
 | Manual | `refresh.yml` with targets | Resyncs specific collections on the next run, ahead of any backlog: a release needed urgently, a collection that looks out of date, or a version that keeps failing |
 | Manual | `refresh.yml` without targets | Sweeps on the next run, e.g. after `deletions_suspected`, instead of waiting for the daily one |
+| Manual, after inspecting a conflict | `refresh.yml` with `acknowledge` and `note` | Stops reporting the conflict, records the note publicly, and marks its alert comment resolved |
 | After moving the artifacts or changing the Galaxy view format | `rebuild.yml` with `dl` | Rewrites every derived file |
 | After an ansible-core release | `rebuild.yml` with an ansible-core ref | Updates `ansible.builtin` in the plugin index |
 
-The scheduled run keeps the outstanding failures and conflicts at the top
-of a tracking issue's description, and posts a new conflict, or a failure
-outstanding for over a day, as a comment there. A heartbeat ping from every
-successful run catches the runs stopping.
+The scheduled run keeps the outstanding failures and unacknowledged
+conflicts at the top of a tracking issue's description, and posts each new
+conflict, and failures outstanding for over a day, as comments there. A
+heartbeat ping from every successful run catches the runs stopping.
 
 ## Documentation
 
