@@ -73,10 +73,14 @@ Resolving a collection:
   (`+git940b822`) suffix. Clients sort by SemVer precedence. When two versions
   differ only in build metadata, clients tie-break by comparing the strings
   so the order is stable.
-- **Version requirements** (`req`, `requires_ansible`): Ansible's syntax,
-  copied verbatim from the collection's `MANIFEST.json`. This is
-  **not** Cargo's semver requirement syntax. See [Requirement
-  syntax](#requirement-syntax).
+- **Version requirements** (`req`): Ansible's syntax, copied verbatim from
+  the collection's `MANIFEST.json`. This is **not** Cargo's semver
+  requirement syntax. See [Requirement syntax](#requirement-syntax).
+- **`requires_ansible`:** a [PEP 440 version
+  specifier](https://peps.python.org/pep-0440/#version-specifiers), such as
+  `>=2.17.0` or `>=2.19.0b1`, copied verbatim from the collection's
+  `meta/runtime.yml`. ansible-core versions are PEP 440, not SemVer. See
+  [`requires_ansible` syntax](#requires_ansible-syntax).
 
 ## `config.json`
 
@@ -173,7 +177,7 @@ publication**, so clients MUST NOT assume they're sorted by version.
 | `deps` | array | yes | Collection dependencies, possibly empty. See below |
 | `cksum` | string | yes | Lowercase hex sha256 of the artifact. For `galaxy` origin this equals Galaxy's `artifact.sha256` |
 | `size` | integer | yes | Artifact size in bytes |
-| `requires_ansible` | string | no | ansible-core version requirement from `meta/runtime.yml`. Absent means no constraint |
+| `requires_ansible` | string | no | ansible-core version requirement from `meta/runtime.yml`, a [PEP 440 specifier](#requires_ansible-syntax). Absent means no constraint |
 | `yanked` | bool | yes | See [Yanking and removal](#yanking-and-removal) |
 | `deprecated` | `true` or string | no | The version is deprecated. A string is a message to show the user. Galaxy deprecation is collection-level, so for `galaxy` origin it appears on every line |
 | `origin` | string | yes | Where the version was published: `galaxy` (mirrored from galaxy.ansible.com) or `native` (published to this index directly). Other indexes MAY define their own values, and clients MUST treat unknown values as opaque |
@@ -215,6 +219,20 @@ clients MUST match:
 - The version in a clause is parsed loosely, so `>=1.0` means `>=1.0.0`.
 
 Examples: `*`, `>=1.0.0`, `>=13.0.0,<14.0.0`, `!=2.1.0`, `1.2.3`.
+
+Galaxy accepts requirements ansible-core can't read, such as npm-style
+`^3.0.0`, so some lines carry them. Indexes copy them verbatim; see
+[Client rules](#client-rules) for what clients do with them.
+
+### `requires_ansible` syntax
+
+A PEP 440 version specifier set, as ansible-core checks it in
+`ansible.plugins.loader._does_collection_support_ansible_version` with
+`packaging.specifiers.SpecifierSet`. ansible-core compares its own version
+with any pre-release, post-release or dev part dropped, so 2.19.0rc1 meets
+`>=2.19.0`. Clients MUST compare the same way.
+
+Examples: `>=2.17.0`, `>=2.15.0,<2.19.0`, `>=2.19.0b1`.
 
 ### Line mutability
 
@@ -403,6 +421,12 @@ to resolve consistently.
 - **Pre-releases** are skipped unless the user asks for them, or a
   requirement explicitly names a pre-release version.
 - **Yanked** versions are skipped unless locked.
+- **Unreadable requirements:** a version with a `deps[].req` the
+  [requirement syntax](#requirement-syntax) can't read (ansible-galaxy fails
+  the whole install on one), or a `requires_ansible` that isn't a valid
+  PEP 440 specifier, SHOULD be skipped as though it were yanked, with a
+  warning naming it. Failing instead would leave anything that resolves to it
+  uninstallable.
 - **`requires_ansible`** SHOULD be checked against the target ansible-core
   version when it's known.
 
