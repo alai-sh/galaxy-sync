@@ -173,6 +173,8 @@ class CollectionState(TypedDict):
     upstream_updated: NotRequired[str]
     upstream_deprecated: NotRequired[bool]
     upstream_count: NotRequired[int]  # versions Galaxy listed at the last reconcile
+    # Versions Galaxy serves that its search index (the upload feed and count) leaves out.
+    unindexed: NotRequired[list[str]]
 
 
 class Observation(TypedDict):
@@ -214,6 +216,7 @@ class Pending(TypedDict):
     revalidate: NotRequired[bool]
     reasons: NotRequired[list[str]]  # what change detection saw, e.g. "updated_at changed"
     uploads: NotRequired[list[str]]  # versions the upload feed saw
+    unseen: NotRequired[list[str]]  # mirrored versions the sweep didn't see in the upload feed
 
 
 class SyncState(TypedDict):

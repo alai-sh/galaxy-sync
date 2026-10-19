@@ -50,6 +50,7 @@ class MockGalaxy:
         self.listed = {}  # (ns, name) -> item in the collection listing
         self.uploaded = {}  # (ns, name, version) -> pulp_created, for the upload feed
         self.uploads = 0
+        self.unindexed = set()  # (ns, name, version) served but left out of the feed and count
         self.collections = {}  # (ns, name) -> add_collection arguments, for replace()
 
     def json(self, path, body, status=200):
@@ -57,11 +58,17 @@ class MockGalaxy:
 
     def _update_listing(self):
         self.json(LISTING, {"data": [self.listed[k] for k in sorted(self.listed)], "links": {"next": None}})
-        rows = [feed_row(*key, created) for key, created in sorted(self.uploaded.items(), key=lambda i: i[1])]
+        uploaded = sorted(self.uploaded.items(), key=lambda i: i[1])
+        rows = [feed_row(*key, created) for key, created in uploaded if key not in self.unindexed]
         rows.reverse()
         self.json(FEED, {"meta": {"count": len(rows)}, "data": rows, "links": {"next": None}})
         self.json(COUNT, {"meta": {"count": len(rows)}, "data": rows[:1], "links": {"next": None}})
         self.touch()
+
+    def unindex(self, *keys):
+        """Leave versions out of the search index (the feed and count) but keep serving them, as Galaxy did."""
+        self.unindexed = set(keys)
+        self._update_listing()
 
     def touch(self):
         """Create a repo version, as every upload, delete or deprecation does."""

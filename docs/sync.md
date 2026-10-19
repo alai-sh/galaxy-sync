@@ -116,7 +116,9 @@ possible:
 5. **Version count**, after reconciling. Galaxy's published count is compared with the total
    the mirror last saw. Deleting a version below a collection's highest
    changes nothing else `sync` can see, but lowers the count; a shortfall is
-   recorded as `deletions_suspected`.
+   recorded as `deletions_suspected`. Versions known to be missing from
+   Galaxy's search index (below) aren't in its count, so they aren't
+   expected.
 
 If neither the feed nor the listing can be read, Galaxy is most likely down.
 The run reconciles nothing and saves no cursor, so the next run looks again.
@@ -138,6 +140,14 @@ Rows can shift between pages during the walk. New uploads only make rows
 appear twice. A delete can make a row look gone, but reconcile checks
 before yanking. If any feed page fails, nothing is queued, since a partial
 walk would make everything after it look deleted. The next run sweeps again.
+
+Galaxy's search index, which the feed and count come from, can also lose
+versions Galaxy still serves. Each mirrored version the sweep doesn't see is
+passed to reconcile, which records those Galaxy still lists as `unindexed`
+in the collection's state. Later sweeps report them as unindexed rather
+than gone and leave them out of the count, but still queue the collection
+each day, since only reconcile can tell when one is really deleted. A
+version back in the feed is dropped from `unindexed`.
 
 The walk takes 30-40 minutes, so new uploads wait for that run to finish.
 

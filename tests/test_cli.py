@@ -369,6 +369,32 @@ def test_sync(galaxy, run, tmp_path, capsys, refresh):
     assert "failures: 0 outstanding" in out
 
 
+def test_sweep_unindexed_versions(galaxy, run, tmp_path, capsys, refresh):
+    galaxy.add_collection("ns", "a", ["1.0.0", "2.0.0"])
+    assert run("sync") == 0
+    galaxy.unindex(("ns", "a", "1.0.0"))
+    capsys.readouterr()
+
+    # The first sweep can't tell it from a deletion; reconcile keeps it, and
+    # the count stops expecting it.
+    assert refresh() == 0
+    out = capsys.readouterr().out
+    assert "  gone: ns.a 1.0.0\n" in out
+    assert "ns.a: +0, up to date (2/2 mirrored)" in out
+    assert "Galaxy's search index lost it" in out
+    assert "failures: 0 outstanding" in out
+    assert "mirror: 2 of 2 versions Galaxy publishes (100.0%), 1 of them missing from its search index" in out
+
+    # Later sweeps recheck it without calling it gone.
+    assert refresh() == 0
+    out = capsys.readouterr().out
+    assert "gone:" not in out
+    assert "  1 versions in 1 collections are still missing from Galaxy's search index" in out
+    assert "Galaxy's search index still leaves out 1.0.0, but Galaxy still serves it" in out
+    assert "failures: 0 outstanding" in out
+    assert state(tmp_path)["collections"]["ns.a"]["unindexed"] == ["1.0.0"]
+
+
 def test_rebuild(galaxy, run, tmp_path, capsys, refresh):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     assert refresh("ns.coll") == 0
@@ -801,7 +827,7 @@ def test_explain_unchanged_reconciles():
         "the upload feed saw 2.0.0: not in Galaxy's version list, so awaiting approval or deleted since"
     ]
     reasons = ["new", "updated_at changed", "deprecation changed", "gone from the listing", "gone: 1.1.0"]
-    reasons += ["not mirrored: 2.0.0", "re-uploaded: 1.0.0", "something else"]
+    reasons += ["not mirrored: 2.0.0", "re-uploaded: 1.0.0", "unindexed: 1.0.0", "something else"]
     assert [line.split(":")[0] for line in explain(reasons=reasons)] == [
         "new in the listing",
         "the listing's updated_at changed but no version did",
@@ -810,6 +836,7 @@ def test_explain_unchanged_reconciles():
         "the sweep didn't see 1.1.0 on Galaxy, but Galaxy still serves it",
         "the sweep saw 2.0.0 unmirrored, but Galaxy's version list doesn't have it",
         "the sweep saw 1.0.0 re-uploaded, but Galaxy's sha256 still matches ours",
+        "Galaxy's search index still leaves out 1.0.0, but Galaxy still serves it",
         "something else",
     ]
     res.upstream = 0

@@ -294,11 +294,14 @@ class Store:
         revalidate: bool = False,
         reasons: Sequence[str] = (),
         uploads: Sequence[str] = (),
+        unseen: Sequence[str] = (),
     ) -> None:
         """Queue a collection, keeping its earlier place if that's sooner.
 
         `reasons` and `uploads` say what change detection saw, so the run
         that reconciles it can explain a reconcile that changed nothing.
+        `unseen` are mirrored versions the sweep didn't see, for reconcile to
+        note which ones Galaxy still serves.
         """
         entry = self.state["pending"].get(fqcn)
         if entry is None:
@@ -311,6 +314,8 @@ class Store:
             entry["reasons"] = list(dict.fromkeys([*entry.get("reasons", []), *reasons]))
         if uploads:
             entry["uploads"] = list(dict.fromkeys([*entry.get("uploads", []), *uploads]))
+        if unseen:
+            entry["unseen"] = list(dict.fromkeys([*entry.get("unseen", []), *unseen]))
 
     def queued(self) -> list[tuple[str, str]]:
         """Pending collections in the order to work them."""

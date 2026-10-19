@@ -255,6 +255,48 @@ def test_sweep(galaxy, client, store):
     assert sweep(client, store).unmirrored == {"ns.a": ["1.1.0"]}
 
 
+def test_sweep_unindexed_versions(galaxy, client, store):
+    galaxy.add_collection("ns", "a", ["1.0.0", "1.1.0", "2.0.0"])
+    reconcile(client, store, "ns", "a")
+    cstate = store.collection_state("ns.a")
+
+    # Galaxy's search index loses versions it still serves: the count and
+    # the feed both look like deletions.
+    galaxy.unindex(("ns", "a", "1.0.0"), ("ns", "a", "1.1.0"))
+    assert check_count(client, store) == 2
+    res = sweep(client, store)
+    assert (res.gone, res.unindexed) == ({"ns.a": ["1.0.0", "1.1.0"]}, {})
+    assert res.unseen(("ns", "a")) == ["1.0.0", "1.1.0"]
+
+    # Reconcile finds them served, so they stop being expected in the count
+    # and the next sweep doesn't call them gone, but still queues them.
+    assert reconcile(client, store, "ns", "a", unseen=res.unseen(("ns", "a"))).yanked == []
+    assert cstate["unindexed"] == ["1.0.0", "1.1.0"]
+    assert check_count(client, store) == 0
+    assert store.state["failures"] == {}
+    res = sweep(client, store)
+    assert (res.gone, res.unindexed, res.collections) == ({}, {"ns.a": ["1.0.0", "1.1.0"]}, [("ns", "a")])
+    assert res.reasons(("ns", "a")) == ["unindexed: 1.0.0, 1.1.0"]
+
+    # A reconcile for another reason keeps them.
+    galaxy.add_collection("ns", "a", ["1.0.0", "1.1.0", "2.0.0", "2.1.0"])
+    assert reconcile(client, store, "ns", "a").added == ["2.1.0"]
+    assert cstate["unindexed"] == ["1.0.0", "1.1.0"]
+
+    # Deleting one still yanks it, once reconcile rechecks it.
+    galaxy.add_collection("ns", "a", ["1.0.0", "2.0.0", "2.1.0"])
+    assert reconcile(client, store, "ns", "a", unseen=res.unseen(("ns", "a"))).yanked == ["1.1.0"]
+    assert cstate["unindexed"] == ["1.0.0"]
+    assert check_count(client, store) == 0
+
+    # Back in the index, it's an ordinary version again.
+    galaxy.unindex()
+    res = sweep(client, store)
+    assert (res.gone, res.unindexed, res.collections) == ({}, {}, [])
+    assert "unindexed" not in cstate
+    assert check_count(client, store) == 0
+
+
 def test_sweep_needs_every_page(galaxy, client, store):
     galaxy.json(
         FEED,

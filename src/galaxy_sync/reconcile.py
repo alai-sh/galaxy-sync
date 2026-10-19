@@ -10,6 +10,7 @@ import logging
 import re
 import tarfile
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import alai_plugin_extractor as ext
@@ -77,6 +78,7 @@ def reconcile(
     *,
     revalidate: bool = False,
     deadline: float | None = None,
+    unseen: Sequence[str] = (),
 ) -> Result:
     """Bring one collection's index file in line with Galaxy.
 
@@ -88,9 +90,13 @@ def reconcile(
     New versions are mirrored oldest first. Once `time.monotonic()` passes
     `deadline`, the rest are left in `Result.deferred` and what's mirrored so
     far is written, so a large collection can be imported over several runs.
+
+    `unseen` are mirrored versions the sweep didn't see in the upload feed.
+    Those Galaxy still serves are recorded as unindexed, so the version count
+    stops expecting them and the next sweep doesn't report them as gone.
     """
     check_name(namespace, name)
-    return _Reconcile(client, store, namespace, name, revalidate, deadline).run()
+    return _Reconcile(client, store, namespace, name, revalidate, deadline, unseen).run()
 
 
 class _Reconcile:
@@ -102,6 +108,7 @@ class _Reconcile:
         name: str,
         revalidate: bool,
         deadline: float | None,
+        unseen: Sequence[str],
     ) -> None:
         self.client = client
         self.store = store
@@ -109,6 +116,7 @@ class _Reconcile:
         self.name = name
         self.revalidate = revalidate
         self.deadline = deadline
+        self.unseen = unseen
         self.fqcn = f"{namespace}.{name}"
         self.res = Result()
         self.cstate = store.collection_state(self.fqcn)
@@ -185,6 +193,10 @@ class _Reconcile:
             # Only once complete, so the listing keeps finding a partial import.
             self.cstate["upstream_updated"] = meta.get("updated_at")
         self.cstate["upstream_count"] = len(upstream_vers)
+        if unindexed := (set(self.cstate.get("unindexed", [])) | set(self.unseen)) & upstream_vers:
+            self.cstate["unindexed"] = sorted(unindexed, key=semver.sort_key)
+        else:
+            _ = self.cstate.pop("unindexed", None)
         self.cstate["upstream_deprecated"] = deprecated
         self.res.mirrored = len(self.lines)
         self.res.upstream = len(upstream_vers)
@@ -274,6 +286,7 @@ class _Reconcile:
         self._write_plugins(self.lines)
         _ = self.cstate.pop("upstream_updated", None)  # the listing check stops looking for it
         self.cstate["upstream_count"] = 0
+        _ = self.cstate.pop("unindexed", None)
         self.res.mirrored = len(self.lines)
         self.store.clear_collection_failures(self.fqcn)
         return self.res

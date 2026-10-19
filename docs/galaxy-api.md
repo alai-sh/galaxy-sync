@@ -39,7 +39,9 @@ Used only to decide which collections to reconcile. Base
 
 The feed is a sorted snapshot of what's published now, not an event log:
 each version appears once, at the time its published artifact was
-uploaded.
+uploaded. It comes from pulp_ansible's cross-repository search index, not
+the repository itself, and that index can lose versions Galaxy still serves
+(below).
 
 `next` links come back as `http://`; `GalaxyClient._url` rewrites them to the
 base URL's scheme.
@@ -86,6 +88,12 @@ each content object's `sha256`, `manifest` and `files`. It isn't used: see
 - **Versions from before the 2023-05 migration** all report the same
   `created_at` (e.g. `2023-05-08T20:24:33Z`), so lines with equal timestamps
   are ordered by version.
+
+- **The search index can lose versions that are still published:** on
+  2026-10-19, 22 versions across 10 collections dropped out of
+  `search/collection-versions/` (the feed, its count, and the UI's search)
+  while their contract endpoints and the listing kept serving them. The
+  sweep records them as `unindexed` once a reconcile finds them served.
 
 ## Measurements
 

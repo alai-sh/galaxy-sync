@@ -125,9 +125,11 @@ def _explain(entry: Pending | None, res: Result) -> list[str]:
                 lines.append("missing from the listing, but Galaxy still serves it")
             case "gone":
                 lines.append(
-                    f"the sweep didn't see {versions} on Galaxy, but Galaxy still serves it: "
-                    + "rows can shift while the feed is paged"
+                    f"the sweep didn't see {versions} on Galaxy, but Galaxy still serves it: rows can shift while "
+                    + "the feed is paged, or Galaxy's search index lost it. Not counted until the feed has it again"
                 )
+            case "unindexed":
+                lines.append(f"Galaxy's search index still leaves out {versions}, but Galaxy still serves it")
             case "not mirrored":
                 lines.append(f"the sweep saw {versions} unmirrored, but Galaxy's version list doesn't have it")
             case "re-uploaded":
@@ -197,8 +199,13 @@ def _print_summary(store: Store, worked: dict[str, Result | str], elapsed: float
         + ")"
     )
     if published := store.state.get("published_count"):
+        unindexed = sum(len(c.get("unindexed", [])) for c in store.state["collections"].values())
+        published += unindexed
         mirrored = sum(len(c["versions"]) for c in store.state["collections"].values())
-        print(f"mirror: {mirrored} of {published} versions Galaxy publishes ({mirrored / published:.1%})")
+        print(
+            f"mirror: {mirrored} of {published} versions Galaxy publishes ({mirrored / published:.1%})"
+            + (f", {unindexed} of them missing from its search index" if unindexed else "")
+        )
 
 
 def _print_warnings(worked: dict[str, Result | str]) -> None:
@@ -424,8 +431,13 @@ def _sweep(client: GalaxyClient, store: Store) -> bool:
         print("listing collections failed; deprecation changes wait for the next sweep", file=sys.stderr)
     for fqcn, versions in sorted(res.gone.items()):
         print(f"  gone: {fqcn} {', '.join(versions)}")
+    if unindexed := sum(map(len, res.unindexed.values())):
+        print(
+            f"  {unindexed} versions in {len(res.unindexed)} collections are still missing from Galaxy's search "
+            + "index, though Galaxy served them last time; rechecking them"
+        )
     for c in res.collections:
-        store.enqueue(".".join(c), "swept", reasons=res.reasons(c))
+        store.enqueue(".".join(c), "swept", reasons=res.reasons(c), unseen=res.unseen(c))
     store.save_state()
     return True
 
@@ -439,7 +451,15 @@ def _reconcile_one(
     """
     fqcn = f"{ns}.{name}"
     try:
-        res = reconcile(client, store, ns, name, revalidate=bool(entry and entry.get("revalidate")), deadline=deadline)
+        res = reconcile(
+            client,
+            store,
+            ns,
+            name,
+            revalidate=bool(entry and entry.get("revalidate")),
+            deadline=deadline,
+            unseen=entry.get("unseen", []) if entry else [],
+        )
     except GalaxyError as e:  # e.g. listing its versions failed
         store.record_failure(fqcn, None, e.kind, str(e))
         print(f"{label}: FAILED ({e})", file=sys.stderr)

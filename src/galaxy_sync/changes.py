@@ -247,12 +247,14 @@ class Sweep:
     gone: dict[str, list[str]] = field(default_factory=dict)  # mirrored, not yanked, no longer published
     unmirrored: dict[str, list[str]] = field(default_factory=dict)  # published, not in the index
     replaced: dict[str, list[str]] = field(default_factory=dict)  # mirrored, re-uploaded since
+    # Mirrored and not in the feed, but a reconcile found Galaxy still serves them.
+    unindexed: dict[str, list[str]] = field(default_factory=dict)
     published: int = 0  # versions the feed listed
     listed: dict[Collection, str] | None = None  # from the collection listing, with why; None if it failed
 
     @property
     def collections(self) -> list[Collection]:
-        names = set(self.gone) | set(self.unmirrored) | set(self.replaced)
+        names = set(self.gone) | set(self.unmirrored) | set(self.replaced) | set(self.unindexed)
         found = {(ns, name) for ns, _, name in (fqcn.partition(".") for fqcn in names)}
         return sorted(found | (self.listed or {}).keys())
 
@@ -261,12 +263,22 @@ class Sweep:
         fqcn = ".".join(collection)
         found = [
             f"{label}: {few(versions)}"
-            for label, by in (("gone", self.gone), ("not mirrored", self.unmirrored), ("re-uploaded", self.replaced))
+            for label, by in (
+                ("gone", self.gone),
+                ("not mirrored", self.unmirrored),
+                ("re-uploaded", self.replaced),
+                ("unindexed", self.unindexed),
+            )
             if (versions := by.get(fqcn))
         ]
         if reason := (self.listed or {}).get(collection):
             found.append(reason)
         return found
+
+    def unseen(self, collection: Collection) -> list[str]:
+        """Mirrored versions of a collection the feed didn't list."""
+        fqcn = ".".join(collection)
+        return [*self.gone.get(fqcn, []), *self.unindexed.get(fqcn, [])]
 
 
 def few(versions: list[str], shown: int = 3) -> str:
@@ -290,7 +302,10 @@ def sweep(client: GalaxyClient, store: Store) -> Sweep:
 
     New uploads during the walk shift rows to later pages, so they're seen
     twice, never skipped. A delete during the walk can shift a row past us,
-    making it look gone; reconcile checks before yanking. Raises GalaxyError
+    making it look gone; reconcile checks before yanking. Galaxy's search
+    index can also lose versions it still serves: once a reconcile has found
+    them served, they're reported as unindexed rather than gone, and still
+    queued so reconcile notices if they're deleted. Raises GalaxyError
     if any feed page fails, since a partial walk would make everything after
     it look deleted.
     """
@@ -309,13 +324,24 @@ def sweep(client: GalaxyClient, store: Store) -> Sweep:
         mirrored.add(fqcn)
         upstream = published.get(fqcn, {})
         have = {line["vers"] for line in store.read_index(ns, name) if not line["yanked"]}
-        seen = store.collection_state(fqcn)["versions"]
+        cstate = store.collection_state(fqcn)
+        seen = cstate["versions"]
         replaced = {
             v
             for v in have & upstream.keys()
             if (state := seen.get(v)) and state["created_at"] and upstream[v] and state["created_at"] != upstream[v]
         }
-        for found, versions in ((res.gone, have - upstream.keys()), (res.unmirrored, upstream.keys() - have)):
+        unlisted = have - upstream.keys()
+        # Those back in the feed are indexed again.
+        if unindexed := set(cstate.get("unindexed", [])) & unlisted:
+            cstate["unindexed"] = _sorted(unindexed)
+        else:
+            _ = cstate.pop("unindexed", None)
+        for found, versions in (
+            (res.gone, unlisted - unindexed),
+            (res.unmirrored, upstream.keys() - have),
+            (res.unindexed, unindexed),
+        ):
             if versions:
                 found[fqcn] = _sorted(versions)
         if replaced:
@@ -323,7 +349,7 @@ def sweep(client: GalaxyClient, store: Store) -> Sweep:
     for fqcn, versions in published.items():
         if fqcn not in mirrored:
             res.unmirrored[fqcn] = _sorted(set(versions))
-    for label, found in (("not mirrored", res.unmirrored), ("re-uploaded", res.replaced)):
+    for label, found in (("not mirrored", res.unmirrored), ("re-uploaded", res.replaced), ("unindexed", res.unindexed)):
         for fqcn, versions in sorted(found.items()):
             log.debug("%s: %s %s", fqcn, label, ", ".join(versions))
     res.listed = try_listing(client, store)
@@ -338,7 +364,9 @@ def check_count(client: GalaxyClient, store: Store) -> int | None:
     unaccounted for (recorded as `deletions_suspected`, cleared once they
     match), or None if the count couldn't be read. Run it after reconciling:
     versions uploaded since only raise Galaxy's count, so they can hide a
-    deletion until the next run but never fake one.
+    deletion until the next run but never fake one. Versions a reconcile found
+    served but missing from the search index aren't in Galaxy's count, so
+    they aren't expected either.
     """
     try:
         count = client.published_count()
@@ -347,9 +375,16 @@ def check_count(client: GalaxyClient, store: Store) -> int | None:
         return None
     store.clear_failures(GLOBAL, "count", exclude=("deletions_suspected",))
     store.state["published_count"] = count
-    expected = sum(c.get("upstream_count", 0) for c in store.state["collections"].values())
+    collections = store.state["collections"].values()
+    unindexed = sum(len(c.get("unindexed", [])) for c in collections)
+    expected = sum(c.get("upstream_count", 0) for c in collections) - unindexed
     missing = expected - count
-    log.info("Galaxy publishes %d versions; the mirror last saw %d", count, expected)
+    log.info(
+        "Galaxy publishes %d versions; the mirror last saw %d%s",
+        count,
+        expected,
+        f", not counting {unindexed} missing from its search index" if unindexed else "",
+    )
     if missing > 0:
         store.record_failure(
             GLOBAL,
