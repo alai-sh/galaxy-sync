@@ -33,8 +33,9 @@ index/
   current module, a module that was removed and redirected, a tombstoned
   lookup, two filters from one file, a role and a playbook.
 - **`collections.json`:** generated from the index files above. Each
-  `updated` is the newest `published` time in that file. In a real index it
-  also moves on yanks and deprecations.
+  `updated` is the newest `published` time in that file, and each `sha256`
+  that file's SHA-256. In a real index `updated` also moves on yanks and
+  deprecations.
 
 ## Things worth noticing
 

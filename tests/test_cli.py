@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 
@@ -59,6 +60,8 @@ def test_sync_writes_the_index(galaxy, run, tmp_path, capsys, refresh):
     collections = json.loads(index_file(tmp_path, "collections.json"))
     assert list(collections["namespaces"]) == ["ns"]
     assert "updated" in collections["namespaces"]["ns"]["coll"]
+    index = (tmp_path / "index-root" / "index" / "ns" / "coll.jsonl").read_bytes()
+    assert collections["namespaces"]["ns"]["coll"]["sha256"] == hashlib.sha256(index).hexdigest()
     assert json.loads(index_file(tmp_path, "plugins.jsonl")) == {
         "v": 1,
         "type": "module",

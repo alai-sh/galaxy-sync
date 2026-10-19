@@ -3,15 +3,18 @@
   "namespaces": {
     "alai_example": {
       "demo": {
-        "updated": "2026-09-20T09:00:00Z"
+        "updated": "2026-09-20T09:00:00Z",
+        "sha256": "e1fb67d80905db40370edd06446b9617c8ade7ef6458c38f14f6a86dc2cdd332"
       }
     },
     "community": {
       "general": {
-        "updated": "2026-10-05T17:30:02Z"
+        "updated": "2026-10-05T17:30:02Z",
+        "sha256": "59976e13dfbe811cee5e2c21744daf8eeda377a3a0f7f618a538a42ad947fcd2"
       },
       "library_inventory_filtering_v1": {
-        "updated": "2025-10-25T11:31:55Z"
+        "updated": "2025-10-25T11:31:55Z",
+        "sha256": "f92ce559b6ca24a4f01855d02195e086e399df38de461b596999b2930857b9c3"
       }
     }
   }

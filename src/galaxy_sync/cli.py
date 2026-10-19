@@ -25,6 +25,7 @@ from pathlib import Path
 
 import alai_plugin_extractor as ext
 
+from .cdn import Purger
 from .changes import (
     FEED_OVERLAP,
     Collection,
@@ -54,7 +55,9 @@ class UsageError(Exception):
 
 
 def _open_store(args: argparse.Namespace) -> Store:
-    return Store(Buckets.r2(R2Config.from_env()) if args.r2 else Buckets.local(args.store))
+    if args.r2:
+        return Store(Buckets.r2(R2Config.from_env()), purger=Purger.from_env())
+    return Store(Buckets.local(args.store))
 
 
 def _exit_code(store: Store, args: argparse.Namespace) -> int:
@@ -234,6 +237,7 @@ GLOBAL_RETRIES = {
     "requests": "retried with the requests",
     "sweep": "retried with the sweep",
     "count": "checked again after reconciling",
+    "purge": "cleared by the next purge that works",
 }
 
 
@@ -535,9 +539,9 @@ def _finish(
     """Write the aggregate files, the failure report and the state, then the run's summary."""
     store.write_galaxy_root()
     store.write_config()
-    store.write_collections()
     plugins = store.write_plugins()
     _ = store.write_conflict_records()
+    store.write_collections()  # last, as it purges the others from the CDN
     failures = store.write_failure_report()
     summary = failures.summary
     store.save_state()
@@ -686,9 +690,9 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
         print(f"[{i + 1:{width}}/{len(collections)}] {ns}.{name}: {', '.join(parts)}")
     store.write_galaxy_root()
     store.write_config()
-    store.write_collections()
     plugins = store.merge_plugins()
     _ = store.write_conflict_records(store.conflicted_collections())
+    store.write_collections()  # last, as it purges the others from the CDN
     store.save_state()
     print(f"rebuilt {len(collections)} collections ({plugins} plugin lines)")
     return 0

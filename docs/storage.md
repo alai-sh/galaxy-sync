@@ -24,7 +24,7 @@ only, editing `config.json` is enough; the next `rebuild` resets it.
 ```
 index bucket
   config.json                  formats, artifact URL template, moved-to
-  collections.json             every collection and when its index file last changed
+  collections.json             every collection, when its index file last changed and its sha256
   plugins.jsonl                the plugin index
   index/<ns>/<name>.jsonl      one line per version
   conflicts/<ns>/<name>.json   every conflict a collection has had, for audit
@@ -64,7 +64,7 @@ without that check, since it can't exist yet.
 | `last_sweep` | When the last sweep finished; the next is due a day later |
 | `plugins_pending` | Collections reconciled since `plugins.jsonl` was last merged; normally empty between runs |
 | `pending.<ns.name>` | The queue: `source` (`requested`, `uploaded`, `listed` or `swept`), `queued`, `revalidate` if asked for, and what change detection saw, so a reconcile that changes nothing can say why it ran: `uploads` (versions the upload feed saw), `unseen` (mirrored versions the sweep didn't see) and `reasons` (e.g. `updated_at changed` from the listing, `gone: 1.1.0` from the sweep) |
-| `collections.<ns.name>` | Per collection: `updated` (when its index file last changed), `upstream_updated`, `upstream_deprecated` and `upstream_count` (Galaxy's values at the last reconcile), `unindexed` (versions Galaxy serves that its search index leaves out), and `versions.<v>` with `created_at` and the cached `upstream` comparison verdict |
+| `collections.<ns.name>` | Per collection: `updated` (when its index file last changed), `sha256` (of its index file as stored, so writing `collections.json` reads no index files; one missing is filled in from the file, and `rebuild` takes every one from its file), `upstream_updated`, `upstream_deprecated` and `upstream_count` (Galaxy's values at the last reconcile), `unindexed` (versions Galaxy serves that its search index leaves out), and `versions.<v>` with `created_at` and the cached `upstream` comparison verdict |
 | `failures` | The failure ledger, keyed `<ns.name>@<version>#<kind>`: `collection`, `version`, `kind`, `message`, `first_seen`, `last_seen`, `attempts`, and `alerted` once it was notified as persistent |
 | `conflicts` | Versions where Galaxy serves different contents from the mirror ([conflicts](sync.md#conflicts)): `collection`, `version`, `ours`, `opened`, `observed` (each differing artifact: `sha256`, `uploaded`, `seen`, `changes` and `saved`, its key in this bucket), `acknowledged` (`at` and `note`) once a person has, and `resolved` once Galaxy serves our contents again. At most one is open per version, and none is ever removed |
 
@@ -83,6 +83,16 @@ up in a command line, shell history or workflow log:
 Locally, keep them in a gitignored `.env` and run
 `uv run --env-file .env galaxy-sync sync --r2 ...`.
 
+Purging the CDN ([below](#cdn-purging)) is configured the same way, and
+only with `--r2`. It's optional: with none of these set, a run leaves the
+cache to expire. Setting some but not all of them is an error.
+
+| Variable | |
+|---|---|
+| `CLOUDFLARE_PURGE_TOKEN` | A Cloudflare API token that can only purge the zone's cache |
+| `CLOUDFLARE_ZONE_ID` | The zone serving the index bucket (`alai.sh`) |
+| `ALAI_INDEX_URL` | Where the index bucket is served, `https://index.alai.sh`; purged URLs are this plus the key |
+
 The backend uses R2's S3 API. Each bucket's objects get its Cache-Control
 from the table above (`private, no-store` for state), and a Content-Type by
 extension: JSON for `.json` and the Galaxy view's `index.html` pages, plain
@@ -90,11 +100,68 @@ text for `.jsonl`. `state.json` is saved with a conditional write
 (`If-Match` on the ETag of what the run read), so two runs can never both
 save it.
 
+## CDN purging
+
+Cloudflare caches the index bucket's files for their `max-age` (60
+seconds). So that clients see a change as soon as the purge spreads,
+`sync` and `rebuild` purge every index bucket file they changed, in the
+order [the spec](index-spec/README.md#publishing-order) asks:
+`collections.json` is written last, the other changed files are purged
+before it's written, and it's purged after. Only the index bucket is
+purged; the Galaxy view expires on its own.
+
+A failed purge doesn't stop the run, and isn't retried, since the old
+files expire within a minute anyway. It's recorded in the failure ledger
+as `*` / `purge` / `cdn_purge` and cleared by the next purge that works,
+so a token that's expired or been revoked shows up on the tracking issue.
+
+### The purge token
+
+The token can purge `alai.sh`'s cache and nothing else. It's separate from
+the R2 token: R2's S3 credentials can't call Cloudflare's API, and one
+token for both would give each job permissions it doesn't need.
+
+To create it, in the Cloudflare dashboard of the account holding the
+`alai.sh` zone:
+
+1. Open *My Profile > API Tokens* (or, for a token owned by the account
+   rather than a person, *Manage Account > Account API Tokens*) and choose
+   **Create Token**.
+2. Under *Custom token*, choose **Get started**.
+3. Name it `galaxy-sync cache purge`.
+4. **Permissions:** one row, `Zone` | `Cache Purge` | `Purge`.
+5. **Zone Resources:** `Include` | `Specific zone` | `alai.sh`.
+6. Leave *Client IP Address Filtering* empty: GitHub's runners don't have
+   fixed addresses. Set a *TTL* end date if you want it to expire, and put
+   a reminder to replace it before then.
+7. **Continue to summary**, check it reads *alai.sh - Cache Purge:Purge*,
+   then **Create Token** and copy the token. It isn't shown again.
+
+Check it works (the response has `"status": "active"`; a user token checks
+at `/user/tokens/verify`, an account token at
+`/accounts/<account id>/tokens/verify`):
+
+```bash
+curl -s https://api.cloudflare.com/client/v4/user/tokens/verify -H "Authorization: Bearer <token>"
+```
+
+The zone ID is under *Domains > alai.sh > Overview*, in the *API* section
+near the bottom of the page.
+
+Then, in this repository's *Settings > Environments > r2*:
+
+- under *Environment secrets*, add `CLOUDFLARE_PURGE_TOKEN` with the token;
+- under *Environment variables*, add `CLOUDFLARE_ZONE_ID` with the zone ID
+  and `ALAI_INDEX_URL` with `https://index.alai.sh`.
+
+To replace the token, create a new one the same way, update the secret,
+then delete the old token from the page it was created on.
+
 ## Hosting and cost
 
 The jobs run on GitHub Actions in the `alai-sh` org
-([scheduling](sync.md#scheduling)), with the R2 token as secrets in a
-protected `r2` environment and the bucket names as variables; an Azure
+([scheduling](sync.md#scheduling)), with the R2 and purge tokens as secrets in a
+protected `r2` environment and the bucket names, zone ID and index URL as variables; an Azure
 Container Apps Job is the fallback. At R2 list prices the mirror is ~25 GB
 at $0.015/GB-month. Egress is free, and clients mostly hit the CDN cache.
 Writes stay inside the free tier: mirroring a version is a handful of

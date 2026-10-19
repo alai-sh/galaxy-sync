@@ -10,6 +10,7 @@ content hasn't changed, except where the object is known to be new.
 """
 
 import datetime
+import hashlib
 import json
 import logging
 import secrets
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from . import galaxy_api, report
+from .cdn import PurgeError, Purger
 from .models import (
     CollectionState,
     Conflict,
@@ -95,6 +97,10 @@ def _write(backend: Backend, key: str, text: str) -> bool:
     return True
 
 
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def _read_jsonl(data: bytes | None) -> list[object]:
     return [json.loads(line) for line in (data or b"").decode().splitlines() if line.strip()]
 
@@ -167,10 +173,12 @@ class StateChanged(StorageError):
 
 
 class Store:
-    def __init__(self, buckets: Buckets, dl_url: str | None = None) -> None:
+    def __init__(self, buckets: Buckets, dl_url: str | None = None, purger: Purger | None = None) -> None:
         """Open a store. The artifact URL template is `dl_url`, else the one in
-        config.json, else DEFAULT_DL."""
+        config.json, else DEFAULT_DL. With `purger`, index files this run
+        changes are purged from the CDN when collections.json is written."""
         self.buckets = buckets
+        self.purger = purger
         self.index = buckets.index
         self.dl = buckets.dl
         self.galaxy = buckets.galaxy
@@ -192,6 +200,8 @@ class Store:
         self._plugin_lines: dict[str, list[PluginLine]] = {}
         # Each collection's extractions object as read or last saved, to skip unchanged saves.
         self._saved_extractions: dict[str, bytes] = {}
+        # Index bucket keys changed since the last purge, in the order written.
+        self._unpurged: dict[str, None] = {}
         self._unsaved_work = 0
 
     def _configured_dl(self) -> str | None:
@@ -434,8 +444,8 @@ class Store:
         for fqcn in sorted(names):
             if conflicts := [c for c in self.state["conflicts"] if c["collection"] == fqcn]:
                 ns, _, name = fqcn.partition(".")
-                written += _write(
-                    self.index, self.conflict_record_key(ns, name), report.conflict_record(fqcn, conflicts)
+                written += self._write_index_file(
+                    self.conflict_record_key(ns, name), report.conflict_record(fqcn, conflicts)
                 )
         self._conflicts_changed.clear()
         return written
@@ -539,9 +549,11 @@ class Store:
         pages and the listings, for progress saved part way through.
         """
         text = "".join(_dump(ordered_line(line)) + "\n" for line in lines)
-        changed = _write(self.index, self.index_key(namespace, name), text)
+        changed = self._write_index_file(self.index_key(namespace, name), text)
+        state = self.collection_state(f"{namespace}.{name}")
+        state["sha256"] = _sha256(text.encode())  # what's stored now, changed or not
         if changed:
-            self.collection_state(f"{namespace}.{name}")["updated"] = now()
+            state["updated"] = now()
         if changed or view:
             _ = self.write_galaxy_collection(namespace, name, lines, added, partial=partial)
         return changed
@@ -590,7 +602,9 @@ class Store:
 
         `rebuild` runs this for every collection, then `merge_plugins`.
         """
-        lines = self.read_index(namespace, name)
+        data = self.index.read(self.index_key(namespace, name))
+        self.collection_state(f"{namespace}.{name}")["sha256"] = _sha256(data or b"")
+        lines = cast(list[IndexLine], _read_jsonl(data))
         pages = self.write_galaxy_collection(namespace, name, lines)
         extractions = self.load_extractions(namespace, name)
         plugins = self.set_collection_plugins(
@@ -606,14 +620,50 @@ class Store:
             "dl": self.dl_url,
             "moved-to": None,
         }
-        _ = _write(self.index, "config.json", json.dumps(config, indent=2) + "\n")
+        _ = self._write_index_file("config.json", json.dumps(config, indent=2) + "\n")
 
     def write_collections(self) -> None:
+        """Write collections.json, after every other index bucket file.
+
+        Each collection's `sha256` comes from state, so writing it reads no
+        index files, except to fill in one state doesn't have yet. The index
+        files this run changed are purged before it's written and it's
+        purged after, so a client that sees a new `sha256` gets the file it
+        describes (docs/index-spec/README.md, "Publishing order").
+        """
         namespaces: dict[str, dict[str, dict[str, str]]] = {}
         for ns, name in self.index_collections():
-            updated = self.collection_state(f"{ns}.{name}").get("updated") or now()
-            namespaces.setdefault(ns, {})[name] = {"updated": updated}
-        _ = _write(self.index, "collections.json", json.dumps({"v": 1, "namespaces": namespaces}, indent=1) + "\n")
+            state = self.collection_state(f"{ns}.{name}")
+            if "sha256" not in state:
+                state["sha256"] = _sha256(self.index.read(self.index_key(ns, name)) or b"")
+            namespaces.setdefault(ns, {})[name] = {"updated": state.get("updated") or now(), "sha256": state["sha256"]}
+        self.purge()
+        _ = self._write_index_file("collections.json", json.dumps({"v": 1, "namespaces": namespaces}, indent=1) + "\n")
+        self.purge()
+
+    def _write_index_file(self, key: str, text: str) -> bool:
+        """Write one index bucket file, noting it for the next purge if it changed."""
+        changed = _write(self.index, key, text)
+        if changed:
+            self._unpurged[key] = None
+        return changed
+
+    def purge(self) -> None:
+        """Purge the index bucket files changed since the last purge from the CDN.
+
+        A failure is recorded and the run carries on: the CDN serves the old
+        files only until their max-age runs out, so they aren't purged again.
+        """
+        keys, self._unpurged = list(self._unpurged), {}
+        if self.purger is None or not keys:
+            return
+        try:
+            self.purger.purge(keys)
+        except PurgeError as e:
+            self.record_failure(GLOBAL, "purge", "cdn_purge", f"purging {len(keys)} files: {e}")
+            return
+        log.info("purged %d files from the CDN", len(keys))
+        self.clear_failures(GLOBAL, "purge")
 
     def set_collection_plugins(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> int:
         """Work out one collection's plugin lines, from each version's extraction, for `write_plugins` to merge.
@@ -668,6 +718,6 @@ class Store:
 
     def _write_plugins(self, lines: list[PluginLine]) -> int:
         lines.sort(key=lambda line: (line["type"], line["name"], line["collection"]))
-        _ = _write(self.index, "plugins.jsonl", _jsonl(lines))
+        _ = self._write_index_file("plugins.jsonl", _jsonl(lines))
         _ = self.state.pop("plugins_pending", None)
         return len(lines)

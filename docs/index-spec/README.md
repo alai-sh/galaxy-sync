@@ -122,11 +122,11 @@ index file last changed.
   "v": 1,
   "namespaces": {
     "alai_example": {
-      "demo": {"updated": "2026-09-20T09:00:00Z"}
+      "demo": {"updated": "2026-09-20T09:00:00Z", "sha256": "e1fb67d80905db40370edd06446b9617c8ade7ef6458c38f14f6a86dc2cdd332"}
     },
     "community": {
-      "general": {"updated": "2026-10-05T17:30:02Z"},
-      "library_inventory_filtering_v1": {"updated": "2025-10-25T11:31:55Z"}
+      "general": {"updated": "2026-10-05T17:30:02Z", "sha256": "59976e13dfbe811cee5e2c21744daf8eeda377a3a0f7f618a538a42ad947fcd2"},
+      "library_inventory_filtering_v1": {"updated": "2025-10-25T11:31:55Z", "sha256": "f92ce559b6ca24a4f01855d02195e086e399df38de461b596999b2930857b9c3"}
     }
   }
 }
@@ -138,6 +138,7 @@ index file last changed.
 | `namespaces` | object | yes | Map of namespace to its collections |
 | `namespaces.<ns>.<name>` | object | yes | One entry per collection that has an index file |
 | `namespaces.<ns>.<name>.updated` | string | yes | When that collection's index file last changed for any reason: a new version, a yank or a deprecation (RFC 3339) |
+| `namespaces.<ns>.<name>.sha256` | string | no | Lowercase hex SHA-256 of that collection's index file, over its bytes exactly as stored (before any transfer compression). Lets a client tell whether its cached copy is current without a request; see [Cached index files](#cached-index-files). Indexes SHOULD include it |
 
 What it's for:
 
@@ -148,10 +149,21 @@ What it's for:
   compares `updated` with what it last saw, and fetches only the index files
   that changed. A collection that disappears from the listing was removed
   entirely.
+- **Skipping unchanged index files.** A client compares each `sha256` with its
+  cached copies and only requests the files that changed, so a resolve where
+  nothing changed costs this file and `config.json`, however many
+  collections it needs. See [Cached index files](#cached-index-files).
 
-For the Galaxy mirror this is about 4.6k entries: roughly 300 KB raw and
-60 KB compressed. It changes on every publish, so it's served with the same
-short cache lifetime as index files.
+For the Galaxy mirror this is about 4.6k entries: roughly 720 KB raw and
+250 KB compressed with `sha256` (340 KB and 60 KB without). It changes on
+every publish, so it's served with the same short cache lifetime as index
+files.
+
+`sha256` is the full hash rather than a prefix because collection authors
+control much of their index file's content and can predict the next one (the
+same file with a version yanked, say). With a 64-bit prefix, finding a file
+that shares its prefix with its own future yanked form takes about 2^32
+attempts, after which clients that had cached it would never see the yank.
 
 Descriptions, tags and other search data are deliberately left out. They
 belong in the catalog (see [Planned additions](#planned-additions)), which is
@@ -355,9 +367,20 @@ added later as an optional field without a format version change.
 
 - **Caching:** index files and `collections.json` SHOULD be served with a
   short `Cache-Control` (e.g. `max-age=60`) and an `ETag`. Clients SHOULD
-  revalidate with `If-None-Match` on every resolve, unless running offline.
-  Artifacts are immutable and SHOULD be served with
-  `Cache-Control: public, max-age=31536000, immutable`.
+  revalidate with `If-None-Match` on every resolve, unless running offline,
+  except for index files whose `sha256` shows the cached copy is current (see
+  [Cached index files](#cached-index-files)). Artifacts are immutable and
+  SHOULD be served with `Cache-Control: public, max-age=31536000, immutable`.
+- **Query strings:** an index host MUST serve index files the same whatever
+  query string is added, and MUST NOT leave the query string out of the
+  cache key for them. Clients rely on a fresh query string to get past a
+  stale cached copy.
+- **Purging:** an index behind a CDN SHOULD purge each changed file from the
+  CDN when it publishes, in the [publishing order](#publishing-order). This
+  shrinks the window in which clients see stale data from the `max-age` to
+  however long the purge takes to spread. Purging only reaches the CDN, not
+  proxies or browsers after it, so the `Cache-Control` sent to clients stays
+  short either way.
 - **Compression:** clients SHOULD send `Accept-Encoding` (gzip, br, zstd).
   Servers MAY compress. Index files compress well.
 - **Content-Type:** clients MUST NOT depend on it.
@@ -429,6 +452,41 @@ to resolve consistently.
   uninstallable.
 - **`requires_ansible`** SHOULD be checked against the target ansible-core
   version when it's known.
+
+### Cached index files
+
+`collections.json` is revalidated on every resolve, like any other file.
+Each index file the resolve needs is then handled by comparing the listing's
+`sha256` with the SHA-256 the client computes over its own cached copy:
+
+1. **They match:** the cached copy is current. The client MAY use it without
+   a request.
+2. **They differ, there's no cached copy, or the listing has no `sha256`:** the
+   client fetches the file as usual, revalidating any cached copy with
+   `If-None-Match`.
+3. **The fetched file's SHA-256 still differs from the listing's:** a cache
+   between the client and the index served an old copy (for up to the
+   file's `max-age` after a change), or the listing is the older of the two.
+   The client SHOULD fetch once more with a query string nobody could
+   predict, such as `?r=<16 random hex characters>`, which no cache holds,
+   and then use whatever it gets.
+
+The client caches each file with the hash of its own bytes, never the
+listing's value, and MUST NOT treat a cached file as current on the strength
+of `updated` alone. Both rules matter for the same reason: anyone can make a
+CDN cache old content under a URL they choose, including one with a future
+`updated` in its query, but nobody can make old content hash to the new
+value. A client that follows them can be served stale data for one resolve,
+inside the `max-age` window, but never gets stuck on it.
+
+### Publishing order
+
+So that a client which sees a new `sha256` or `updated` can fetch the content
+it describes, whatever writes an index MUST write a changed index file
+before the `collections.json` that describes it. An index served through a
+CDN it can purge SHOULD purge the changed index files between the two
+writes, and purge `collections.json` after it. See
+[HTTP behaviour](#http-behaviour).
 
 ## Planned additions
 

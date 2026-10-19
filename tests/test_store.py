@@ -1,9 +1,11 @@
 """Store: the reconcile queue and guarding state.json."""
 
+import hashlib
 import json
 
 import pytest
 
+from galaxy_sync.cdn import PurgeError
 from galaxy_sync.storage import Buckets
 from galaxy_sync.store import StateChanged, Store
 
@@ -106,3 +108,91 @@ def test_conflicts_saved_one_per_artifact_are_folded(tmp_path):
     # Folded state stays as it is.
     store.save_state()
     assert Store(Buckets.local(tmp_path)).state["conflicts"] == [resolved, current]
+
+
+LINE = {
+    "v": 1,
+    "name": "ns.coll",
+    "vers": "1.0.0",
+    "deps": [],
+    "cksum": "a" * 64,
+    "size": 1,
+    "yanked": False,
+    "published": "2026-01-01T00:00:00Z",
+}
+
+
+def _listed(store, name="coll"):
+    return json.loads(store.index.read("collections.json"))["namespaces"]["ns"][name]
+
+
+def test_collections_sha256(tmp_path):
+    store = Store(Buckets.local(tmp_path))
+    _ = store.write_index("ns", "coll", [LINE])
+    store.write_collections()
+    data = store.index.read("index/ns/coll.jsonl")
+    assert _listed(store)["sha256"] == hashlib.sha256(data).hexdigest()
+
+    # A collection state has no hash for yet is read once to fill it in.
+    store.index.write("index/ns/other.jsonl", b"{}\n")
+    del store.state["collections"]["ns.coll"]["sha256"]
+    store.write_collections()
+    assert _listed(store)["sha256"] == hashlib.sha256(data).hexdigest()
+    assert _listed(store, "other")["sha256"] == hashlib.sha256(b"{}\n").hexdigest()
+
+    # Rebuild takes the hash from the file, whatever state says.
+    store.state["collections"]["ns.coll"]["sha256"] = "stale"
+    _ = store.rebuild_collection("ns", "coll")
+    store.write_collections()
+    assert _listed(store)["sha256"] == hashlib.sha256(data).hexdigest()
+
+
+class FakePurger:
+    def __init__(self, store, error=None):
+        self.store = store
+        self.error = error
+        self.calls = []
+
+    def purge(self, keys):
+        listing = self.store.index.read("collections.json")
+        self.calls.append((list(keys), listing and json.loads(listing)))
+        if self.error:
+            raise PurgeError(self.error)
+
+
+def test_purge_order(tmp_path):
+    store = Store(Buckets.local(tmp_path))
+    store.purger = purger = FakePurger(store)
+    _ = store.write_index("ns", "coll", [LINE])
+    store.write_config()
+    store.write_collections()
+    # The index files first, while collections.json doesn't name them yet, then collections.json.
+    assert purger.calls == [(["index/ns/coll.jsonl", "config.json"], None), (["collections.json"], purger.calls[1][1])]
+
+    # Unchanged files aren't purged, and nothing at all is when nothing changed.
+    purger.calls.clear()
+    _ = store.write_index("ns", "coll", [LINE])
+    store.write_config()
+    store.write_collections()
+    assert purger.calls == []
+
+    _ = store.write_index("ns", "coll", [{**LINE, "yanked": True}])
+    store.write_collections()
+    assert [keys for keys, _ in purger.calls] == [["index/ns/coll.jsonl"], ["collections.json"]]
+    assert purger.calls[0][1]["namespaces"]["ns"]["coll"]["sha256"] != _listed(store)["sha256"]
+
+
+def test_purge_failure_is_recorded(tmp_path):
+    store = Store(Buckets.local(tmp_path))
+    store.purger = FakePurger(store, error="HTTP 403: Authentication error")
+    _ = store.write_index("ns", "coll", [LINE])
+    store.write_collections()  # carries on, and writes collections.json anyway
+    assert store.index.read("collections.json") is not None
+    [failure] = store.state["failures"].values()
+    assert (failure["collection"], failure["version"], failure["kind"]) == ("*", "purge", "cdn_purge")
+    assert failure["message"] == "purging 1 files: HTTP 403: Authentication error"
+
+    store.purger = FakePurger(store)
+    _ = store.write_index("ns", "coll", [{**LINE, "yanked": True}])
+    store.write_collections()
+    assert store.state["failures"] == {}

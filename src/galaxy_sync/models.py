@@ -170,6 +170,7 @@ class VersionState(TypedDict):
 class CollectionState(TypedDict):
     versions: dict[str, VersionState]
     updated: NotRequired[str]
+    sha256: NotRequired[str]  # of the index file as stored, for collections.json
     upstream_updated: NotRequired[str]
     upstream_deprecated: NotRequired[bool]
     upstream_count: NotRequired[int]  # versions Galaxy listed at the last reconcile
