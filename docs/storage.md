@@ -63,7 +63,7 @@ without that check, since it can't exist yet.
 | `repo_published` | The repo metadata timestamp at the last `sync` |
 | `last_sweep` | When the last sweep finished; the next is due a day later |
 | `plugins_pending` | Collections reconciled since `plugins.jsonl` was last merged; normally empty between runs |
-| `pending.<ns.name>` | The queue: `source` (`requested`, `uploaded`, `listed` or `swept`), `queued`, and `revalidate` if asked for |
+| `pending.<ns.name>` | The queue: `source` (`requested`, `uploaded`, `listed` or `swept`), `queued`, `revalidate` if asked for, and what change detection saw, so a reconcile that changes nothing can say why it ran: `uploads` (versions the upload feed saw) and `reasons` (e.g. `updated_at changed` from the listing, `gone: 1.1.0` from the sweep) |
 | `collections.<ns.name>` | Per collection: `updated` (when its index file last changed), `upstream_updated`, `upstream_deprecated` and `upstream_count` (Galaxy's values at the last reconcile), and `versions.<v>` with `created_at` and the cached `upstream` comparison verdict |
 | `failures` | The failure ledger, keyed `<ns.name>@<version>#<kind>`: `collection`, `version`, `kind`, `message`, `first_seen`, `last_seen`, `attempts`, and `alerted` once it was notified as persistent |
 | `conflicts` | Versions where Galaxy serves different contents from the mirror ([conflicts](sync.md#conflicts)): `collection`, `version`, `ours`, `opened`, `observed` (each differing artifact: `sha256`, `uploaded`, `seen`, `changes` and `saved`, its key in this bucket), `acknowledged` (`at` and `note`) once a person has, and `resolved` once Galaxy serves our contents again. At most one is open per version, and none is ever removed |

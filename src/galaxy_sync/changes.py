@@ -71,8 +71,8 @@ def resolve_targets(client: GalaxyClient, targets: list[str]) -> list[Collection
     return result
 
 
-def _listed_changes(client: GalaxyClient, store: Store) -> set[Collection]:
-    """Collections the full listing says need a reconcile.
+def _listed_changes(client: GalaxyClient, store: Store) -> dict[Collection, str]:
+    """Collections the full listing says need a reconcile, with why.
 
     New collections, and ones whose `deprecated` flag or `updated_at` differs
     from the last reconcile. Galaxy's `updated_at` is the timestamp of the
@@ -83,7 +83,12 @@ def _listed_changes(client: GalaxyClient, store: Store) -> set[Collection]:
     """
     log.info("reading the collection listing")
     listed: set[Collection] = set()
-    reasons: dict[str, set[Collection]] = {"new": set(), "updated": set(), "deprecation changed": set(), "gone": set()}
+    reasons: dict[str, set[Collection]] = {
+        "new": set(),
+        "updated_at changed": set(),
+        "deprecation changed": set(),
+        "gone from the listing": set(),
+    }
     for item in client.list_collections():
         ns, name = item["namespace"], item["name"]
         if not _valid(ns, name):
@@ -93,14 +98,14 @@ def _listed_changes(client: GalaxyClient, store: Store) -> set[Collection]:
         if cstate is None:
             reasons["new"].add((ns, name))
         elif cstate.get("upstream_updated") != item.get("updated_at"):
-            reasons["updated"].add((ns, name))
+            reasons["updated_at changed"].add((ns, name))
         elif cstate.get("upstream_deprecated", False) != bool(item.get("deprecated")):
             reasons["deprecation changed"].add((ns, name))
 
     for fqcn, cstate in store.state["collections"].items():
         ns, _, name = fqcn.partition(".")
         if (ns, name) not in listed and "upstream_updated" in cstate:
-            reasons["gone"].add((ns, name))
+            reasons["gone from the listing"].add((ns, name))
     log.info(
         "collection listing: %d collections; %s",
         len(listed),
@@ -109,10 +114,10 @@ def _listed_changes(client: GalaxyClient, store: Store) -> set[Collection]:
     for reason, found in reasons.items():
         for ns, name in sorted(found):
             log.debug("%s.%s: %s in the listing", ns, name, reason)
-    return {c for found in reasons.values() for c in found}
+    return {c: reason for reason, found in reasons.items() for c in found}
 
 
-def try_listing(client: GalaxyClient, store: Store) -> set[Collection] | None:
+def try_listing(client: GalaxyClient, store: Store) -> dict[Collection, str] | None:
     """The listing's changes, or None (with `*/listing` recorded) if it failed."""
     try:
         found = _listed_changes(client, store)
@@ -123,11 +128,15 @@ def try_listing(client: GalaxyClient, store: Store) -> set[Collection] | None:
     return found
 
 
-def _feed_changes(client: GalaxyClient, cursor: str | None) -> tuple[str | None, set[Collection]]:
-    """Walk the upload feed back to `cursor`; return the new cursor and the collections seen.
+def _feed_changes(
+    client: GalaxyClient, cursor: str | None
+) -> tuple[str | None, dict[Collection, set[str]], set[Collection]]:
+    """Walk the upload feed back to `cursor`.
 
-    With no cursor only the newest entry is read, to start one. Entries up to
-    FEED_OVERLAP older than the cursor are included again.
+    Returns the new cursor, the versions seen by collection, and the
+    collections with an upload newer than `cursor`. With no cursor only the
+    newest entry is read, to start one. Entries up to FEED_OVERLAP older than
+    the cursor are included again.
     """
     since = datetime.datetime.fromisoformat(cursor) if cursor else None
     stop = since - FEED_OVERLAP if since else None
@@ -136,26 +145,31 @@ def _feed_changes(client: GalaxyClient, cursor: str | None) -> tuple[str | None,
     else:
         log.info("reading the newest upload to start the feed cursor")
     newest: str | None = None
-    found: set[Collection] = set()
+    found: dict[Collection, set[str]] = {}
+    fresh: set[Collection] = set()
     for row in client.published_feed():
         cv = row["collection_version"]
         newest = newest or cv["pulp_created"]
         if stop is None or datetime.datetime.fromisoformat(cv["pulp_created"]) < stop:
             break
         if _valid(cv["namespace"], cv["name"]):
-            found.add((cv["namespace"], cv["name"]))
+            found.setdefault((cv["namespace"], cv["name"]), set()).add(cv["version"])
+            if since is None or datetime.datetime.fromisoformat(cv["pulp_created"]) > since:
+                fresh.add((cv["namespace"], cv["name"]))
     if newest is None or (since is not None and datetime.datetime.fromisoformat(newest) < since):
         # Nothing newer, and the cursor's own version may have been deleted.
         newest = cursor
     if stop:
         log.info("upload feed: %d collections have new uploads; the newest is from %s", len(found), newest)
-    return newest, found
+    return newest, found, fresh
 
 
 @dataclass
 class Discovery:
     collections: list[Collection] = field(default_factory=list)
-    uploads: set[Collection] = field(default_factory=set)  # the ones the upload feed found
+    uploads: dict[Collection, list[str]] = field(default_factory=dict)  # the versions the upload feed found
+    new_uploads: set[Collection] = field(default_factory=set)  # those uploaded since the cursor, not just the overlap
+    listing: dict[Collection, str] = field(default_factory=dict)  # what the listing found, and why
     cursor: str | None = None  # save as `feed_cursor` once `collections` are queued
     published: str | None = None  # save as `repo_published` once `collections` are queued
     unchanged: bool = False  # the repo hasn't changed since the last run, so nothing else was read
@@ -199,13 +213,12 @@ def discover(client: GalaxyClient, store: Store) -> Discovery:
             res.cursor = cursor
             return res
 
-    found: set[Collection] = set()
     list_all = cursor is None
     if list_all:
         log.info("no feed cursor yet (the initial import): every collection will be listed")
     try:
-        res.cursor, found = _feed_changes(client, cursor)
-        res.uploads = set(found)
+        res.cursor, uploads, res.new_uploads = _feed_changes(client, cursor)
+        res.uploads = {c: _sorted(versions) for c, versions in uploads.items()}
     except GalaxyError as e:
         store.record_failure(GLOBAL, "feed", e.kind, f"upload feed: {e}")
         log.info("the upload feed failed: falling back to the collection listing")
@@ -223,9 +236,9 @@ def discover(client: GalaxyClient, store: Store) -> Discovery:
             res.published = None  # nor what the listing missed
         else:
             res.listed = True
-            found |= listed
+            res.listing = listed
 
-    res.collections = sorted(found)
+    res.collections = sorted(res.uploads.keys() | res.listing.keys())
     return res
 
 
@@ -235,13 +248,31 @@ class Sweep:
     unmirrored: dict[str, list[str]] = field(default_factory=dict)  # published, not in the index
     replaced: dict[str, list[str]] = field(default_factory=dict)  # mirrored, re-uploaded since
     published: int = 0  # versions the feed listed
-    listed: set[Collection] | None = None  # from the collection listing; None if it failed
+    listed: dict[Collection, str] | None = None  # from the collection listing, with why; None if it failed
 
     @property
     def collections(self) -> list[Collection]:
         names = set(self.gone) | set(self.unmirrored) | set(self.replaced)
         found = {(ns, name) for ns, _, name in (fqcn.partition(".") for fqcn in names)}
-        return sorted(found | (self.listed or set()))
+        return sorted(found | (self.listed or {}).keys())
+
+    def reasons(self, collection: Collection) -> list[str]:
+        """What the sweep saw for a collection it queued."""
+        fqcn = ".".join(collection)
+        found = [
+            f"{label}: {few(versions)}"
+            for label, by in (("gone", self.gone), ("not mirrored", self.unmirrored), ("re-uploaded", self.replaced))
+            if (versions := by.get(fqcn))
+        ]
+        if reason := (self.listed or {}).get(collection):
+            found.append(reason)
+        return found
+
+
+def few(versions: list[str], shown: int = 3) -> str:
+    """The first few versions, and how many more there are."""
+    more = f" and {len(versions) - shown} more" if len(versions) > shown else ""
+    return ", ".join(versions[:shown]) + more
 
 
 def _sorted(versions: set[str]) -> list[str]:

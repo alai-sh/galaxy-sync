@@ -25,8 +25,20 @@ from pathlib import Path
 
 import alai_plugin_extractor as ext
 
-from .changes import Collection, check_count, check_target, discover, resolve_targets, split_version_target, sweep
+from .changes import (
+    FEED_OVERLAP,
+    Collection,
+    Discovery,
+    check_count,
+    check_target,
+    discover,
+    few,
+    resolve_targets,
+    split_version_target,
+    sweep,
+)
 from .galaxy import BASE_URL, GalaxyClient, GalaxyError
+from .models import Pending, Request
 from .plugins import builtin_lines
 from .reconcile import Result, reconcile
 from .storage import Buckets, R2Config, StorageError
@@ -62,6 +74,8 @@ def _changes(res: Result) -> list[str]:
     ):
         if versions:
             parts.append(f"{label} {','.join(versions)}")
+    if res.deprecated is not None:
+        parts.append("deprecated" if res.deprecated else "no longer deprecated")
     if res.deferred:
         parts.append(f"{len(res.deferred)} left for the next run")
     if res.errors:
@@ -70,12 +84,85 @@ def _changes(res: Result) -> list[str]:
 
 
 def _describe(res: Result) -> str:
-    return " ".join([f"+{len(res.added)}", *_changes(res)])
+    changes = _changes(res)
+    if res.added or changes:
+        return " ".join([f"+{len(res.added)}", *changes])
+    checked = f", rechecked {res.rechecked} versions: all match" if res.rechecked else ""
+    return f"+0, up to date ({res.mirrored}/{res.upstream} mirrored){checked}"
+
+
+def _explain(entry: Pending | None, res: Result) -> list[str]:
+    """Why a collection whose reconcile changed nothing was queued, and what may explain it."""
+    if entry is None:
+        return ["queued for its outstanding failures"]
+    lines: list[str] = []
+    if uploads := entry.get("uploads"):
+        if seen := [v for v in uploads if v in res.listed]:
+            lines.append(
+                f"the upload feed saw {few(seen)}: already mirrored, so seen again in the feed's {_wait(FEED_OVERLAP)} overlap"
+            )
+        if unlisted := [v for v in uploads if v not in res.listed]:
+            lines.append(
+                f"the upload feed saw {few(unlisted)}: not in Galaxy's version list, so awaiting approval or deleted since"
+            )
+    for reason in entry.get("reasons", []):
+        label, _, versions = reason.partition(": ")
+        match label:
+            case "new":
+                lines.append(
+                    "new in the listing" + ("; Galaxy lists no versions for it yet" if not res.upstream else "")
+                )
+            case "updated_at changed":
+                lines.append(
+                    "the listing's updated_at changed but no version did: possibly a highest version deleted or "
+                    + "re-uploaded, or an edit on Galaxy that isn't a release"
+                )
+            case "deprecation changed":
+                lines.append(
+                    "the listing's deprecation flag changed but the collection's page didn't: the listing may lag"
+                )
+            case "gone from the listing":
+                lines.append("missing from the listing, but Galaxy still serves it")
+            case "gone":
+                lines.append(
+                    f"the sweep didn't see {versions} on Galaxy, but Galaxy still serves it: "
+                    + "rows can shift while the feed is paged"
+                )
+            case "not mirrored":
+                lines.append(f"the sweep saw {versions} unmirrored, but Galaxy's version list doesn't have it")
+            case "re-uploaded":
+                lines.append(f"the sweep saw {versions} re-uploaded, but Galaxy's sha256 still matches ours")
+            case _:
+                lines.append(reason)
+    if not lines:
+        lines.append(
+            {
+                "requested": "requested",
+                "uploaded": "the upload feed saw an upload: probably seen again in the feed's overlap, "
+                + "or awaiting approval on Galaxy",
+                "listed": "found by the listing",
+                "swept": "found by the sweep",
+            }.get(entry["source"], entry["source"])
+        )
+    return lines
 
 
 def _duration(seconds: float) -> str:
     minutes, seconds = divmod(round(seconds), 60)
     return f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+
+
+def _wait(delta: datetime.timedelta) -> str:
+    """A wait in hours and minutes."""
+    hours, minutes = divmod(max(round(delta.total_seconds() / 60), 0), 60)
+    return f"{hours}h {minutes}m" if hours and minutes else f"{hours}h" if hours else f"{minutes}m"
+
+
+def _when(timestamp: str | datetime.datetime) -> str:
+    """A timestamp in UTC to the second."""
+    if isinstance(timestamp, str):
+        timestamp = datetime.datetime.fromisoformat(timestamp)
+    return timestamp.astimezone(datetime.UTC).strftime("%Y-%m-%d %H:%M:%SZ")
 
 
 def _print_summary(store: Store, worked: dict[str, Result | str], elapsed: float) -> None:
@@ -114,52 +201,179 @@ def _print_summary(store: Store, worked: dict[str, Result | str], elapsed: float
         print(f"mirror: {mirrored} of {published} versions Galaxy publishes ({mirrored / published:.1%})")
 
 
+def _print_warnings(worked: dict[str, Result | str]) -> None:
+    """List the repacks: Galaxy serving different bytes with the same contents, which keeps ours."""
+    repacks = [
+        (fqcn, vers, shas)
+        for fqcn, res in worked.items()
+        if isinstance(res, Result)
+        for vers, shas in res.repacked.items()
+    ]
+    if not repacks:
+        return
+    print(f"warnings: {len(repacks)} repacks (Galaxy serves different bytes with the same contents; ours kept)")
+    for fqcn, vers, (ours, theirs) in repacks:
+        print(f"  {fqcn} {vers}: ours {ours}, Galaxy's {theirs}")
+
+
 # How many outstanding failures a run lists when it starts; the rest are in failures.json.
 SHOW_FAILURES = 20
 
+# When each step's run-level failure (collection GLOBAL) is retried.
+GLOBAL_RETRIES = {
+    "published": "retried every run",
+    "feed": "retried every run",
+    "listing": "retried when the listing runs",
+    "requests": "retried with the requests",
+    "sweep": "retried with the sweep",
+    "count": "checked again after reconciling",
+}
 
-def _print_outstanding(store: Store) -> None:
-    """List the failures earlier runs left, which this run retries once the queue is worked."""
+
+def _print_outstanding(store: Store, requests: list[tuple[str, Request]]) -> None:
+    """List the failures earlier runs left, by when this run retries them."""
     failures = sorted(store.state["failures"].values(), key=lambda e: (e["collection"], e["version"] or "", e["kind"]))
     if not failures:
         return
-    print(f"{len(failures)} failures outstanding from earlier runs; collections are retried after the queue:")
-    for e in failures[:SHOW_FAILURES]:
-        message = e["message"].replace("\n", " ")
-        print(
-            f"  {e['collection']} {e['version'] or '*'}: {e['kind']}, {e['attempts']} attempts "
-            + f"since {e['first_seen']}: {message[:200]}"
-        )
+    pending = store.state["pending"]
+    targets = {t for _, request in requests for t in request["targets"]}
+    groups: dict[str, list[str]] = {
+        "queued, retried in their place in the queue": [],
+        "retried after the queue, if there's time left": [],
+        "run-level": [],
+    }
+    width = max(len(e["collection"]) for e in failures)
+    vwidth = max(len(e["version"] or "*") for e in failures)
+    kwidth = max(len(e["kind"]) for e in failures)
+    for e in failures:
+        fqcn = e["collection"]
+        row = f"    {fqcn:{width}}  {e['version'] or '*':{vwidth}}  {e['kind']:{kwidth}}  {e['attempts']} attempts since {_when(e['first_seen'])}"
+        message = e["message"].replace("\n", " ")[:200]
+        if fqcn == GLOBAL:
+            group = "run-level"
+            row += f", {GLOBAL_RETRIES.get(e['version'] or '', 'retried every run')}"
+        elif fqcn in pending or fqcn in targets or fqcn.partition(".")[0] in targets:
+            group = "queued, retried in their place in the queue"
+        else:
+            group = "retried after the queue, if there's time left"
+        groups[group].append(f"{row}: {message}")
+    collections = {e["collection"] for e in failures} - {GLOBAL}
+    run_level = len(groups["run-level"])
+    print(
+        f"outstanding failures: {len(failures) - run_level} in {len(collections)} collections"
+        + (f", {run_level} run-level" if run_level else "")
+    )
+    shown = 0
+    for title, rows in groups.items():
+        if rows and shown < SHOW_FAILURES:
+            print(f"  {title}")
+            for row in rows[: SHOW_FAILURES - shown]:
+                print(row)
+            shown += min(len(rows), SHOW_FAILURES - shown)
     if len(failures) > SHOW_FAILURES:
         print(f"  and {len(failures) - SHOW_FAILURES} more; see failures.json in the state bucket")
 
 
-def _queue_requests(client: GalaxyClient, store: Store) -> int:
+def _asks(request: Request) -> list[str]:
+    """What a `refresh` request asks for, one line each."""
+    if acknowledge := request.get("acknowledge"):
+        return [f"acknowledge {target}: {request.get('note', '')}" for target in acknowledge]
+    if not request["targets"]:
+        return ["sweep"]
+    flags = " (revalidating)" if request["revalidate"] else ""
+    return [f"reconcile {'' if '.' in t else 'namespace '}{t}{flags}" for t in request["targets"]]
+
+
+def _sweep_status(store: Store, requested: bool = False) -> str:
+    last = store.state.get("last_sweep")
+    if requested:
+        return "sweep: due now (requested)"
+    if last is None:
+        return "sweep: due now"
+    due = datetime.datetime.fromisoformat(last) + SWEEP_EVERY
+    if (wait := due - datetime.datetime.fromisoformat(now())) <= datetime.timedelta():
+        return f"sweep: due now (last ran {_when(last)})"
+    return f"sweep: next due {_when(due)} (in {_wait(wait)})"
+
+
+def _print_plan(store: Store, requests: list[tuple[str, Request]], sweep_due: bool, budget: float) -> None:
+    """What this run works, in order."""
+    lines: list[str] = []
+    if requests:
+        lines.append(f"  requests: {len(requests)} waiting")
+        for key, request in requests:
+            lines.append(f"    {key}, from {_when(request['requested'])}")
+            lines.extend(f"      {ask}" for ask in _asks(request))
+    if sweep_due:
+        lines.append("  sweep: queues everything that differs from Galaxy")
+    pending = store.state["pending"]
+    if pending:
+        sources = collections.Counter(entry["source"] for entry in pending.values())
+        lines.append(
+            f"  queue: {len(pending)} collections ("
+            + ", ".join(f"{sources[source]} {source}" for source in SOURCES)
+            + ")"
+        )
+        lines.append(f"    {few([f'{ns}.{name}' for ns, name in store.queued()], 5)}")
+    if retry := [c for c in store.failed_collections() if f"{c[0]}.{c[1]}" not in pending]:
+        lines.append(f"  retry: {len(retry)} collections with outstanding failures, if there's time left")
+    if not lines:
+        print("plan: nothing to do")
+        return
+    print(f"plan (budget {budget:g}m):")
+    for line in lines:
+        print(line)
+
+
+def _print_discovery(res: Discovery, previous: str | None, initial: bool) -> None:
+    """Whether Galaxy changed since the last run, and what finding changes turned up."""
+    if res.unchanged and res.published:
+        print(f"galaxy: unchanged since {_when(res.published)}")
+        return
+    if initial:
+        print("galaxy: no feed cursor yet, so this is the initial import")
+    elif previous and res.published:
+        print(f"galaxy: changed since the last run ({_when(previous)} → {_when(res.published)})")
+    else:
+        print("galaxy: checking for changes since the last run")
+    if not res.feed:
+        print("  upload feed: couldn't be read")
+    elif not initial:
+        new = f"{len(res.new_uploads)} collections with new uploads" if res.new_uploads else "no new uploads"
+        again = len(res.uploads) - len(res.new_uploads)
+        overlap = f", {again} collections seen again in the {_wait(FEED_OVERLAP)} overlap" if again else ""
+        print(f"  upload feed: {new}{overlap}")
+    if res.listed:
+        why = "" if initial else " (the repo changed without an upload)" if res.hinted else " (in place of the feed)"
+        print(f"  listing{why}: {len(res.listing)} collections new or changed")
+    elif initial or res.hinted or not res.feed:
+        print("  listing: couldn't be read")
+
+
+def _queue_requests(client: GalaxyClient, store: Store, requests: list[tuple[str, Request]]) -> int:
     """Queue every waiting `refresh` request and delete it; returns how many were taken."""
     taken = 0
     failed = False
-    for key, request in store.requests():
-        asked = ", ".join(request["targets"]) or "a sweep"
-        flags = ", revalidating" if request["revalidate"] else ""
-        what = f"request {key} from {request['requested']}: {asked}{flags}"
+    for key, request in requests:
+        what = f"request {key}"
         if acknowledge := request.get("acknowledge"):
-            _acknowledge(store, key, request["requested"], acknowledge, request.get("note", ""))
+            _acknowledge(store, key, acknowledge, request.get("note", ""))
         elif not request["targets"]:
             _ = store.state.pop("last_sweep", None)  # sweep this run
-            print(f"{what}; sweeping this run")
+            print(f"{what}: sweeping this run")
         else:
             try:
                 targets = resolve_targets(client, request["targets"])
             except GalaxyError as e:
                 store.record_failure(GLOBAL, "requests", e.kind, f"expanding {', '.join(request['targets'])}: {e}")
-                print(f"{what}; kept for the next run, as Galaxy couldn't expand it: {e}", file=sys.stderr)
+                print(f"{what}: kept for the next run, as Galaxy couldn't expand it: {e}", file=sys.stderr)
                 failed = True
                 continue
             except ValueError as e:  # `refresh` checks names, so only a hand-written request
-                print(f"{what}; dropped: {e}", file=sys.stderr)
+                print(f"{what}: dropped: {e}", file=sys.stderr)
                 targets = []
             else:
-                print(f"{what}; queued {len(targets)} collections ahead of everything else")
+                print(f"{what}: queued {len(targets)} collections ahead of everything else")
             for ns, name in targets:
                 store.enqueue(f"{ns}.{name}", "requested", revalidate=request["revalidate"])
         store.save_state()  # before deleting, so a crash can only take a request twice
@@ -170,19 +384,19 @@ def _queue_requests(client: GalaxyClient, store: Store) -> int:
     return taken
 
 
-def _acknowledge(store: Store, key: str, requested: str, targets: list[str], note: str) -> None:
+def _acknowledge(store: Store, key: str, targets: list[str], note: str) -> None:
     """Acknowledge the conflicts a request names, so they're no longer reported."""
     for target in targets:
-        what = f"request {key} from {requested}: acknowledge {target}"
+        what = f"request {key}: acknowledge {target}"
         try:
             fqcn, vers = split_version_target(target)
         except ValueError as e:  # `refresh` checks names, so only a hand-written request
-            print(f"{what}; dropped: {e}", file=sys.stderr)
+            print(f"{what} dropped: {e}", file=sys.stderr)
             continue
         if store.acknowledge_conflict(fqcn, vers, note) is None:
-            print(f"{what}; dropped: it has no open conflict", file=sys.stderr)
+            print(f"{what} dropped: it has no open conflict", file=sys.stderr)
         else:
-            print(f"{what}; acknowledged: {note}")
+            print(f"{what}: acknowledged")
 
 
 def _sweep_due(store: Store) -> bool:
@@ -210,14 +424,14 @@ def _sweep(client: GalaxyClient, store: Store) -> bool:
         print("listing collections failed; deprecation changes wait for the next sweep", file=sys.stderr)
     for fqcn, versions in sorted(res.gone.items()):
         print(f"  gone: {fqcn} {', '.join(versions)}")
-    for ns, name in res.collections:
-        store.enqueue(f"{ns}.{name}", "swept")
+    for c in res.collections:
+        store.enqueue(".".join(c), "swept", reasons=res.reasons(c))
     store.save_state()
     return True
 
 
 def _reconcile_one(
-    client: GalaxyClient, store: Store, ns: str, name: str, label: str, revalidate: bool, deadline: float
+    client: GalaxyClient, store: Store, ns: str, name: str, label: str, entry: Pending | None, deadline: float
 ) -> Result | str:
     """Reconcile one collection, recording rather than raising anything that goes wrong.
 
@@ -225,7 +439,7 @@ def _reconcile_one(
     """
     fqcn = f"{ns}.{name}"
     try:
-        res = reconcile(client, store, ns, name, revalidate=revalidate, deadline=deadline)
+        res = reconcile(client, store, ns, name, revalidate=bool(entry and entry.get("revalidate")), deadline=deadline)
     except GalaxyError as e:  # e.g. listing its versions failed
         store.record_failure(fqcn, None, e.kind, str(e))
         print(f"{label}: FAILED ({e})", file=sys.stderr)
@@ -235,6 +449,13 @@ def _reconcile_one(
         print(f"{label}: FAILED unexpectedly ({type(e).__name__}: {e})", file=sys.stderr)
         return "unexpected"
     print(f"{label}: {_describe(res)}")  # failures were logged as they were recorded
+    if not (res.added or _changes(res)):
+        for line in _explain(entry, res):
+            print(f"{' ' * (len(label) - len(fqcn) + 2)}{line}")
+    for vers, (ours, theirs) in res.repacked.items():
+        print(
+            f"WARNING {fqcn} {vers}: Galaxy now serves sha256 {theirs} instead of ours ({ours}); same contents, so ours is kept"
+        )
     return res
 
 
@@ -269,8 +490,7 @@ def _work(
         fqcn = f"{ns}.{name}"
         entry = pending.get(fqcn)
         label = f"[{i + 1:{width}}/{len(targets)}] {fqcn}"
-        revalidate = bool(entry and entry.get("revalidate"))
-        res = done[fqcn] = _reconcile_one(client, store, ns, name, label, revalidate, deadline)
+        res = done[fqcn] = _reconcile_one(client, store, ns, name, label, entry, deadline)
         if isinstance(res, Result) and res.deferred:
             store.enqueue(fqcn, entry["source"] if entry else "listed")
         else:
@@ -307,6 +527,8 @@ def _finish(
         f"failures: {summary.outstanding} outstanding, {summary.new} new, {summary.resolved} resolved; "
         + f"{summary.conflicts} conflicts to inspect (see failures.json in the state bucket)"
     )
+    _print_warnings(worked)
+    print(_sweep_status(store))
     print(f"{client.requests} Galaxy requests")
     if headline := summary.alerts.headline():
         print(headline)
@@ -333,19 +555,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
     deadline = started + args.budget * 60
     client = GalaxyClient(args.galaxy_url)
     store = _open_store(args)
-    _print_outstanding(store)
     initial = "feed_cursor" not in store.state
+    previous = store.state.get("repo_published")
     res = discover(client, store)
     if not res.ok:
         store.save_state()
         print("sync failed: neither the upload feed nor the collection listing could be read", file=sys.stderr)
         return _exit_code(store, args)
-    if res.unchanged:
-        print(f"the published repo hasn't changed since {res.published}")
-    else:
-        sources = " and ".join(name for name, used in (("upload feed", res.feed), ("listing", res.listed)) if used)
-        hint = "; the repo changed without an upload, so the listing ran" if res.hinted else ""
-        print(f"{len(res.collections)} collections new or changed (from the {sources}{hint})")
+    _print_discovery(res, previous, initial)
 
     if args.dry_run:
         for ns, name in res.collections:
@@ -355,8 +572,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return _exit_code(store, args)
 
     # Queued before the cursor moves, so nothing found is lost if the run stops.
-    for ns, name in res.collections:
-        store.enqueue(f"{ns}.{name}", "uploaded" if (ns, name) in res.uploads else "listed")
+    for c in res.collections:
+        reasons = [reason] if (reason := res.listing.get(c)) else []
+        source = "uploaded" if c in res.uploads else "listed"
+        store.enqueue(".".join(c), source, reasons=reasons, uploads=res.uploads.get(c, []))
     if res.cursor:
         store.state["feed_cursor"] = res.cursor
     if res.published:
@@ -365,7 +584,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
         store.state["last_sweep"] = now()  # the initial import's listing already covers everything
     store.save_state()
 
-    requests = _queue_requests(client, store)
+    requests = store.requests()
+    asked = any(not r["targets"] and not r.get("acknowledge") for _, r in requests)
+    print(_sweep_status(store, asked))
+    _print_plan(store, requests, asked or _sweep_due(store), args.budget)
+    _print_outstanding(store, requests)
+    taken = _queue_requests(client, store, requests)
     # Requested collections go before the sweep, which can take most of the budget.
     worked: dict[str, Result | str] = {}
     _work(client, store, deadline, worked, requested=True)
@@ -373,7 +597,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     # budget has run out; the next run starts with it instead.
     swept = time.monotonic() < deadline and _sweep_due(store) and _sweep(client, store)
     _work(client, store, deadline, worked)
-    if res.unchanged and not (requests or swept or worked):
+    if res.unchanged and not (taken or swept or worked):
         return _exit_code(store, args)  # nothing changed: skip rewriting the aggregate files
     if not res.unchanged or swept:
         _report_count(client, store)

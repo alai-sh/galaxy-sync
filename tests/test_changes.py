@@ -281,7 +281,7 @@ def test_sweep_finds_replaced_versions(galaxy, client, store):
     galaxy.replace("ns", "a", "1.0.0", artifact("ns", "a", "1.0.0", mtime=1_800_000_000))
     res = sweep(client, store)
     assert (res.replaced, res.collections) == ({"ns.a": ["1.0.0"]}, [("ns", "a")])
-    assert reconcile(client, store, "ns", "a").repacked == ["1.0.0"]
+    assert list(reconcile(client, store, "ns", "a").repacked) == ["1.0.0"]
     assert sweep(client, store).replaced == {}
 
     # Restoring the original brings back its old upload time: still a change.

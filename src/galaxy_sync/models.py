@@ -212,6 +212,8 @@ class Pending(TypedDict):
     source: str  # why it's queued, one of store.SOURCES
     queued: str
     revalidate: NotRequired[bool]
+    reasons: NotRequired[list[str]]  # what change detection saw, e.g. "updated_at changed"
+    uploads: NotRequired[list[str]]  # versions the upload feed saw
 
 
 class SyncState(TypedDict):

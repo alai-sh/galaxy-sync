@@ -286,8 +286,20 @@ class Store:
     # Collections waiting for a reconcile. A run that stops early leaves the
     # rest queued for the next one.
 
-    def enqueue(self, fqcn: str, source: str, *, revalidate: bool = False) -> None:
-        """Queue a collection, keeping its earlier place if that's sooner."""
+    def enqueue(
+        self,
+        fqcn: str,
+        source: str,
+        *,
+        revalidate: bool = False,
+        reasons: Sequence[str] = (),
+        uploads: Sequence[str] = (),
+    ) -> None:
+        """Queue a collection, keeping its earlier place if that's sooner.
+
+        `reasons` and `uploads` say what change detection saw, so the run
+        that reconciles it can explain a reconcile that changed nothing.
+        """
         entry = self.state["pending"].get(fqcn)
         if entry is None:
             entry = self.state["pending"][fqcn] = {"source": source, "queued": now()}
@@ -295,6 +307,10 @@ class Store:
             entry["source"] = source
         if revalidate:
             entry["revalidate"] = True
+        if reasons:
+            entry["reasons"] = list(dict.fromkeys([*entry.get("reasons", []), *reasons]))
+        if uploads:
+            entry["uploads"] = list(dict.fromkeys([*entry.get("uploads", []), *uploads]))
 
     def queued(self) -> list[tuple[str, str]]:
         """Pending collections in the order to work them."""

@@ -224,7 +224,7 @@ def test_repacked_artifact_keeps_ours_silently(galaxy, client, store):
     # The same files rebuilt: new bytes and a new upload time.
     galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", mtime=1_800_000_000))
     res = reconcile(client, store, "ns", "coll")
-    assert (res.repacked, res.conflicts) == (["1.0.0"], [])
+    assert (list(res.repacked), res.conflicts) == (["1.0.0"], [])
     (line,) = store.read_index("ns", "coll")
     assert line == original  # same bytes, no flag
     assert store.state["conflicts"] == []
@@ -233,7 +233,7 @@ def test_repacked_artifact_keeps_ours_silently(galaxy, client, store):
     # Compared once: --revalidate reuses the verdict without downloading again.
     galaxy.requests.clear()
     res = reconcile(client, store, "ns", "coll", revalidate=True)
-    assert res.repacked == ["1.0.0"]
+    assert list(res.repacked) == ["1.0.0"]
     assert not any("/pulp/content/" in r for r in galaxy.requests)
 
 

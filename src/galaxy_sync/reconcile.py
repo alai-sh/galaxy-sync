@@ -39,11 +39,15 @@ class Result:
     yanked: list[str] = field(default_factory=list)
     unyanked: list[str] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)  # Galaxy serves different contents
-    repacked: list[str] = field(default_factory=list)  # different bytes, same contents
+    # Different bytes, same contents: version -> (our, Galaxy's) sha256.
+    repacked: dict[str, tuple[str, str]] = field(default_factory=dict)
     resolved: list[str] = field(default_factory=list)  # Galaxy serves our contents again
     reextracted: list[str] = field(default_factory=list)
     deferred: list[str] = field(default_factory=list)  # left unmirrored because the deadline passed
     errors: list[str] = field(default_factory=list)
+    deprecated: bool | None = None  # the collection's new deprecation flag, if Galaxy changed it
+    rechecked: int = 0  # mirrored versions whose artifact was compared with Galaxy's
+    listed: set[str] = field(default_factory=set)  # the versions Galaxy lists
     changed: bool = False
     downloaded: int = 0  # bytes of new artifacts
     mirrored: int = 0  # versions in the index afterwards
@@ -173,6 +177,8 @@ class _Reconcile:
             else:
                 _ = line.pop("deprecated", None)
 
+        if deprecated != self.cstate.get("upstream_deprecated", False):
+            self.res.deprecated = deprecated
         if self.res.deferred:
             log.info("%s: out of time, %d versions left for the next run", self.fqcn, len(self.res.deferred))
         else:
@@ -182,6 +188,7 @@ class _Reconcile:
         self.cstate["upstream_deprecated"] = deprecated
         self.res.mirrored = len(self.lines)
         self.res.upstream = len(upstream_vers)
+        self.res.listed = upstream_vers
         if self.lines or not self.res.deferred:  # no empty index file for an import that hasn't started
             # After saving progress, the whole view is rewritten: yanks,
             # deprecation and rechecks can have changed lines already written.
@@ -333,6 +340,7 @@ class _Reconcile:
     def _recheck(self, line: IndexLine, v: GalaxyVersion) -> None:
         """Compare what Galaxy serves now with our line. Ours is never overwritten."""
         vers = line["vers"]
+        self.res.rechecked += 1
         detail = self._detail(vers)
         sha = detail["artifact"]["sha256"]
         seen = self.cstate["versions"].get(vers)
@@ -368,7 +376,7 @@ class _Reconcile:
             if self.store.resolve_conflicts(self.fqcn, vers) or flagged:
                 self.res.resolved.append(vers)
             elif sha != line["cksum"]:
-                self.res.repacked.append(vers)
+                self.res.repacked[vers] = (line["cksum"], sha)
         else:
             line["upstream_conflict"] = True
             self.res.conflicts.append(vers)

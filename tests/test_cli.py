@@ -157,14 +157,14 @@ def test_failures_are_recorded_and_retried(galaxy, run, tmp_path, capsys, refres
     monkeypatch.setattr(cli, "SHOW_FAILURES", 1)
     assert run("sync", "--strict") == 0
     out = capsys.readouterr().out
-    assert out.startswith(
-        "2 failures outstanding from earlier runs; collections are retried after the queue:\n  ns.broken *: galaxy_http_403, 1 attempts since "
-    )
+    assert "\noutstanding failures: 2 in 2 collections\n  queued, retried in their place in the queue\n" in out
+    assert re.search(r"^    ns\.broken  \*  +galaxy_http_403 +1 attempts since \S+ \S+: ", out, re.MULTILINE)
     assert "\n  and 1 more; see failures.json in the state bucket\n" in out
+    assert out.index("outstanding failures") < out.index("[1/2] ns.coll: +1")
     assert "failures: 0 outstanding, 0 new, 2 resolved" in out
     # Nothing outstanding: nothing listed.
     assert run("sync") == 0
-    assert "failures outstanding" not in capsys.readouterr().out
+    assert "outstanding failures" not in capsys.readouterr().out
 
 
 def test_unexpected_errors_are_recorded(galaxy, run, capsys, monkeypatch, refresh):
@@ -210,7 +210,8 @@ def test_sync_retries_failures_and_reads_nothing_on_failure(galaxy, run, tmp_pat
     capsys.readouterr()
     assert run("sync") == 0
     out = capsys.readouterr().out
-    assert "hasn't changed" in out
+    assert "galaxy: unchanged since " in out
+    assert "  retry: 1 collections with outstanding failures, if there's time left\n" in out
     assert "retrying 1 collections with outstanding failures" in out
     assert "failures: 0 outstanding" in out
 
@@ -321,7 +322,10 @@ def test_verbose_logging(run):
 def test_sync(galaxy, run, tmp_path, capsys, refresh):
     galaxy.add_collection("ns", "coll", ["1.0.0", "2.0.0"])
     assert run("sync", "--dry-run") == 0
-    assert "1 collections new or changed (from the upload feed and listing)\n  ns.coll\n" in capsys.readouterr().out
+    assert (
+        "galaxy: no feed cursor yet, so this is the initial import\n  listing: 1 collections new or changed\n  ns.coll\n"
+        in capsys.readouterr().out
+    )
     assert not (tmp_path / "index-root").exists()
 
     assert run("sync") == 0
@@ -338,7 +342,7 @@ def test_sync(galaxy, run, tmp_path, capsys, refresh):
     # Nothing changed: one request, and no count check.
     galaxy.requests.clear()
     assert run("sync") == 0
-    assert "the published repo hasn't changed since 2026-04-01T00:00:01.000000Z" in capsys.readouterr().out
+    assert "galaxy: unchanged since 2026-04-01 00:00:01Z\n" in capsys.readouterr().out
     assert galaxy.requests == [REPO_METADATA]
 
     # A backport comes from the feed alone.
@@ -346,7 +350,8 @@ def test_sync(galaxy, run, tmp_path, capsys, refresh):
     galaxy.requests.clear()
     assert run("sync") == 0
     out = capsys.readouterr().out
-    assert "(from the upload feed)" in out
+    assert "  upload feed: 1 collections with new uploads\n" in out
+    assert "listing" not in out
     assert "ns.coll: +1" in out
     assert not any("collections/index/" in r for r in galaxy.requests)
 
@@ -415,7 +420,7 @@ def test_refresh(galaxy, run, tmp_path, capsys, refresh):
 
     # The sweep runs once a day.
     assert run("sync") == 0
-    assert "sweep:" not in capsys.readouterr().out
+    assert "sweep: Galaxy publishes" not in capsys.readouterr().out
     current = state(tmp_path)
     current["last_sweep"] = "2026-01-01T00:00:00Z"
     (tmp_path / "state" / "state.json").write_text(json.dumps(current))
@@ -427,7 +432,7 @@ def test_refresh(galaxy, run, tmp_path, capsys, refresh):
     out = capsys.readouterr().out
     assert "[1/2] ns.a" in out
     assert "[2/2] ns.b" in out
-    assert "sweep:" not in out
+    assert "sweep: Galaxy publishes" not in out
 
     # A failed listing still applies the sweep.
     galaxy.add_collection("ns", "a", ["1.0.0"])
@@ -458,7 +463,7 @@ def test_refresh_requests(galaxy, run, tmp_path, capsys):
     assert run("refresh", "--revalidate", "ns") == 0
     capsys.readouterr()
     assert run("sync") == 0
-    assert ": ns, revalidating; kept for the next run" in capsys.readouterr().err
+    assert re.search(r"^request requests/\S+\.json: kept for the next run", capsys.readouterr().err, re.MULTILINE)
     assert "galaxy_unavailable" in json.dumps(state(tmp_path)["failures"])
     assert len(list((tmp_path / "state" / "requests").iterdir())) == 1
 
@@ -467,8 +472,9 @@ def test_refresh_requests(galaxy, run, tmp_path, capsys):
     assert run("sync") == 0
     out = capsys.readouterr().out
     assert re.search(
-        r"^request requests/\S+\.json from \S+: ns, revalidating; queued 1 collections ahead", out, re.MULTILINE
+        r"^    requests/\S+\.json, from .+\n      reconcile namespace ns \(revalidating\)$", out, re.MULTILINE
     )
+    assert re.search(r"^request requests/\S+\.json: queued 1 collections ahead", out, re.MULTILINE)
     assert "ns.coll: +0 CONFLICT 1.0.0" in out
     assert not list((tmp_path / "state" / "requests").iterdir())
     assert not state(tmp_path)["failures"]
@@ -477,7 +483,7 @@ def test_refresh_requests(galaxy, run, tmp_path, capsys):
     store = Store(Buckets.local(tmp_path))
     _ = store.add_request(["Bad"], False)
     assert run("sync") == 0
-    assert "; dropped: invalid" in capsys.readouterr().err
+    assert ".json: dropped: invalid" in capsys.readouterr().err
     assert not list((tmp_path / "state" / "requests").iterdir())
 
 
@@ -506,12 +512,12 @@ def test_budget(galaxy, run, tmp_path, capsys):
     store.save_state()
     # A sweep that's due isn't started once the budget has run out.
     assert run("sync", "--budget", "0") == 0
-    assert "sweep:" not in capsys.readouterr().out
+    assert "sweep: Galaxy publishes" not in capsys.readouterr().out
     assert "last_sweep" not in state(tmp_path)
     assert run("sync") == 0
     out = capsys.readouterr().out
-    assert "the published repo hasn't changed" in out
-    assert out.index("[1/1] ns.b: +1") < out.index("sweep:") < out.index("[1/1] ns.a: +1")
+    assert "galaxy: unchanged since" in out
+    assert out.index("[1/1] ns.b: +1") < out.index("sweep: Galaxy publishes") < out.index("[1/1] ns.a: +1")
     assert not state(tmp_path)["pending"]
 
 
@@ -601,14 +607,16 @@ def test_acknowledge(galaxy, run, tmp_path, capsys):
     capsys.readouterr()
     assert run("refresh", "--ack", "ns.coll:2.0.0", "--note", "typo") == 0
     assert run("sync") == 0
-    assert "acknowledge ns.coll:2.0.0; dropped: it has no open conflict" in capsys.readouterr().err
+    assert "acknowledge ns.coll:2.0.0 dropped: it has no open conflict" in capsys.readouterr().err
 
     # Acknowledged: off the report, and listed for the workflow to resolve its comment.
     assert run("refresh", "--ack", "ns.coll:1.0.0", "--note", "the author republished 1.0.0") == 0
     out = capsys.readouterr().out
     assert "queued acknowledging ns.coll:1.0.0 for the next sync" in out
     assert run("sync", "--strict", "--report", str(report), "--acknowledged", str(acknowledged)) == 0
-    assert "acknowledge ns.coll:1.0.0; acknowledged: the author republished 1.0.0" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "      acknowledge ns.coll:1.0.0: the author republished 1.0.0\n" in out
+    assert "acknowledge ns.coll:1.0.0: acknowledged\n" in out
     assert "No outstanding failures or conflicts to inspect." in report.read_text()
     marker = f"<!-- galaxy-sync:conflict ns.coll 1.0.0 {conflict['opened']} -->"
     assert json.loads(acknowledged.read_text()) == {"marker": marker, "note": "the author republished 1.0.0"}
@@ -729,3 +737,80 @@ def test_unexpected_failure_messages_lose_urls(galaxy, run, tmp_path, monkeypatc
     assert "cloudflarestorage" not in text
     failures = json.loads((tmp_path / "state" / "failures.json").read_text())
     assert "https://abc123.r2.cloudflarestorage.com/state" in failures["outstanding"][0]["message"]
+
+
+def test_run_output_explains_itself(galaxy, run, capsys):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    galaxy.add_collection("ns", "other", ["1.0.0"])
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert "plan (budget 45m):\n  queue: 2 collections (0 requested, 0 uploaded, 2 listed, 0 swept)\n" in out
+    assert "\n    ns.coll, ns.other\n" in out
+    assert re.search(r"^sweep: next due \S+ \S+Z \(in 24h\)$", out, re.MULTILINE)
+
+    # A reconcile that changes nothing says why the collection was queued:
+    # here the feed's overlap read the newest upload again.
+    galaxy.touch()
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert re.search(r"^galaxy: changed since the last run \(\S+ \S+Z → \S+ \S+Z\)$", out, re.MULTILINE)
+    assert "  upload feed: no new uploads, 1 collections seen again in the 1h overlap\n" in out
+    assert (
+        "[1/1] ns.other: +0, up to date (1/1 mirrored)\n"
+        + "        the upload feed saw 1.0.0: already mirrored, so seen again in the feed's 1h overlap\n"
+    ) in out
+
+    # New bytes with the same contents: a warning, and again at the end.
+    galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", mtime=1_800_000_000))
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert "  upload feed: 1 collections with new uploads, 1 collections seen again in the 1h overlap\n" in out
+    assert "ns.coll: +0 repacked 1.0.0\nWARNING ns.coll 1.0.0: Galaxy now serves sha256 " in out
+    assert "warnings: 1 repacks (Galaxy serves different bytes with the same contents; ours kept)\n" in out
+    assert re.search(r"^  ns\.coll 1\.0\.0: ours [0-9a-f]{64}, Galaxy's [0-9a-f]{64}$", out, re.MULTILINE)
+
+    # The plan lists each request; a deprecation is a change of its own.
+    galaxy.add_collection("ns", "other", ["1.0.0"], deprecated=True)
+    assert run("refresh") == 0
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert "sweep: due now (requested)\nplan (budget 45m):\n  requests: 1 waiting\n" in out
+    assert re.search(r"^      sweep\n  sweep: queues everything that differs from Galaxy$", out, re.MULTILINE)
+    assert "ns.other: +0 deprecated\n" in out
+    assert "warnings:" not in out
+
+    # Nothing to do.
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert re.match(r"galaxy: unchanged since \S+ \S+Z\nsweep: next due .+\nplan: nothing to do\n$", out)
+
+
+def test_explain_unchanged_reconciles():
+    from galaxy_sync.reconcile import Result
+
+    res = Result(listed={"1.0.0"}, upstream=1)
+
+    def explain(**entry):
+        return cli._explain({"source": "listed", "queued": "", **entry}, res)
+
+    assert cli._explain(None, res) == ["queued for its outstanding failures"]
+    assert explain() == ["found by the listing"]
+    assert explain(source="requested") == ["requested"]
+    assert explain(source="uploaded")[0].startswith("the upload feed saw an upload: probably")
+    assert explain(uploads=["2.0.0"]) == [
+        "the upload feed saw 2.0.0: not in Galaxy's version list, so awaiting approval or deleted since"
+    ]
+    reasons = ["new", "updated_at changed", "deprecation changed", "gone from the listing", "gone: 1.1.0"]
+    reasons += ["not mirrored: 2.0.0", "re-uploaded: 1.0.0", "something else"]
+    assert [line.split(":")[0] for line in explain(reasons=reasons)] == [
+        "new in the listing",
+        "the listing's updated_at changed but no version did",
+        "the listing's deprecation flag changed but the collection's page didn't",
+        "missing from the listing, but Galaxy still serves it",
+        "the sweep didn't see 1.1.0 on Galaxy, but Galaxy still serves it",
+        "the sweep saw 2.0.0 unmirrored, but Galaxy's version list doesn't have it",
+        "the sweep saw 1.0.0 re-uploaded, but Galaxy's sha256 still matches ours",
+        "something else",
+    ]
+    res.upstream = 0
+    assert explain(reasons=["new"]) == ["new in the listing; Galaxy lists no versions for it yet"]
