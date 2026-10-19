@@ -65,7 +65,7 @@ without that check, since it can't exist yet.
 | `pending.<ns.name>` | The queue: `source` (`requested`, `uploaded`, `listed` or `swept`), `queued`, and `revalidate` if asked for |
 | `collections.<ns.name>` | Per collection: `updated` (when its index file last changed), `upstream_updated`, `upstream_deprecated` and `upstream_count` (Galaxy's values at the last reconcile), and `versions.<v>` with `created_at` and the cached `upstream` comparison verdict |
 | `failures` | The failure ledger, keyed `<ns.name>@<version>#<kind>`: `collection`, `version`, `kind`, `message`, `first_seen`, `last_seen`, `attempts`, and `alerted` once it was notified as persistent |
-| `conflicts` | Versions where Galaxy serves different contents from the mirror: `collection`, `version`, `ours`, `upstream`, `seen`, `changes`, `saved`, and `resolved` once Galaxy serves our contents again |
+| `conflicts` | Versions where Galaxy serves different contents from the mirror: `collection`, `version`, `ours`, `upstream` (the latest Galaxy served), `seen` (when first opened), `changes`, `saved`, and `resolved` once Galaxy serves our contents again. At most one is open per version |
 
 The failure kinds are listed in [sync.md](sync.md#failures-and-conflicts).
 

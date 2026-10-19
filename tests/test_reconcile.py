@@ -269,6 +269,16 @@ def test_changed_contents_are_a_conflict(galaxy, client, store):
     assert len(store.state["conflicts"]) == 1
     assert not any("/pulp/content/" in r for r in galaxy.requests)
 
+    # Different bytes again before it's resolved: the open conflict takes them.
+    again = artifact("ns", "coll", "1.0.0", modules=("third",))
+    galaxy.replace("ns", "coll", "1.0.0", again)
+    assert reconcile(client, store, "ns", "coll").conflicts == ["1.0.0"]
+    (updated,) = store.state["conflicts"]
+    assert updated["upstream"] == hashlib.sha256(again).hexdigest()
+    assert updated["changes"] == "added plugins/modules/third.py; removed plugins/modules/thing.py"
+    assert store.state_bucket.read(updated["saved"]) == again
+    assert updated["seen"] == conflict["seen"]
+
     # Galaxy serves our artifact again (re-uploading it brings back its old upload time).
     galaxy.replace("ns", "coll", "1.0.0", first_blob, uploaded=first_upload)
     res = reconcile(client, store, "ns", "coll")

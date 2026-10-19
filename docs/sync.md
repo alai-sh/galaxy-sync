@@ -180,7 +180,10 @@ count.
 
 Each version's verdict is cached with Galaxy's sha256, so the same
 artifact is downloaded once. A conflict stays open until Galaxy serves
-our contents again, which resolves it and clears the flag.
+our contents again, which resolves it and clears the flag. A version has one
+open conflict at a time: if Galaxy serves different bytes again before then,
+the open conflict is updated with the latest artifact and changes, and isn't
+alerted again.
 
 ## Failures and conflicts
 
@@ -222,7 +225,7 @@ a tracking issue instead, in two parts:
   is outstanding does. Editing the description doesn't notify anyone, which
   suits routine churn, and resolved failures just disappear from it.
 - `sync --alerts FILE` writes what a person should hear about: a conflict
-  opened, or a failure outstanding for over a day (each failure once), as a
+  opened (once per version until it's resolved), or a failure outstanding for over a day (each failure once), as a
   Markdown comment listing just those entries, or leaves the file empty. The
   workflow posts it as a comment, which emails the issue's subscribers.
   Transient failures that clear within a day never notify.

@@ -287,13 +287,20 @@ class Store:
         return [c for c in self.state["conflicts"] if "resolved" not in c]
 
     def open_conflict(self, conflict: Conflict) -> bool:
-        """Record a conflict unless the same one is already open; True if it's new."""
-        same = (conflict["collection"], conflict["version"], conflict["upstream"])
-        if any((c["collection"], c["version"], c["upstream"]) == same for c in self.open_conflicts()):
-            return False
-        self.state["conflicts"].append(conflict)
-        self._new_conflicts.append(conflict)
-        return True
+        """Record a conflict unless the version already has one open; True if it's new.
+
+        A version keeps one open conflict. When Galaxy serves different bytes
+        again before it's resolved, the open one takes the latest artifact and
+        changes but keeps when it was first seen, and isn't alerted again.
+        """
+        version = (conflict["collection"], conflict["version"])
+        current = next((c for c in self.open_conflicts() if (c["collection"], c["version"]) == version), None)
+        if current is None:
+            self.state["conflicts"].append(conflict)
+            self._new_conflicts.append(conflict)
+            return True
+        current.update(upstream=conflict["upstream"], changes=conflict["changes"], saved=conflict["saved"])
+        return False
 
     def resolve_conflicts(self, fqcn: str, vers: str) -> bool:
         """Mark a version's open conflicts resolved; True if there were any."""

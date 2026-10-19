@@ -523,6 +523,13 @@ def test_alerts(galaxy, run, tmp_path, capsys):
     assert run("sync", "--alerts", str(alerts)) == 0
     assert alerts.read_text() == ""
 
+    # Galaxy serving different bytes again for the version doesn't alert again.
+    galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "[]"})})
+    assert run("refresh", "--revalidate", "ns.coll") == 0
+    assert run("sync", "--alerts", str(alerts)) == 0
+    assert alerts.read_text() == ""
+    assert len(state(tmp_path)["conflicts"]) == 1
+
     # So does a failure once it has been outstanding for a day.
     galaxy.add_collection("ns", "other", ["1.0.0"])
     galaxy.routes[DETAIL.replace("ns/coll", "ns/other").format("1.0.0")] = UNAVAILABLE
