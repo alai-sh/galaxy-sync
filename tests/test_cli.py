@@ -423,6 +423,21 @@ def test_rebuild(galaxy, run, tmp_path, capsys, refresh):
     assert run("sync") == 0
     assert urls() == ("https://moved.example/{sha256-checksum}", {"moved.example"})
 
+    # --no-galaxy-view keeps the template and doesn't touch the view, but
+    # still rebuilds the plugin index.
+    (pages / "1.1.0" / "index.html").unlink()
+    (tmp_path / "index-root" / "plugins.jsonl").unlink()
+    capsys.readouterr()
+    assert run("rebuild", "--no-galaxy-view") == 0
+    out = capsys.readouterr().out
+    assert "[1/1] ns.coll: 2 versions, 1 plugin lines\n" in out
+    assert urls() == ("https://moved.example/{sha256-checksum}", {"moved.example"})
+    assert not (pages / "1.1.0" / "index.html").exists()
+    assert (tmp_path / "index-root" / "plugins.jsonl").exists()
+    with pytest.raises(SystemExit):
+        run("rebuild", "--no-galaxy-view", "--dl", "https://elsewhere.example/{sha256-checksum}")
+    assert "--dl needs the Galaxy view" in capsys.readouterr().err
+
     # A plain rebuild resets it.
     assert run("rebuild") == 0
     assert urls() == (DEFAULT_DL, {"dl.alai.sh"})

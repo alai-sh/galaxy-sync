@@ -10,6 +10,10 @@ on:
         description: An ansible-core tag or branch to re-extract ansible.builtin from; empty to keep it
         type: string
         default: ""
+      galaxy_view:
+        description: Also rewrite the Galaxy view, which is most of a rebuild's time; untick to only update the plugin index (needs dl empty)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -18,7 +22,7 @@ jobs:
   rebuild:
     name: rebuild
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360  # GitHub-hosted runners' limit; a full rebuild is about 4 hours
     environment: r2
     permissions:
       contents: read
@@ -82,9 +86,13 @@ jobs:
         if [ -d ansible-core ]; then
           args+=(--builtin ansible-core)
         fi
+        if [ "$GALAXY_VIEW" = "false" ]; then
+          args+=(--no-galaxy-view)
+        fi
         uv run --locked galaxy-sync rebuild --r2 -v "${args[@]}"
       env:
         DL: ${{ inputs.dl }}
+        GALAXY_VIEW: ${{ inputs.galaxy_view }}
         R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
         R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

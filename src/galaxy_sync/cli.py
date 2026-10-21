@@ -674,21 +674,24 @@ def _extract_builtin(store: Store, src: Path) -> None:
 
 def cmd_rebuild(args: argparse.Namespace) -> int:
     """Regenerate every file derived from the index, without contacting Galaxy."""
+    if args.dl and not args.galaxy_view:
+        raise UsageError("--dl needs the Galaxy view, which has the artifact URLs too")
     store = _open_store(args)
-    store.dl_url = args.dl or DEFAULT_DL  # rebuild is the one place the artifact URL changes
+    if args.galaxy_view:
+        store.dl_url = args.dl or DEFAULT_DL  # rebuild is the one place the artifact URL changes
     if args.builtin is not None:
         _extract_builtin(store, args.builtin)
     collections = store.index_collections()
     width = len(str(len(collections)))
     for i, (ns, name) in enumerate(collections):
-        res = store.rebuild_collection(ns, name)
-        parts = [
-            f"{res.versions} versions",
-            f"Galaxy view: {res.pages} pages written" if res.pages else "Galaxy view unchanged",
-        ]
+        res = store.rebuild_collection(ns, name, view=args.galaxy_view)
+        parts = [f"{res.versions} versions"]
+        if args.galaxy_view:
+            parts.append(f"Galaxy view: {res.pages} pages written" if res.pages else "Galaxy view unchanged")
         parts.append(f"{res.plugins} plugin lines")
         print(f"[{i + 1:{width}}/{len(collections)}] {ns}.{name}: {', '.join(parts)}")
-    store.write_galaxy_root()
+    if args.galaxy_view:
+        store.write_galaxy_root()
     store.write_config()
     plugins = store.merge_plugins()
     _ = store.write_conflict_records(store.conflicted_collections())
@@ -783,6 +786,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     _ = p.add_argument(
         "--builtin", type=Path, metavar="SRC", help="re-extract ansible.builtin from this checkout or sdist"
+    )
+    _ = p.add_argument(
+        "--no-galaxy-view",
+        dest="galaxy_view",
+        action="store_false",
+        help="leave the Galaxy view and the artifact URL template as they are; much faster",
     )
     p.set_defaults(func=cmd_rebuild)
     return parser

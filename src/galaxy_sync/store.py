@@ -597,15 +597,17 @@ class Store:
         for path in (galaxy_api.SERVER_ROOT, galaxy_api.API_ROOT):
             _ = self._write_galaxy_page(path, galaxy_api.root(path))
 
-    def rebuild_collection(self, namespace: str, name: str) -> Rebuilt:
+    def rebuild_collection(self, namespace: str, name: str, *, view: bool = True) -> Rebuilt:
         """Rewrite one collection's Galaxy view and plugin lines from its index file and extractions.
 
         `rebuild` runs this for every collection, then `merge_plugins`.
+        Without `view` the Galaxy view is left alone: it reads every version
+        page, so it's most of a rebuild's time.
         """
         data = self.index.read(self.index_key(namespace, name))
         self.collection_state(f"{namespace}.{name}")["sha256"] = _sha256(data or b"")
         lines = cast(list[IndexLine], _read_jsonl(data))
-        pages = self.write_galaxy_collection(namespace, name, lines)
+        pages = self.write_galaxy_collection(namespace, name, lines) if view else 0
         extractions = self.load_extractions(namespace, name)
         plugins = self.set_collection_plugins(
             namespace,
