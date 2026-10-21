@@ -28,7 +28,7 @@ uv run galaxy-sync COMMAND [OPTIONS] ...
 | `sync [--budget MINUTES] [--dry-run]` | Find what changed on Galaxy and queue it, reconcile `refresh` requests first, sweep once a day, then reconcile the rest of the queue until the budget (default 45 minutes) runs out. The rest stays queued for the next run, so the initial import is built up over many runs. `--dry-run` only reports what changed |
 | `refresh [NS[.NAME]...] [--revalidate]` | Ask the next `sync` to reconcile these namespaces or collections ahead of everything else, or with no targets to sweep: compare every published version with the mirror. `--revalidate` also checks every mirrored version's artifact against the one Galaxy publishes now. Writes a request and returns; it doesn't contact Galaxy |
 | `refresh --ack NS.NAME:VERSION... --note TEXT` | Ask the next `sync` to acknowledge these versions' conflicts once a person has inspected them, so they're no longer reported. The note is published with the conflict ([conflicts](docs/sync.md#conflicts)) |
-| `rebuild [--dl TEMPLATE] [--builtin SRC]` | Regenerate the files derived from the index without contacting Galaxy. `--dl` sets the artifact URL template used by `config.json` and the Galaxy view (default: `dl.alai.sh`); later runs keep it, and a plain `rebuild` resets it. `--builtin` first re-extracts `ansible.builtin`'s plugins from an ansible-core checkout or sdist |
+| `rebuild [--dl TEMPLATE] [--builtin SRC] [--no-galaxy-view]` | Regenerate the files derived from the index without contacting Galaxy. `--dl` sets the artifact URL template used by `config.json` and the Galaxy view (default: `dl.alai.sh`); later runs keep it, and a plain `rebuild` resets it. `--builtin` first re-extracts `ansible.builtin`'s plugins from an ansible-core checkout or sdist. `--no-galaxy-view` leaves the Galaxy view and the artifact URL template alone, which skips most of a rebuild's time (it can't be combined with `--dl`) |
 
 | Option | Commands | |
 |---|---|---|
@@ -56,7 +56,7 @@ The workflows are described in [scheduling](docs/sync.md#scheduling).
 | Manual | `refresh.yml` without targets | Sweeps on the next run, e.g. after `deletions_suspected`, instead of waiting for the daily one |
 | Manual, after inspecting a conflict | `refresh.yml` with `acknowledge` and `note` | Stops reporting the conflict, records the note publicly, and marks its alert comment resolved |
 | After moving the artifacts or changing the Galaxy view format | `rebuild.yml` with `dl` | Rewrites every derived file |
-| After an ansible-core release | `rebuild.yml` with an ansible-core ref | Updates `ansible.builtin` in the plugin index |
+| After an ansible-core release | `rebuild.yml` with an ansible-core ref and `galaxy_view` unticked | Updates `ansible.builtin` in the plugin index |
 
 The scheduled run keeps the outstanding failures and unacknowledged
 conflicts at the top of a tracking issue's description, and posts each new
