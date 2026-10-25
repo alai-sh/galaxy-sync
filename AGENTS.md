@@ -51,7 +51,6 @@ never a real bucket.
 | `store.py` | The mirror's files and state on top of the backends; the queue, `refresh` requests, the failure ledger and conflicts |
 | `report.py` | Rendering `failures.json`, the tracking issue's report block and alert comments, and the public conflict records |
 | `storage.py` | The `Backend` interface (one per bucket), `LocalBackend` and `R2Backend` |
-| `cdn.py` | Purging changed index bucket files from Cloudflare's cache |
 | `models.py` | TypedDicts for Galaxy responses, index and plugin lines, and state |
 | `semver.py`, `times.py` | SemVer 2.0.0 precedence; RFC 3339 timestamps |
 
@@ -83,9 +82,9 @@ gitignored.
   possible) and carry on. Extraction failures still mirror the artifact and
   index line. Recorded failures exit `0`; `--strict` exits `1`.
 - **Write order:** artifacts, then index files, then aggregate files, with
-  `collections.json` last: the other changed files are purged from the CDN
-  before it's written and it's purged after. The index must never point at
-  an artifact that isn't written yet.
+  `collections.json` last, as it names the index files. The index must never
+  point at an artifact that isn't written yet. Nothing is purged from the
+  CDN (docs/storage.md, "Caching").
 - **Index files are published by sha256, never overwritten.** Each change
   publishes `index/<aa>/<sha256>.jsonl` before state's `sha256`, the only
   record of which file is a collection's, points at it, so

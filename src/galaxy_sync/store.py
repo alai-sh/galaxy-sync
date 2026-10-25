@@ -21,7 +21,6 @@ from compression import zstd
 from typing import cast
 
 from . import report
-from .cdn import PurgeError, Purger
 from .models import (
     CollectionState,
     Conflict,
@@ -179,12 +178,10 @@ class StateChanged(StorageError):
 
 
 class Store:
-    def __init__(self, buckets: Buckets, dl_url: str | None = None, purger: Purger | None = None) -> None:
+    def __init__(self, buckets: Buckets, dl_url: str | None = None) -> None:
         """Open a store. The artifact URL template is `dl_url`, else the one in
-        config.json, else DEFAULT_DL. With `purger`, index files this run
-        changes are purged from the CDN when collections.json is written."""
+        config.json, else DEFAULT_DL."""
         self.buckets = buckets
-        self.purger = purger
         self.index = buckets.index
         self.dl = buckets.dl
         self.state_bucket = buckets.state
@@ -205,8 +202,6 @@ class Store:
         self._plugin_lines: dict[str, list[PluginLine]] = {}
         # Each collection's extractions object as read or last saved, to skip unchanged saves.
         self._saved_extractions: dict[str, bytes] = {}
-        # Index bucket keys changed since the last purge, in the order written.
-        self._unpurged: dict[str, None] = {}
         # Each index file's sha256 in the collections.json written this run, for pruning.
         self._listed: set[str] | None = None
         self._unsaved_work = 0
@@ -601,27 +596,21 @@ class Store:
 
         Each collection's `sha256` comes from state, so writing it reads no
         index files, and every file it names is published, as each is
-        published before state points at it. The other files this run
-        changed are purged before it's written and it's purged after
-        (docs/index-spec/README.md, "Publishing order").
+        published before state points at it (docs/index-spec/README.md,
+        "Publishing order").
         """
         namespaces: dict[str, dict[str, dict[str, str]]] = {}
         for ns, name in self.index_collections():
             state = self.collection_state(f"{ns}.{name}")
             sha256 = state["sha256"]  # pyright: ignore[reportTypedDictNotRequiredAccess]  # index_collections has it
             namespaces.setdefault(ns, {})[name] = {"updated": state.get("updated") or now(), "sha256": sha256}
-        self.purge()
         text = json.dumps({"v": 1, "namespaces": namespaces}, indent=1) + "\n"
         _ = self._write_index_file("collections.json", text)
-        self.purge()
         self._listed = {entry["sha256"] for entries in namespaces.values() for entry in entries.values()}
 
     def _write_index_file(self, key: str, text: str) -> bool:
-        """Write one index bucket file, noting it for the next purge if it changed."""
-        changed = _write(self.index, key, text)
-        if changed:
-            self._unpurged[key] = None
-        return changed
+        """Write one index bucket file, returning False if it was already the same."""
+        return _write(self.index, key, text)
 
     def prune_due(self) -> bool:
         last = self.state.get("last_prune")
@@ -662,24 +651,6 @@ class Store:
         if deleted:
             log.info("deleted %d retired index files", deleted)
         return deleted
-
-    def purge(self) -> None:
-        """Purge the index bucket files changed since the last purge from the CDN.
-
-        A failure is recorded and the run carries on: the CDN serves the old
-        files only until their s-maxage runs out, so they aren't purged again.
-        Index files aren't among them: each is published under a new key.
-        """
-        keys, self._unpurged = list(self._unpurged), {}
-        if self.purger is None or not keys:
-            return
-        try:
-            self.purger.purge(keys)
-        except PurgeError as e:
-            self.record_failure(GLOBAL, "purge", "cdn_purge", f"purging {len(keys)} files: {e}")
-            return
-        log.info("purged %d files from the CDN", len(keys))
-        self.clear_failures(GLOBAL, "purge")
 
     def set_collection_plugins(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> int:
         """Work out one collection's plugin lines, from each version's extraction, for `write_plugins` to merge.

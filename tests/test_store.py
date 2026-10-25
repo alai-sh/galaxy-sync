@@ -7,7 +7,6 @@ import json
 import pytest
 
 from galaxy_sync import store as store_mod
-from galaxy_sync.cdn import PurgeError
 from galaxy_sync.storage import Buckets, StorageError
 from galaxy_sync.store import RETIRED_GRACE, StateChanged, Store
 
@@ -151,58 +150,6 @@ def test_read_index_missing_file(tmp_path):
     # Never read as empty, which would mirror the whole collection again.
     with pytest.raises(StorageError, match=r"ns\.coll's index file .* is missing"):
         _ = store.read_index("ns", "coll")
-
-
-class FakePurger:
-    def __init__(self, store, error=None):
-        self.store = store
-        self.error = error
-        self.calls = []
-
-    def purge(self, keys):
-        listing = self.store.index.read("collections.json")
-        self.calls.append((list(keys), listing and json.loads(listing)))
-        if self.error:
-            raise PurgeError(self.error)
-
-
-def test_purge_order(tmp_path):
-    store = Store(Buckets.local(tmp_path))
-    store.purger = purger = FakePurger(store)
-    _ = store.write_index("ns", "coll", [LINE])
-    store.write_config()
-    store.write_collections()
-    # The other changed files first, while collections.json doesn't exist yet, then collections.json. Index files
-    # are never purged: each is published under a new key.
-    assert purger.calls == [(["config.json"], None), (["collections.json"], purger.calls[1][1])]
-
-    # Unchanged files aren't purged, and nothing at all is when nothing changed.
-    purger.calls.clear()
-    _ = store.write_index("ns", "coll", [LINE])
-    store.write_config()
-    store.write_collections()
-    assert purger.calls == []
-
-    _ = store.write_index("ns", "coll", [{**LINE, "yanked": True}])
-    store.write_collections()
-    assert purger.calls == [(["collections.json"], purger.calls[0][1])]
-    assert purger.calls[0][1]["namespaces"]["ns"]["coll"]["sha256"] == _listed(store)["sha256"]
-
-
-def test_purge_failure_is_recorded(tmp_path):
-    store = Store(Buckets.local(tmp_path))
-    store.purger = FakePurger(store, error="HTTP 403: Authentication error")
-    _ = store.write_index("ns", "coll", [LINE])
-    store.write_collections()  # carries on, and writes collections.json anyway
-    assert store.index.read("collections.json") is not None
-    [failure] = store.state["failures"].values()
-    assert (failure["collection"], failure["version"], failure["kind"]) == ("*", "purge", "cdn_purge")
-    assert failure["message"] == "purging 1 files: HTTP 403: Authentication error"
-
-    store.purger = FakePurger(store)
-    _ = store.write_index("ns", "coll", [{**LINE, "yanked": True}])
-    store.write_collections()
-    assert store.state["failures"] == {}
 
 
 def _published(store, data):

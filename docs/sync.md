@@ -278,12 +278,11 @@ Recorded failures exit 0; `--strict` exits 1.
 | `extract_error` | Extraction failed; the version is still mirrored and re-extracted on later reconciles |
 | `deletions_suspected` | Galaxy publishes fewer versions than the mirror last saw |
 | `unexpected` | Any other exception while reconciling a collection |
-| `cdn_purge` | Purging changed index bucket files from the CDN failed ([CDN purging](storage.md#cdn-purging)) |
 | `pypi_unavailable`, `pypi_http_<code>` | PyPI couldn't be read for ansible-core ([ansible.builtin](#ansiblebuiltin)); `sha256_mismatch` and `extract_error` are recorded for its sdist too |
 
 Failures of the Galaxy-wide checks are recorded under the collection `*`,
 with the version naming the check: `published`, `feed`, `listing`, `count`,
-`sweep`, `requests`, `purge` or `builtin`. Each clears when that check next works.
+`sweep`, `requests` or `builtin`. Each clears when that check next works.
 
 Conflicts aren't failures: they aren't retried, and they stay open until
 Galaxy serves our contents again. Every run writes `failures.json` with the

@@ -7,7 +7,7 @@ bucket.
 
 | Bucket | Local directory | Served as | Cache |
 |---|---|---|---|
-| Index | `index-root/` | `index.alai.sh` | `public, max-age=60, s-maxage=600, stale-while-revalidate=86400` with ETags, but `public, max-age=31536000, immutable` for `index/` |
+| Index | `index-root/` | `index.alai.sh` | `public, max-age=600, stale-while-revalidate=86400` with ETags, but `public, max-age=31536000, immutable` for `index/` |
 | Artifacts | `dl-root/` | `dl.alai.sh` | `public, max-age=31536000, immutable` |
 | State | `state/` | Private | |
 
@@ -103,16 +103,6 @@ up in a command line, shell history or workflow log:
 Locally, keep them in a gitignored `.env` and run
 `uv run --env-file .env galaxy-sync sync --r2 ...`.
 
-Purging the CDN ([below](#cdn-purging)) is configured the same way, and
-only with `--r2`. It's optional: with none of these set, a run leaves the
-cache to expire. Setting some but not all of them is an error.
-
-| Variable | |
-|---|---|
-| `CLOUDFLARE_PURGE_TOKEN` | A Cloudflare API token that can only purge the zone's cache |
-| `CLOUDFLARE_ZONE_ID` | The zone serving the index bucket (`alai.sh`) |
-| `ALAI_INDEX_URL` | Where the index bucket is served, `https://index.alai.sh`; purged URLs are this plus the key |
-
 The backend uses R2's S3 API. Each bucket's objects get its Cache-Control
 from the table above (`private, no-store` for state), and a Content-Type by
 extension: JSON for `.json`, plain text for `.jsonl`. The index bucket's `index/` gets the
@@ -120,77 +110,73 @@ artifacts' Cache-Control instead. `state.json` is saved with a conditional write
 (`If-Match` on the ETag of what the run read), so two runs can never both
 save it.
 
-## CDN purging
+## Caching
 
-Cloudflare caches the index bucket's files that change (`config.json`,
-`collections.json`, `plugins.jsonl` and the conflict records) for their
-`s-maxage`, 10 minutes, and browsers and other caches for their `max-age`,
-a minute, which no purge reaches. With `stale-while-revalidate`, the first
-request after Cloudflare's copy expires gets it at once while Cloudflare
-checks R2 behind it. So that clients see a change as soon as the purge
-spreads, `sync` purges every one of those files it changed, in the
-order [the spec](index-spec/README.md#publishing-order) asks:
-`collections.json` is written last, the other changed files are purged
-before it's written, and it's purged after. Index files are never purged:
-each is published under a new key. Only the index bucket is purged.
+The index bucket's files that change (`config.json`, `collections.json`,
+`plugins.jsonl` and the conflict records) are cached for their `max-age`,
+10 minutes, by Cloudflare and by browsers and other caches after it. Once
+Cloudflare's copy expires, `stale-while-revalidate` has it answer the next
+request from that copy at once, `UPDATING`, while it fetches the file from
+R2 for the requests after, so no request waits for R2 unless Cloudflare has
+dropped its copy, or hasn't had one. Index files are named by their sha256,
+so they never change and are cached for a year.
+
+Nothing is purged (2026-10-26). A change reaches clients up to 10 minutes
+after the sync that made it, and as `collections.json` names index files by
+sha256, an older copy only means newer versions show up later: every file it
+names is still there. Purging what each sync changed would show changes
+within seconds, but a purge removes Cloudflare's copy rather than marking it
+stale, so the first request at each Cloudflare location after almost every
+sync would wait for R2 (about 0.65 s from Brisbane), and Cloudflare would
+fetch the 16.5 MB `plugins.jsonl` from R2 again after most of them. It also
+needed a Cloudflare API token in the sync's environment.
 
 10 minutes is the sync's schedule (`*/10` in `scheduler/wrangler.toml`), so
-a failed purge leaves Cloudflare at most one sync behind; change
-`storage.INDEX_CACHE` with the schedule. A failed purge doesn't stop the
-run, and isn't retried, since the old files expire by then anyway. A stale
-`collections.json` only names older index files, which are kept for a week,
-so clients see an older index, never a broken one. It's recorded in the
-failure ledger as `*` / `purge` / `cdn_purge` and cleared by the next purge
-that works, so a token that's expired or been revoked shows up on the
-tracking issue.
+a client's copy is at most about one sync behind; change
+`storage.INDEX_CACHE` with the schedule.
 
-### The purge token
+There's no `s-maxage`. Cloudflare treats it as `proxy-revalidate` and so
+never serves an expired copy, which turns `stale-while-revalidate` off
+([Cloudflare's Cache-Control directives](https://developers.cloudflare.com/cache/concepts/cache-control/)):
+with `max-age=60, s-maxage=600, stale-while-revalidate=86400`, every
+request after Cloudflare's copy expired came back `REVALIDATED`, having
+waited for R2 (tested 2026-10-26). Enabling Always Online on the zone would
+turn it off too.
 
-The token can purge `alai.sh`'s cache and nothing else. It's separate from
-the R2 token: R2's S3 credentials can't call Cloudflare's API, and one
-token for both would give each job permissions it doesn't need.
+A file keeps the Cache-Control it was written with until it's written
+again, and the sync skips writes whose content is unchanged, so after
+changing `storage.INDEX_CACHE` a file that rarely changes, `config.json`
+above all, keeps the old one; see below.
 
-To create it, in the Cloudflare dashboard of the account holding the
-`alai.sh` zone:
+### Changing an object's headers
 
-1. Open *My Profile > API Tokens* (or, for a token owned by the account
-   rather than a person, *Manage Account > Account API Tokens*) and choose
-   **Create Token**.
-2. Under *Custom token*, choose **Get started**.
-3. Name it `galaxy-sync cache purge`.
-4. **Permissions:** one row, `Zone` | `Cache Purge` | `Purge`.
-5. **Zone Resources:** `Include` | `Specific zone` | `alai.sh`.
-6. Leave *Client IP Address Filtering* empty: GitHub's runners don't have
-   fixed addresses. Set a *TTL* end date if you want it to expire, and put
-   a reminder to replace it before then.
-7. **Continue to summary**, check it reads *alai.sh - Cache Purge:Purge*,
-   then **Create Token** and copy the token. It isn't shown again.
-
-Check it works (the response has `"status": "active"`; a user token checks
-at `/user/tokens/verify`, an account token at
-`/accounts/<account id>/tokens/verify`):
+To give an existing index bucket file new headers without changing it, copy
+it onto itself with them, which R2 does in place, so it's never missing.
+Cloudflare's copy keeps the old headers until it expires. With the R2
+variables in `.env`:
 
 ```bash
-curl -s https://api.cloudflare.com/client/v4/user/tokens/verify -H "Authorization: Bearer <token>"
+uv run --env-file .env python - config.json <<'EOF'
+import sys
+from galaxy_sync.storage import INDEX_CACHE, R2Config, content_type
+
+config = R2Config.from_env()
+for key in sys.argv[1:]:
+    config.client().copy_object(
+        Bucket=config.index_bucket, Key=key, CopySource={"Bucket": config.index_bucket, "Key": key},
+        MetadataDirective="REPLACE", ContentType=content_type(key), CacheControl=INDEX_CACHE,
+    )
+EOF
 ```
 
-The zone ID is under *Domains > alai.sh > Overview*, in the *API* section
-near the bottom of the page.
-
-Then, in this repository's *Settings > Environments > r2*:
-
-- under *Environment secrets*, add `CLOUDFLARE_PURGE_TOKEN` with the token;
-- under *Environment variables*, add `CLOUDFLARE_ZONE_ID` with the zone ID
-  and `ALAI_INDEX_URL` with `https://index.alai.sh`.
-
-To replace the token, create a new one the same way, update the secret,
-then delete the old token from the page it was created on.
+Name more keys after `config.json` to do several. Check with
+`curl -sI https://index.alai.sh/config.json`.
 
 ## Hosting and cost
 
 The jobs run on GitHub Actions in the `alai-sh` org
-([scheduling](sync.md#scheduling)), with the R2 and purge tokens as secrets in a
-protected `r2` environment and the bucket names, zone ID and index URL as variables; an Azure
+([scheduling](sync.md#scheduling)), with the R2 token as secrets in a
+protected `r2` environment and the bucket names as variables; an Azure
 Container Apps Job is the fallback. At R2 list prices the mirror is ~25 GB
 at $0.015/GB-month. Egress is free, and clients mostly hit the CDN cache.
 Writes stay inside the free tier: mirroring a version is a handful of

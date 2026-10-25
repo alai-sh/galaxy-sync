@@ -191,9 +191,7 @@ def test_r2_buckets():
     buckets = Buckets.r2(R2Config.from_env(R2_ENVIRON))
     assert isinstance(buckets.index, R2Backend)
     assert buckets.index.cache_for("index/aa/x.jsonl") == "public, max-age=31536000, immutable"
-    assert buckets.index.cache_for("collections.json") == (
-        "public, max-age=60, s-maxage=600, stale-while-revalidate=86400"
-    )
+    assert buckets.index.cache_for("collections.json") == "public, max-age=600, stale-while-revalidate=86400"
     assert isinstance(buckets.dl, R2Backend)
     assert (buckets.dl.bucket, buckets.dl.cache_control) == ("alai-dl", "public, max-age=31536000, immutable")
     assert isinstance(buckets.state, R2Backend)

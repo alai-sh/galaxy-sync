@@ -47,9 +47,6 @@ jobs:
         ALAI_INDEX_BUCKET: ${{ vars.ALAI_INDEX_BUCKET }}
         ALAI_DL_BUCKET: ${{ vars.ALAI_DL_BUCKET }}
         ALAI_STATE_BUCKET: ${{ vars.ALAI_STATE_BUCKET }}
-        CLOUDFLARE_PURGE_TOKEN: ${{ secrets.CLOUDFLARE_PURGE_TOKEN }}
-        CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}
-        ALAI_INDEX_URL: ${{ vars.ALAI_INDEX_URL }}
 
     # The report block is kept at the top of the tracking issue's description,
     # edited only when it changed; edits don't notify anyone. Each conflict

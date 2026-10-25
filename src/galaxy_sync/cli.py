@@ -25,7 +25,6 @@ from pathlib import Path
 
 from . import builtin
 from .builtin import BuiltinError
-from .cdn import Purger
 from .changes import (
     FEED_OVERLAP,
     Collection,
@@ -55,7 +54,7 @@ class UsageError(Exception):
 
 def _open_store(args: argparse.Namespace) -> Store:
     if args.r2:
-        return Store(Buckets.r2(R2Config.from_env()), purger=Purger.from_env())
+        return Store(Buckets.r2(R2Config.from_env()))
     return Store(Buckets.local(args.store))
 
 
@@ -236,7 +235,6 @@ GLOBAL_RETRIES = {
     "requests": "retried with the requests",
     "sweep": "retried with the sweep",
     "count": "checked again after reconciling",
-    "purge": "cleared by the next purge that works",
     "builtin": "retried every run",
 }
 
@@ -621,7 +619,7 @@ def _finish(
     store.write_config()
     plugins = store.write_plugins()
     _ = store.write_conflict_records()
-    store.write_collections()  # last, as it purges the others from the CDN
+    store.write_collections()  # last, as it names the index files written before it
     pruned = store.prune_index_files() if store.prune_due() else None
     failures = store.write_failure_report()
     summary = failures.summary

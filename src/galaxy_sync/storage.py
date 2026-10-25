@@ -129,14 +129,15 @@ class Buckets:
 
 # Cache-Control, as docs/index-spec/README.md asks. Index files and artifacts
 # are named by their sha256, so they never change and are cached for a year.
-# The rest of the index bucket changes on every publish: a minute for browsers
-# and other clients' caches, which no purge reaches; 10 minutes for Cloudflare,
-# which every sync purges of what it changed. 600 matches the sync's schedule,
-# `*/10` in scheduler/wrangler.toml, so a failed purge leaves Cloudflare at
-# most one sync behind; change both together. stale-while-revalidate lets
-# Cloudflare answer at once when its copy expires, and check R2 behind it.
+# The rest of the index bucket changes on every publish, and isn't purged: 10
+# minutes matches the sync's schedule, `*/10` in scheduler/wrangler.toml, so a
+# cached copy is at most about one sync behind; change both together.
+# stale-while-revalidate lets Cloudflare answer at once when its copy
+# expires, and fetch from R2 behind it. No s-maxage, which would stop that:
+# Cloudflare treats it as proxy-revalidate, so it never serves an expired
+# copy. See docs/storage.md, "Caching".
 # The state bucket isn't public; no-store keeps it that way if it ever is.
-INDEX_CACHE = "public, max-age=60, s-maxage=600, stale-while-revalidate=86400"
+INDEX_CACHE = "public, max-age=600, stale-while-revalidate=86400"
 IMMUTABLE = "public, max-age=31536000, immutable"
 PRIVATE = "private, no-store"
 # The index bucket's prefix for index files, which get IMMUTABLE.

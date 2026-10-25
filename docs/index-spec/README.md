@@ -447,14 +447,20 @@ added later as an optional field without a format version change.
   files found by name the same whatever query string is added, and MUST
   NOT leave the query string out of the cache key for them. Clients rely on
   a fresh query string to get past a stale cached copy.
-- **Purging:** an index behind a CDN SHOULD purge each changed file from the
+- **Purging:** an index behind a CDN MAY purge each changed file from the
   CDN when it publishes, in the [publishing order](#publishing-order). This
   shrinks the window in which clients see stale data from the CDN's
-  lifetime to however long the purge takes to spread. Purging only reaches
-  the CDN, not proxies or browsers after it, so the `max-age` sent to
-  clients stays short either way; a longer `s-maxage` for the CDN alone
-  bounds how stale a failed purge leaves it. Index files found by SHA-256
-  are never replaced, so there's nothing to purge for them.
+  lifetime to however long the purge takes to spread, at the cost of the
+  next request waiting for the origin. Purging only reaches the CDN, not
+  proxies or browsers after it, so the `max-age` sent to clients stays
+  short either way. An index whose files are found by name and that
+  doesn't purge leaves a client briefly seeing a `collections.json` and an
+  index file that disagree, which [Cached index files](#cached-index-files)
+  handles; one by SHA-256 can't, as only `collections.json` changes. A host that wants its CDN to answer at
+  once when its copy expires can add `stale-while-revalidate`, but not with
+  `s-maxage`: shared caches treat `s-maxage` as `proxy-revalidate` and
+  never serve an expired copy. Index files found by SHA-256 are never
+  replaced, so there's nothing to purge for them.
 - **Compression:** clients SHOULD send `Accept-Encoding` (gzip, br, zstd).
   Servers MAY compress. Index files compress well.
 - **Content-Type:** clients MUST NOT depend on it.
@@ -570,7 +576,7 @@ SHA-256 can't be stale at all: only `collections.json` can be.
 So that a client which sees a new `sha256` or `updated` can fetch the content
 it describes, whatever writes an index MUST write a changed index file
 before the `collections.json` that describes it. An index served through a
-CDN it can purge SHOULD purge the changed index files found by name between
+CDN it purges SHOULD purge the changed index files found by name between
 the two writes, and purge `collections.json` after it. See
 [HTTP behaviour](#http-behaviour). With files found by SHA-256, a stale
 `collections.json` only names older files, which the index still keeps, so
