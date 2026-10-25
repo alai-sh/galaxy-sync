@@ -59,11 +59,14 @@ def test_sync_writes_the_index(galaxy, run, tmp_path, capsys, refresh):
     config = json.loads(index_file(tmp_path, "config.json"))
     assert config["dl"] == DEFAULT_DL
     assert config["formats"]["1"]["plugins"] == "plugins.jsonl"
+    assert config["formats"]["1"]["index"] == "index/{sha256-prefix}/{sha256-checksum}.jsonl"
     collections = json.loads(index_file(tmp_path, "collections.json"))
     assert list(collections["namespaces"]) == ["ns"]
     assert "updated" in collections["namespaces"]["ns"]["coll"]
-    index = (tmp_path / "index-root" / "index" / "ns" / "coll.jsonl").read_bytes()
-    assert collections["namespaces"]["ns"]["coll"]["sha256"] == hashlib.sha256(index).hexdigest()
+    # Published by its sha256, the only copy.
+    sha256 = collections["namespaces"]["ns"]["coll"]["sha256"]
+    index = (tmp_path / "index-root" / "index" / sha256[:2] / f"{sha256}.jsonl").read_bytes()
+    assert sha256 == hashlib.sha256(index).hexdigest()
     assert json.loads(index_file(tmp_path, "plugins.jsonl")) == {
         "v": 1,
         "type": "module",
@@ -72,7 +75,7 @@ def test_sync_writes_the_index(galaxy, run, tmp_path, capsys, refresh):
         "since": "1.0.0",
         "short_description": "A thing",
     }
-    assert (tmp_path / "index-root" / "index" / "ns" / "coll.jsonl").is_file()
+    assert not (tmp_path / "index-root" / "index" / "ns").exists()
     assert len(list((tmp_path / "dl-root" / "sha256").rglob("*.tar.gz"))) == 1
 
 
@@ -389,7 +392,7 @@ def test_sync(galaxy, run, tmp_path, capsys, refresh):
 
     assert run("sync") == 0
     assert "ns.coll: +2" in capsys.readouterr().out
-    assert (tmp_path / "index-root" / "index" / "ns" / "coll.jsonl").is_file()
+    assert [line["vers"] for line in Store(Buckets.local(tmp_path)).read_index("ns", "coll")] == ["1.0.0", "2.0.0"]
     state = json.loads((tmp_path / "state" / "state.json").read_text())
     assert state["feed_cursor"] == galaxy.uploaded[("ns", "coll", "2.0.0")]
 
@@ -946,3 +949,43 @@ def test_explain_unchanged_reconciles():
     ]
     res.upstream = 0
     assert explain(reasons=["new"]) == ["new in the listing; Galaxy lists no versions for it yet"]
+
+
+def test_sync_moves_index_files_first(galaxy, run, tmp_path, capsys, monkeypatch):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    assert run("sync") == 0
+    # As a store from before index files were published by sha256 was: each by name, in the index bucket.
+    buckets = Buckets.local(tmp_path)
+    store = Store(buckets)
+    data = store.index.read(store.index_key(store.state["collections"]["ns.coll"]["sha256"]))
+    assert data is not None
+    for key in list(buckets.index.list("index/")):
+        buckets.index.delete(key)
+    buckets.index.write("index/ns/coll.jsonl", data)
+    del store.state["index_files"]
+    store.save_state()
+    capsys.readouterr()
+
+    # Out of time: progress is kept, and nothing else is done.
+    monkeypatch.setattr(cli.time, "monotonic", lambda: float("inf"))
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert "out of time, 1 collections left for the next run" in out
+    assert "galaxy:" not in out
+    monkeypatch.undo()
+    monkeypatch.setattr(cli.GalaxyClient, "__init__", _fast_client(cli.GalaxyClient.__init__))
+
+    assert run("sync") == 0
+    out = capsys.readouterr().out
+    assert "moving index files: done" in out
+    sha256 = hashlib.sha256(data).hexdigest()
+    assert buckets.index.read(f"index/{sha256[:2]}/{sha256}.jsonl") == data
+    assert json.loads(index_file(tmp_path, "collections.json"))["namespaces"]["ns"]["coll"]["sha256"] == sha256
+    assert not Store(buckets).needs_migration()
+
+
+def test_dry_run_moves_nothing(galaxy, run, tmp_path):
+    buckets = Buckets.local(tmp_path)
+    buckets.index.write("index/ns/coll.jsonl", b"{}\n")
+    assert run("sync", "--dry-run") == 0
+    assert list(buckets.index.list("index/")) == ["index/ns/coll.jsonl"]

@@ -1,8 +1,11 @@
 """The mirror's files and state, on top of one storage backend per bucket.
 
-    index bucket   config.json, collections.json, plugins.jsonl, index/, conflicts/
+    index bucket   config.json, collections.json, plugins.jsonl, index/<aa>/<sha256>.jsonl, conflicts/
     dl bucket      sha256/<aa>/<sha256>.tar.gz
     state bucket   state.json, failures.json, builtin.jsonl, extract/, conflicts/, requests/
+
+Each collection's index file is published by its sha256, and never changes;
+the sha256 in state.json says which is the collection's.
 
 See docs/storage.md. Writes go through `_write`, which skips objects whose
 content hasn't changed, except where the object is known to be new.
@@ -12,8 +15,9 @@ import datetime
 import hashlib
 import json
 import logging
+import re
 import secrets
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from compression import zstd
 from typing import cast
 
@@ -61,6 +65,20 @@ SAVE_EVERY = 100
 # A failure outstanding this long is reported once as needing a person.
 PERSISTENT = datetime.timedelta(days=1)
 
+# Where clients find a published index file, from collections.json's sha256.
+INDEX_TEMPLATE = "index/{sha256-prefix}/{sha256-checksum}.jsonl"
+
+# A published index file no collections.json names is kept this long, for
+# clients and caches still holding an older listing, then deleted. Far longer
+# than any copy of collections.json lives (s-maxage plus
+# stale-while-revalidate, a day at most); docs/index-spec/README.md asks for
+# at least 7 days.
+RETIRED_GRACE = datetime.timedelta(days=7)
+
+# How often retired index files are looked for, as listing the index bucket
+# costs a request per thousand files.
+PRUNE_EVERY = datetime.timedelta(days=1)
+
 # Field order for index lines, matching the spec.
 LINE_FIELDS = (
     "v",
@@ -76,6 +94,9 @@ LINE_FIELDS = (
     "published",
     "upstream_conflict",
 )
+
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _dump(obj: object) -> str:
@@ -97,6 +118,18 @@ def _write(backend: Backend, key: str, text: str) -> bool:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _name_keys(keys: Iterable[str]) -> list[tuple[str, str]]:
+    """(namespace, name) of each `index/<ns>/<name>.jsonl` key, leaving out any published by sha256."""
+    result: list[tuple[str, str]] = []
+    for key in keys:
+        parts = key.split("/")
+        if len(parts) == 3 and parts[2].endswith(".jsonl"):
+            stem = parts[2].removesuffix(".jsonl")
+            if not (_SHA256_RE.fullmatch(stem) and parts[1] == stem[:2]):
+                result.append((parts[1], stem))
+    return result
 
 
 def _read_jsonl(data: bytes | None) -> list[object]:
@@ -190,6 +223,8 @@ class Store:
         self._saved_extractions: dict[str, bytes] = {}
         # Index bucket keys changed since the last purge, in the order written.
         self._unpurged: dict[str, None] = {}
+        # Each index file's sha256 in the collections.json written this run, for pruning.
+        self._listed: set[str] | None = None
         self._unsaved_work = 0
 
     def _configured_dl(self) -> str | None:
@@ -515,39 +550,53 @@ class Store:
         return cast(list[PluginLine], _read_jsonl(self.state_bucket.read("builtin.jsonl")))
 
     @staticmethod
-    def index_key(namespace: str, name: str) -> str:
-        return f"index/{namespace}/{name}.jsonl"
+    def index_key(sha256: str) -> str:
+        """An index file in the index bucket, by its sha256, as INDEX_TEMPLATE has clients find it."""
+        return f"index/{sha256[:2]}/{sha256}.jsonl"
 
     def index_collections(self) -> list[tuple[str, str]]:
-        """(namespace, name) of every collection with an index file."""
-        result: list[tuple[str, str]] = []
-        for key in self.index.list("index/"):
-            parts = key.split("/")
-            if len(parts) == 3 and parts[2].endswith(".jsonl"):
-                result.append((parts[1], parts[2].removesuffix(".jsonl")))
-        return result
+        """(namespace, name) of every collection with an index file: those state has a sha256 for."""
+        return sorted(
+            (ns, name)
+            for ns, _, name in (fqcn.partition(".") for fqcn, cs in self.state["collections"].items() if "sha256" in cs)
+        )
 
     def read_index(self, namespace: str, name: str) -> list[IndexLine]:
-        return cast(list[IndexLine], _read_jsonl(self.index.read(self.index_key(namespace, name))))
+        """A collection's index file, through the sha256 state has for it; none if it has none."""
+        fqcn = f"{namespace}.{name}"
+        cs = self.state["collections"].get(fqcn)
+        if cs is None or (sha256 := cs.get("sha256")) is None:
+            return []
+        if (data := self.index.read(self.index_key(sha256))) is None:
+            # Never treated as empty, which would mirror the whole collection again.
+            raise StorageError(f"{fqcn}'s index file {self.index_key(sha256)} is missing")
+        return cast(list[IndexLine], _read_jsonl(data))
 
     def write_index(self, namespace: str, name: str, lines: list[IndexLine]) -> bool:
-        """Write an index file, returning False if it was already the same."""
-        text = "".join(_dump(ordered_line(line)) + "\n" for line in lines)
-        changed = self._write_index_file(self.index_key(namespace, name), text)
+        """Publish an index file by its sha256 and point state at it, returning False if it was already the same.
+
+        State is the only record of which file is a collection's, so a run
+        that stops before saving it leaves the file this one replaced in use,
+        and the next run reconciles again from there; the new file is left
+        for pruning.
+        """
+        data = "".join(_dump(ordered_line(line)) + "\n" for line in lines).encode()
+        sha256 = _sha256(data)
         state = self.collection_state(f"{namespace}.{name}")
-        state["sha256"] = _sha256(text.encode())  # what's stored now, changed or not
-        if changed:
-            state["updated"] = now()
-        return changed
+        if state.get("sha256") == sha256:
+            return False
+        # Content-addressed, so the key is new unless an earlier file is coming back, which is the same bytes.
+        self.index.write(self.index_key(sha256), data)
+        state["sha256"] = sha256
+        state["updated"] = now()
+        return True
 
     def rebuild_collection(self, namespace: str, name: str) -> None:
-        """Work out one collection's plugin lines and index file sha256 again, for a rebuild.
+        """Work out one collection's plugin lines again, for a rebuild.
 
         The lines are merged by the next `write_plugins`, like a reconcile's.
         """
-        data = self.index.read(self.index_key(namespace, name))
-        self.collection_state(f"{namespace}.{name}")["sha256"] = _sha256(data or b"")
-        lines = cast(list[IndexLine], _read_jsonl(data))
+        lines = self.read_index(namespace, name)
         extractions = self.load_extractions(namespace, name)
         _ = self.set_collection_plugins(
             namespace,
@@ -555,45 +604,137 @@ class Store:
             {line["vers"]: extractions[line["cksum"]] for line in lines if line["cksum"] in extractions},
         )
 
-    def write_config(self) -> None:
+    # Index files used to be published by name in the index bucket, and read
+    # from there. The first sync after that changed publishes each one by its
+    # sha256 and points state at it, before doing anything else, as nothing
+    # can be reconciled until it's done. Remove this once the stored index has
+    # been moved.
+
+    def needs_migration(self) -> bool:
+        """Whether index files still have to be moved to the sha256 layout. A new store has nothing to move."""
+        if "index_files" in self.state:
+            return False
+        if "migration" not in self.state:
+            if not self.legacy_index_files():
+                self.state["index_files"] = "sha256"
+                return False
+            self.state["migration"] = {}
+        return True
+
+    def legacy_index_files(self) -> list[tuple[str, str]]:
+        """(namespace, name) of every index file still published by name in the index bucket, from before."""
+        return _name_keys(self.index.list("index/"))
+
+    def migrate_collection(self, namespace: str, name: str) -> None:
+        """Publish one collection's index file by its sha256, from its old file by name, and point state at it.
+
+        The old file stays until pruning removes it, as no listing names it.
+        """
+        data = self.index.read(f"index/{namespace}/{name}.jsonl") or b""
+        sha256 = _sha256(data)
+        self.index.write(self.index_key(sha256), data)
+        self.collection_state(f"{namespace}.{name}")["sha256"] = sha256
+
+    def finish_migration(self) -> None:
+        """Point config.json at the sha256 layout, once every index file is published by it.
+
+        config.json, collections.json and plugins.jsonl are written even if
+        their content is the same, so they get the index bucket's new
+        Cache-Control.
+        """
+        _ = self.state.pop("migration", None)
+        self.state["index_files"] = "sha256"
+        self.write_config(force=True)
+        if (plugins := self.index.read("plugins.jsonl")) is not None:
+            _ = self._write_index_file("plugins.jsonl", plugins.decode(), force=True)
+        self.write_collections(force=True)
+
+    def write_config(self, *, force: bool = False) -> None:
         config = {
-            "formats": {"1": {"index": "index/", "collections": "collections.json", "plugins": "plugins.jsonl"}},
+            "formats": {"1": {"index": INDEX_TEMPLATE, "collections": "collections.json", "plugins": "plugins.jsonl"}},
             "dl": self.dl_url,
             "moved-to": None,
         }
-        _ = self._write_index_file("config.json", json.dumps(config, indent=2) + "\n")
+        _ = self._write_index_file("config.json", json.dumps(config, indent=2) + "\n", force=force)
 
-    def write_collections(self) -> None:
+    def write_collections(self, *, force: bool = False) -> None:
         """Write collections.json, after every other index bucket file.
 
         Each collection's `sha256` comes from state, so writing it reads no
-        index files, except to fill in one state doesn't have yet. The index
-        files this run changed are purged before it's written and it's
-        purged after, so a client that sees a new `sha256` gets the file it
-        describes (docs/index-spec/README.md, "Publishing order").
+        index files, and every file it names is published, as each is
+        published before state points at it. The other files this run
+        changed are purged before it's written and it's purged after
+        (docs/index-spec/README.md, "Publishing order").
         """
         namespaces: dict[str, dict[str, dict[str, str]]] = {}
         for ns, name in self.index_collections():
             state = self.collection_state(f"{ns}.{name}")
-            if "sha256" not in state:
-                state["sha256"] = _sha256(self.index.read(self.index_key(ns, name)) or b"")
-            namespaces.setdefault(ns, {})[name] = {"updated": state.get("updated") or now(), "sha256": state["sha256"]}
+            sha256 = state["sha256"]  # pyright: ignore[reportTypedDictNotRequiredAccess]  # index_collections has it
+            namespaces.setdefault(ns, {})[name] = {"updated": state.get("updated") or now(), "sha256": sha256}
         self.purge()
-        _ = self._write_index_file("collections.json", json.dumps({"v": 1, "namespaces": namespaces}, indent=1) + "\n")
+        text = json.dumps({"v": 1, "namespaces": namespaces}, indent=1) + "\n"
+        _ = self._write_index_file("collections.json", text, force=force)
         self.purge()
+        self._listed = {entry["sha256"] for entries in namespaces.values() for entry in entries.values()}
 
-    def _write_index_file(self, key: str, text: str) -> bool:
-        """Write one index bucket file, noting it for the next purge if it changed."""
-        changed = _write(self.index, key, text)
+    def _write_index_file(self, key: str, text: str, *, force: bool = False) -> bool:
+        """Write one index bucket file, noting it for the next purge if it changed. With `force`, written and purged
+        even if it's the same."""
+        if force:
+            self.index.write(key, text.encode())
+            changed = True
+        else:
+            changed = _write(self.index, key, text)
         if changed:
             self._unpurged[key] = None
         return changed
+
+    def prune_due(self) -> bool:
+        last = self.state.get("last_prune")
+        return (
+            last is None
+            or datetime.datetime.fromisoformat(now()) - datetime.datetime.fromisoformat(last) >= PRUNE_EVERY
+        )
+
+    def prune_index_files(self) -> int:
+        """Delete published index files the collections.json written this run doesn't name and none has for
+        RETIRED_GRACE, returning how many.
+
+        A file is retired from when a prune first finds it unnamed: one a
+        collection replaced, one left by a run that stopped between
+        publishing and saving state, and the old files by name in the index
+        bucket. One named again is no longer retired.
+        """
+        if self._listed is None:
+            return 0
+        live = {self.index_key(sha256) for sha256 in self._listed}
+        retired = self.state.setdefault("retired_index_files", {})
+        stamp = now()
+        cutoff = datetime.datetime.fromisoformat(stamp) - RETIRED_GRACE
+        keys = list(self.index.list("index/"))
+        deleted = 0
+        for key in keys:
+            if key in live:
+                _ = retired.pop(key, None)
+            elif datetime.datetime.fromisoformat(retired.setdefault(key, stamp)) <= cutoff:
+                self.index.delete(key)
+                del retired[key]
+                deleted += 1
+        for key in set(retired) - set(keys):
+            del retired[key]  # deleted some other way
+        if not retired:
+            del self.state["retired_index_files"]
+        self.state["last_prune"] = stamp
+        if deleted:
+            log.info("deleted %d retired index files", deleted)
+        return deleted
 
     def purge(self) -> None:
         """Purge the index bucket files changed since the last purge from the CDN.
 
         A failure is recorded and the run carries on: the CDN serves the old
-        files only until their max-age runs out, so they aren't purged again.
+        files only until their s-maxage runs out, so they aren't purged again.
+        Index files aren't among them: each is published under a new key.
         """
         keys, self._unpurged = list(self._unpurged), {}
         if self.purger is None or not keys:

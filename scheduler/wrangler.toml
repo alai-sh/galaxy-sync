@@ -10,6 +10,8 @@ workers_dev = false
 preview_urls = false
 
 [triggers]
+# Every 10 minutes. The index's s-maxage (storage.INDEX_CACHE in the Python
+# package) is 600 to match, so change both together.
 crons = ["*/10 * * * *"]
 
 [vars]

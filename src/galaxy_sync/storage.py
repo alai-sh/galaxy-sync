@@ -121,18 +121,26 @@ class Buckets:
     def r2(cls, config: R2Config) -> Buckets:
         client = config.client()
         return cls(
-            R2Backend(client, config.index_bucket, INDEX_CACHE),
-            R2Backend(client, config.dl_bucket, ARTIFACT_CACHE),
+            R2Backend(client, config.index_bucket, INDEX_CACHE, {INDEX_FILES: IMMUTABLE}),
+            R2Backend(client, config.dl_bucket, IMMUTABLE),
             R2Backend(client, config.state_bucket, PRIVATE),
         )
 
 
-# Cache-Control, as docs/index-spec/README.md asks: short for files that
-# change on every publish, forever for artifacts, whose keys are their sha256.
+# Cache-Control, as docs/index-spec/README.md asks. Index files and artifacts
+# are named by their sha256, so they never change and are cached for a year.
+# The rest of the index bucket changes on every publish: a minute for browsers
+# and other clients' caches, which no purge reaches; 10 minutes for Cloudflare,
+# which every sync purges of what it changed. 600 matches the sync's schedule,
+# `*/10` in scheduler/wrangler.toml, so a failed purge leaves Cloudflare at
+# most one sync behind; change both together. stale-while-revalidate lets
+# Cloudflare answer at once when its copy expires, and check R2 behind it.
 # The state bucket isn't public; no-store keeps it that way if it ever is.
-INDEX_CACHE = "public, max-age=60"
-ARTIFACT_CACHE = "public, max-age=31536000, immutable"
+INDEX_CACHE = "public, max-age=60, s-maxage=600, stale-while-revalidate=86400"
+IMMUTABLE = "public, max-age=31536000, immutable"
 PRIVATE = "private, no-store"
+# The index bucket's prefix for index files, which get IMMUTABLE.
+INDEX_FILES = "index/"
 
 # Clients mustn't depend on Content-Type; these let Cloudflare compress the
 # text and browsers show it.
@@ -151,10 +159,17 @@ def content_type(key: str) -> str:
 class R2Backend:
     """An R2 bucket, through its S3-compatible API."""
 
-    def __init__(self, client: S3Client, bucket: str, cache_control: str) -> None:
+    def __init__(
+        self, client: S3Client, bucket: str, cache_control: str, overrides: Mapping[str, str] | None = None
+    ) -> None:
         self.client = client
         self.bucket = bucket
         self.cache_control = cache_control
+        # Cache-Control by key prefix, for keys that differ from the bucket's.
+        self.overrides = dict(overrides or {})
+
+    def cache_for(self, key: str) -> str:
+        return next((value for prefix, value in self.overrides.items() if key.startswith(prefix)), self.cache_control)
 
     def read(self, key: str) -> bytes | None:
         try:
@@ -169,7 +184,7 @@ class R2Backend:
             Key=check_key(key),
             Body=data,
             ContentType=content_type(key),
-            CacheControl=self.cache_control,
+            CacheControl=self.cache_for(key),
         )
 
     def replace(self, key: str, data: bytes, previous: bytes | None) -> None:
@@ -179,7 +194,7 @@ class R2Backend:
             Key=check_key(key),
             Body=data,
             ContentType=content_type(key),
-            CacheControl=self.cache_control,
+            CacheControl=self.cache_for(key),
         )
         try:
             if previous is None:

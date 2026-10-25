@@ -29,8 +29,9 @@ An index has two roots, which MAY be on different hosts:
 ```
 <index root>                             e.g. https://index.alai.sh/
   config.json                            how to read this index
-  collections.json                       every collection, with last-updated times
-  index/<namespace>/<name>.jsonl         one line per collection version
+  collections.json                       every collection, with last-updated times and sha256s
+  index/<namespace>/<name>.jsonl         one line per collection version, found by name
+    or index/<aa>/<sha256>.jsonl         or by sha256, as config.json's index template says
   conflicts/<namespace>/<name>.json      mirrors: why versions differ from the origin
 
 <artifact root>                          e.g. https://dl.alai.sh/
@@ -43,8 +44,9 @@ Resolving a collection:
 2. Decide which index the requested collection comes from (see [Client
    rules](#client-rules)). `collections.json` says whether an index has it
    without probing for a 404.
-3. Fetch `index/<namespace>/<name>.jsonl`, and for each dependency fetch its
-   file from the same index. Requests SHOULD run in parallel.
+3. Fetch the collection's [index file](#index-files), from the `index`
+   template, and for each dependency fetch its file from the same index.
+   Requests SHOULD run in parallel.
 4. Resolve offline using the lines.
 5. Download each chosen artifact using the `dl` template, and verify its
    sha256 against `cksum`.
@@ -91,7 +93,7 @@ schema only ever gains fields and never changes incompatibly.
 {
   "formats": {
     "1": {
-      "index": "index/",
+      "index": "index/{namespace}/{name}.jsonl",
       "collections": "collections.json"
     }
   },
@@ -103,7 +105,7 @@ schema only ever gains fields and never changes incompatibly.
 | Field | Type | Required | Meaning |
 |---|---|---|---|
 | `formats` | object | yes | Map of format number (as a string) to the paths for that format, relative to the index root. An index MAY serve several formats at once during a transition. Clients MUST pick the highest format they support, and MUST fail with a clear error ("this index requires a newer alai") if they support none |
-| `formats.<n>.index` | string | yes | Directory containing the per-collection index files |
+| `formats.<n>.index` | string | yes | URL template for each collection's [index file](#index-files), with the placeholders in [The `index` template](#the-index-template) |
 | `formats.<n>.collections` | string | yes | Path of the [collection listing](#collectionsjson) |
 | `formats.<n>.plugins` | string | no | Path of the [plugin index](plugins.md). Absent if the index has none |
 | `dl` | string | yes | Artifact URL template. See [Artifacts](#artifacts) |
@@ -111,6 +113,51 @@ schema only ever gains fields and never changes incompatibly.
 
 The names `api` (a publishing endpoint) and `auth-required` (both from Cargo)
 are reserved. An index without `api` is read-only.
+
+The paths in `formats`, and the `index` template once filled in, are URL
+references resolved against the index root as RFC 3986 says: relative, or
+absolute and on another host. The index root ends in `/`, so a path without
+a leading `/` stays under it. Clients MUST refuse one that leads from an
+`https` index to anything but `https`, or from an index that isn't on the
+client's own disk to a `file:` URL.
+
+### The `index` template
+
+`formats.<n>.index` says where each collection's index file is. A client
+fills in its placeholders for the collection it wants, then resolves the
+result against the index root:
+
+| Placeholder | Replaced with |
+|---|---|
+| `{namespace}` | The collection's namespace |
+| `{name}` | The collection's name, without the namespace |
+| `{sha256-checksum}` | The collection's `sha256` in [`collections.json`](#collectionsjson): the SHA-256 of its index file, not of an artifact |
+| `{sha256-prefix}` | The first two characters of that `sha256` |
+
+The template MUST name each file on its own: it has both `{namespace}` and
+`{name}`, or `{sha256-checksum}`. `{sha256-prefix}` alone doesn't, and is
+for spreading files across directories. Any other text is kept as it is.
+Which placeholders an index uses decides how it works:
+
+- **By name**, such as `index/{namespace}/{name}.jsonl`, which gives
+  `index/community/general.jsonl`. A collection's file keeps its URL and is
+  replaced in place when it changes, so it's served with a short cache
+  lifetime ([HTTP behaviour](#http-behaviour)). A client can build the URL
+  without `collections.json`, and an index can generate files on request.
+  `sha256` in `collections.json` stays optional.
+- **By SHA-256**, such as `index/{sha256-prefix}/{sha256-checksum}.jsonl`,
+  which gives `index/59/59976e13….jsonl`. A file's URL changes with its
+  content, so a file never changes and can be cached as long as an artifact.
+  Only `collections.json` says where a collection's file is, which makes it
+  required reading, and its `sha256` required in every entry (see
+  [below](#index-templates-by-sha-256)). The index MUST keep each file
+  available for at least 7 days after the last `collections.json` that
+  named it was replaced, longer than any copy of `collections.json` lives in
+  a cache, and MAY delete it after that.
+
+A template can use both kinds, such as
+`index/{namespace}/{name}-{sha256-checksum}.jsonl`; any template with
+`{sha256-checksum}` or `{sha256-prefix}` is by SHA-256.
 
 ## `collections.json`
 
@@ -138,7 +185,7 @@ index file last changed.
 | `namespaces` | object | yes | Map of namespace to its collections |
 | `namespaces.<ns>.<name>` | object | yes | One entry per collection that has an index file |
 | `namespaces.<ns>.<name>.updated` | string | yes | When that collection's index file last changed for any reason: a new version, a yank or a deprecation (RFC 3339) |
-| `namespaces.<ns>.<name>.sha256` | string | no | Lowercase hex SHA-256 of that collection's index file, over its bytes exactly as stored (before any transfer compression). Lets a client tell whether its cached copy is current without a request; see [Cached index files](#cached-index-files). Indexes SHOULD include it |
+| `namespaces.<ns>.<name>.sha256` | string | no | Lowercase hex SHA-256 of that collection's index file, over its bytes exactly as stored (before any transfer compression). Lets a client tell whether its cached copy is current without a request; see [Cached index files](#cached-index-files). MUST be in every entry when the `index` template is [by SHA-256](#index-templates-by-sha-256); otherwise indexes SHOULD include it |
 
 What it's for:
 
@@ -156,8 +203,8 @@ What it's for:
 
 For the Galaxy mirror this is about 4.6k entries: roughly 720 KB raw and
 250 KB compressed with `sha256` (340 KB and 60 KB without). It changes on
-every publish, so it's served with the same short cache lifetime as index
-files.
+every publish, so it's served with a short cache lifetime (see
+[HTTP behaviour](#http-behaviour)).
 
 `sha256` is the full hash rather than a prefix because collection authors
 control much of their index file's content and can predict the next one (the
@@ -169,10 +216,32 @@ Descriptions, tags and other search data are deliberately left out. They
 belong in the catalog (see [Planned additions](#planned-additions)), which is
 larger and used less often.
 
+### Index templates by SHA-256
+
+When the [`index` template](#the-index-template) uses `{sha256-checksum}`
+or `{sha256-prefix}`, `collections.json` is how a client finds index files,
+not just a shortcut:
+
+- **Every entry MUST have `sha256`.** A client treats an entry without one
+  as an error for that collection, as it can't say where its file is.
+- **A client MUST read `collections.json` before any index file**, and
+  can't fetch a file for a collection it doesn't list. A collection that
+  isn't listed isn't in the index, without probing for a 404.
+- **It's the only file that changes**, apart from `config.json`, so how
+  fresh it is decides how fresh the whole index is to a client. A stale
+  copy only names older index files, which the index still keeps, so a
+  client sees an older index, never a mix of old and new.
+- **A changed collection gets a new `sha256` and a new URL.** A downstream
+  mirror that polls `updated` fetches the file the new `sha256` names, and
+  can reuse the `sha256` rather than hash the file again if it publishes
+  the same bytes.
+
 ## Index files
 
-Path: `<formats.<n>.index><namespace>/<name>.jsonl`, e.g.
-`index/community/general.jsonl`.
+Each collection's index file is where the
+[`index` template](#the-index-template) in `config.json` says: by name, such
+as `index/community/general.jsonl`, or by SHA-256, such as
+`index/59/59976e13….jsonl`.
 
 Each line describes one version of the collection. Lines appear in **order of
 publication**, so clients MUST NOT assume they're sorted by version.
@@ -365,28 +434,35 @@ added later as an optional field without a format version change.
 
 ## HTTP behaviour
 
-- **Caching:** index files and `collections.json` SHOULD be served with a
-  short `Cache-Control` (e.g. `max-age=60`) and an `ETag`. Clients SHOULD
-  revalidate with `If-None-Match` on every resolve, unless running offline,
-  except for index files whose `sha256` shows the cached copy is current (see
-  [Cached index files](#cached-index-files)). Artifacts are immutable and
-  SHOULD be served with `Cache-Control: public, max-age=31536000, immutable`.
-- **Query strings:** an index host MUST serve index files the same whatever
-  query string is added, and MUST NOT leave the query string out of the
-  cache key for them. Clients rely on a fresh query string to get past a
-  stale cached copy.
+- **Caching:** `config.json`, `collections.json` and index files found by
+  name SHOULD be served with a short `Cache-Control` (e.g. `max-age=60`) and
+  an `ETag`. Clients SHOULD revalidate with `If-None-Match` on every
+  resolve, unless running offline, except for index files whose `sha256`
+  shows the cached copy is current (see
+  [Cached index files](#cached-index-files)). Index files found by SHA-256,
+  and artifacts, never change and SHOULD be served with
+  `Cache-Control: public, max-age=31536000, immutable`. These are advice:
+  clients don't depend on any lifetime.
+- **Query strings:** an index host MUST serve `collections.json` and index
+  files found by name the same whatever query string is added, and MUST
+  NOT leave the query string out of the cache key for them. Clients rely on
+  a fresh query string to get past a stale cached copy.
 - **Purging:** an index behind a CDN SHOULD purge each changed file from the
   CDN when it publishes, in the [publishing order](#publishing-order). This
-  shrinks the window in which clients see stale data from the `max-age` to
-  however long the purge takes to spread. Purging only reaches the CDN, not
-  proxies or browsers after it, so the `Cache-Control` sent to clients stays
-  short either way.
+  shrinks the window in which clients see stale data from the CDN's
+  lifetime to however long the purge takes to spread. Purging only reaches
+  the CDN, not proxies or browsers after it, so the `max-age` sent to
+  clients stays short either way; a longer `s-maxage` for the CDN alone
+  bounds how stale a failed purge leaves it. Index files found by SHA-256
+  are never replaced, so there's nothing to purge for them.
 - **Compression:** clients SHOULD send `Accept-Encoding` (gzip, br, zstd).
   Servers MAY compress. Index files compress well.
 - **Content-Type:** clients MUST NOT depend on it.
-- **Not found:** a `404`, `410` or `451` for an index file means the
-  collection doesn't exist in this index. Clients MAY cache that briefly.
-  Other errors are failures, not "not found".
+- **Not found:** a `404`, `410` or `451` for an index file found by name
+  means the collection doesn't exist in this index. Clients MAY cache that
+  briefly. For one found by SHA-256, see
+  [Cached index files](#cached-index-files). Other errors are failures,
+  not "not found".
 - **Redirects:** clients MUST follow redirects, but MUST NOT follow one from
   `https` to `http`.
 - **Authentication** is the host's concern, not the format's. The public
@@ -464,12 +540,21 @@ Each index file the resolve needs is then handled by comparing the listing's
 2. **They differ, there's no cached copy, or the listing has no `sha256`:** the
    client fetches the file as usual, revalidating any cached copy with
    `If-None-Match`.
-3. **The fetched file's SHA-256 still differs from the listing's:** a cache
-   between the client and the index served an old copy (for up to the
-   file's `max-age` after a change), or the listing is the older of the two.
-   The client SHOULD fetch once more with a query string nobody could
-   predict, such as `?r=<16 random hex characters>`, which no cache holds,
-   and then use whatever it gets.
+3. **The fetched file's SHA-256 still differs from the listing's:** for a
+   file found by name, a cache between the client and the index served an
+   old copy (for up to the file's `max-age` after a change), or the listing
+   is the older of the two. The client SHOULD fetch once more with a query
+   string nobody could predict, such as `?r=<16 random hex characters>`,
+   which no cache holds, and then use whatever it gets. For a file found by
+   SHA-256, the file isn't the one its URL names, and the client MUST treat
+   it as an error.
+
+For an index whose template finds files by SHA-256, a collection
+`collections.json` doesn't list isn't in the index, without a request, as
+nothing else says where its file would be. A `404` for a listed file means
+the client's `collections.json` is older than the index keeps replaced files
+for: the client SHOULD fetch `collections.json` once more past any cache, as
+above, and try the file it names now, and fail if that's also missing.
 
 The client caches each file with the hash of its own bytes, never the
 listing's value, and MUST NOT treat a cached file as current on the strength
@@ -477,16 +562,19 @@ of `updated` alone. Both rules matter for the same reason: anyone can make a
 CDN cache old content under a URL they choose, including one with a future
 `updated` in its query, but nobody can make old content hash to the new
 value. A client that follows them can be served stale data for one resolve,
-inside the `max-age` window, but never gets stuck on it.
+inside the `max-age` window, but never gets stuck on it. Files found by
+SHA-256 can't be stale at all: only `collections.json` can be.
 
 ### Publishing order
 
 So that a client which sees a new `sha256` or `updated` can fetch the content
 it describes, whatever writes an index MUST write a changed index file
 before the `collections.json` that describes it. An index served through a
-CDN it can purge SHOULD purge the changed index files between the two
-writes, and purge `collections.json` after it. See
-[HTTP behaviour](#http-behaviour).
+CDN it can purge SHOULD purge the changed index files found by name between
+the two writes, and purge `collections.json` after it. See
+[HTTP behaviour](#http-behaviour). With files found by SHA-256, a stale
+`collections.json` only names older files, which the index still keeps, so
+a client sees an older index but never a mix of old and new.
 
 ## Planned additions
 

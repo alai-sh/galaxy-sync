@@ -31,7 +31,9 @@ uses:
 5. **Deprecation** is copied from the collection onto every line.
 
 Writes go artifacts, then index files, then aggregate files, so the index
-never points at an artifact that isn't there.
+never points at an artifact that isn't there. Each index file is published
+by its sha256 before state points at it ([storage](storage.md#index-files)),
+so `collections.json` never names one that isn't published.
 
 Reconcile also re-extracts mirrored versions whose stored extraction is
 missing or older than `plugins.EXTRACTION_FORMAT`, so extractor fixes reach
@@ -53,26 +55,29 @@ What to reconcile is kept in `state.json` (`pending`), not in the run. A run
 that's stopped, times out or crashes loses nothing, and every run does the
 same work, so it doesn't matter which run picks it up. Each `sync`:
 
-1. **Finds changes** (below) and queues them, then saves the feed cursor.
+1. **Moves index files** to the sha256 layout, for a store from before it,
+   and does nothing else until that's done
+   ([storage](storage.md#index-files)).
+2. **Finds changes** (below) and queues them, then saves the feed cursor.
    Something found is saved in the queue before the cursor moves past it.
-2. **Takes requests.** `refresh` doesn't reconcile anything itself. It writes
+3. **Takes requests.** `refresh` doesn't reconcile anything itself. It writes
    a request object under `requests/` in the state bucket, which the next
    sync queues and deletes. A request names collections or namespaces,
    asks for a sweep, a rebuild or a new artifact URL template, or
    acknowledges conflicts. A namespace that can't be listed keeps its
    request for the next run.
-3. **Works what was requested,** ahead of everything else: the requested
+4. **Works what was requested,** ahead of everything else: the requested
    collections, then any rebuild ([below](#rebuilds)).
-4. **Checks ansible-core** once a day ([below](#ansiblebuiltin)).
-5. **Sweeps** once a day (below), queueing everything that differs. It comes
+5. **Checks ansible-core** once a day ([below](#ansiblebuiltin)).
+6. **Sweeps** once a day (below), queueing everything that differs. It comes
    after the requested work, since it can take most of the budget,
    and isn't started once the budget has run out: it runs to the end once
    started, so the next run does it instead.
-6. **Works the rest of the queue** in order: new uploads, then what the
+7. **Works the rest of the queue** in order: new uploads, then what the
    listing and the sweep found, which includes the initial import's backlog.
    Collections with outstanding failures come last. A collection leaves the
    queue once reconciled; one that ran out of time part way stays queued.
-7. **Stops starting new work** once `--budget` minutes (default 45) have
+8. **Stops starting new work** once `--budget` minutes (default 45) have
    passed since the run started, sweep included. That applies to requested
    collections too, so a requested collection too big for one run carries on
    in the next, still first in the queue. The run then writes the aggregate
@@ -223,8 +228,7 @@ the private state bucket.
 
 `refresh --rebuild` asks for every file derived from the index to be
 regenerated, without contacting Galaxy: each collection's plugin lines from
-its index file and stored extractions, its index file's `sha256` in state,
-the public conflict records, and `ansible.builtin`, extracted again. It's
+its index file and stored extractions, the public conflict records, and `ansible.builtin`, extracted again. It's
 for a change to how those are derived; a change to extraction itself bumps
 `plugins.EXTRACTION_FORMAT` instead, which reconcile handles.
 
@@ -277,7 +281,7 @@ Recorded failures exit 0; `--strict` exits 1.
 | `extract_error` | Extraction failed; the version is still mirrored and re-extracted on later reconciles |
 | `deletions_suspected` | Galaxy publishes fewer versions than the mirror last saw |
 | `unexpected` | Any other exception while reconciling a collection |
-| `cdn_purge` | Purging changed index files from the CDN failed ([CDN purging](storage.md#cdn-purging)) |
+| `cdn_purge` | Purging changed index bucket files from the CDN failed ([CDN purging](storage.md#cdn-purging)) |
 | `pypi_unavailable`, `pypi_http_<code>` | PyPI couldn't be read for ansible-core ([ansible.builtin](#ansiblebuiltin)); `sha256_mismatch` and `extract_error` are recorded for its sdist too |
 
 Failures of the Galaxy-wide checks are recorded under the collection `*`,

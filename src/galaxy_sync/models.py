@@ -190,7 +190,7 @@ class VersionState(TypedDict):
 class CollectionState(TypedDict):
     versions: dict[str, VersionState]
     updated: NotRequired[str]
-    sha256: NotRequired[str]  # of the index file as stored, for collections.json
+    sha256: NotRequired[str]  # of its index file, the key it's published under; none until it has one
     upstream_updated: NotRequired[str]
     upstream_deprecated: NotRequired[bool]
     upstream_count: NotRequired[int]  # versions Galaxy listed at the last reconcile
@@ -251,6 +251,10 @@ class RebuildState(TypedDict):
     after: NotRequired[str]  # the last collection rebuilt, in (namespace, name) order
 
 
+class MigrationState(TypedDict):
+    after: NotRequired[str]  # the last collection moved to the sha256 layout, in (namespace, name) order
+
+
 class SyncState(TypedDict):
     collections: dict[str, CollectionState]
     conflicts: list[Conflict]
@@ -263,6 +267,10 @@ class SyncState(TypedDict):
     plugins_pending: NotRequired[list[str]]  # collections whose plugin lines aren't in plugins.jsonl yet
     builtin: NotRequired[BuiltinState]
     rebuild: NotRequired[RebuildState]  # a requested rebuild that isn't finished yet
+    index_files: NotRequired[str]  # "sha256" once index files are published by their sha256
+    migration: NotRequired[MigrationState]  # moving index files to that layout, until it's done
+    retired_index_files: NotRequired[dict[str, str]]  # index bucket keys no listing names, and since when
+    last_prune: NotRequired[str]  # when retired index files were last pruned
 
 
 # requests/ in the state bucket.

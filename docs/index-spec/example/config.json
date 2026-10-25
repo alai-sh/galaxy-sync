@@ -1,7 +1,7 @@
 {
   "formats": {
     "1": {
-      "index": "index/",
+      "index": "index/{namespace}/{name}.jsonl",
       "collections": "collections.json",
       "plugins": "plugins.jsonl"
     }

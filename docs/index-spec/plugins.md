@@ -19,7 +19,7 @@ in the [index format](README.md#conventions).
 An optional `plugins` path in the format's entry in `config.json`:
 
 ```json
-"formats": {"1": {"index": "index/", "collections": "collections.json", "plugins": "plugins.jsonl"}}
+"formats": {"1": {"index": "index/{namespace}/{name}.jsonl", "collections": "collections.json", "plugins": "plugins.jsonl"}}
 ```
 
 If it's absent, the index has no plugin index. Clients that don't support

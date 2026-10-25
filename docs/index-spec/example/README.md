@@ -50,7 +50,7 @@ index/
 
 ## Walkthrough: installing `alai_example.demo`
 
-1. `GET config.json` gives format `1`, index path `index/`, and the `dl`
+1. `GET config.json` gives format `1`, index template `index/{namespace}/{name}.jsonl`, and the `dl`
    template.
 2. `GET collections.json` shows that this index has `alai_example.demo`, so
    it, and all its dependencies, resolve from this index.

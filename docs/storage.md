@@ -7,7 +7,7 @@ bucket.
 
 | Bucket | Local directory | Served as | Cache |
 |---|---|---|---|
-| Index | `index-root/` | `index.alai.sh` | Short (`max-age=60`) with ETags |
+| Index | `index-root/` | `index.alai.sh` | `public, max-age=60, s-maxage=600, stale-while-revalidate=86400` with ETags, but `public, max-age=31536000, immutable` for `index/` |
 | Artifacts | `dl-root/` | `dl.alai.sh` | `public, max-age=31536000, immutable` |
 | State | `state/` | Private | |
 
@@ -20,10 +20,10 @@ it holds, so editing `config.json` by hand works too.
 
 ```
 index bucket
-  config.json                  formats, artifact URL template, moved-to
+  config.json                  formats, index file and artifact URL templates, moved-to
   collections.json             every collection, when its index file last changed and its sha256
   plugins.jsonl                the plugin index
-  index/<ns>/<name>.jsonl      one line per version
+  index/<aa>/<sha256>.jsonl    each collection's index file, one line per version, by its sha256
   conflicts/<ns>/<name>.json   every conflict a collection has had, for audit
 
 artifact bucket
@@ -43,6 +43,46 @@ The formats clients read are specified in [index-spec/](index-spec/README.md).
 Every write is skipped when the stored content is already the same, so an
 unchanged run writes nothing.
 
+## Index files
+
+Each collection's index file is published once, by its sha256:
+`index/<aa>/<sha256>.jsonl` in the index bucket. Clients find it through the
+template `index/{sha256-prefix}/{sha256-checksum}.jsonl` in `config.json`
+and the collection's sha256 in `collections.json`; the sync finds it through
+the same sha256 in `state.json` (`collections.<ns.name>.sha256`), which is
+what `collections.json` is written from. A published file never changes, so
+it's cached for a year, like an artifact, and never purged.
+
+When a file changes, the new one is published, then state points at it.
+Nothing is overwritten: a published file stays until pruned. A run that
+stops before saving state leaves it pointing at the file it was replacing,
+so `collections.json` never names one that isn't published, and the next
+run reconciles that collection again from there: what it had mirrored since
+state was last saved, at most 100 versions, is downloaded again. A second
+copy by name, in the state bucket, would avoid that, for a GET and PUT more
+on every change; a run stopping part way is rare enough not to.
+
+**Pruning.** Once a day, a run that writes `collections.json` lists the
+index bucket's `index/` and retires each file that listing doesn't name,
+recording when in `state.json` (`retired_index_files`). One still retired
+7 days later (`store.RETIRED_GRACE`) is deleted; one named again, as when a
+yank is undone, stops being retired. The spec asks for 7 days, far longer
+than any copy of `collections.json` lives in a cache, so a client holding an
+older one still finds the files it names. Pruning also clears files left by
+a run that stopped, and the old files by name from before this layout.
+
+**Moving to this layout.** Index files used to be published by name in the
+index bucket, which was also the copy the sync read. The first sync of a
+store like that moves them before doing anything else, as nothing can be
+reconciled until state points at them: for each collection, in
+(namespace, name) order, it publishes the file by its sha256 and points
+state at it, keeping its place in `state.json` (`migration.after`)
+so a run that runs out of budget carries on in the next. Once every file is
+moved, it sets `index_files` and writes `config.json`, `plugins.jsonl` and
+`collections.json` even where unchanged, so they get the new Cache-Control.
+The old files are left for pruning, a week later. Remove this once the
+stored index has been moved.
+
 ## state.json
 
 | Key | Meaning |
@@ -52,9 +92,13 @@ unchanged run writes nothing.
 | `last_sweep` | When the last sweep finished; the next is due a day later |
 | `builtin` | The daily ansible-core check: `checked`, and the `version` and `format` (`EXTRACTION_FORMAT`) `builtin.jsonl` was extracted with |
 | `rebuild` | A requested rebuild that isn't finished: `requested`, and `after`, the last collection done |
+| `index_files` | `sha256` once index files are published by their sha256 ([index files](#index-files)) |
+| `migration` | Moving index files to that layout, until it's done: `after`, the last collection moved |
+| `retired_index_files` | Index bucket keys under `index/` that no `collections.json` names, and when a prune first found each |
+| `last_prune` | When retired index files were last pruned; the next is due a day later |
 | `plugins_pending` | Collections reconciled since `plugins.jsonl` was last merged; normally empty between runs |
 | `pending.<ns.name>` | The queue: `source` (`requested`, `uploaded`, `listed` or `swept`), `queued`, `revalidate` if asked for, and what change detection saw, so a reconcile that changes nothing can say why it ran: `uploads` (versions the upload feed saw), `unseen` (mirrored versions the sweep didn't see) and `reasons` (e.g. `updated_at changed` from the listing, `gone: 1.1.0` from the sweep) |
-| `collections.<ns.name>` | Per collection: `updated` (when its index file last changed), `sha256` (of its index file as stored, so writing `collections.json` reads no index files; one missing is filled in from the file, and a rebuild takes every one from its file), `upstream_updated`, `upstream_deprecated` and `upstream_count` (Galaxy's values at the last reconcile), `unindexed` (versions Galaxy serves that its search index leaves out), and `versions.<v>` with `created_at` and the cached `upstream` comparison verdict |
+| `collections.<ns.name>` | Per collection: `updated` (when its index file last changed), `sha256` (of its index file, the key it's published under: the only record of which file is the collection's; a collection without one has no index file), `upstream_updated`, `upstream_deprecated` and `upstream_count` (Galaxy's values at the last reconcile), `unindexed` (versions Galaxy serves that its search index leaves out), and `versions.<v>` with `created_at` and the cached `upstream` comparison verdict |
 | `failures` | The failure ledger, keyed `<ns.name>@<version>#<kind>`: `collection`, `version`, `kind`, `message`, `first_seen`, `last_seen`, `attempts`, and `alerted` once it was notified as persistent |
 | `conflicts` | Versions where Galaxy serves different contents from the mirror ([conflicts](sync.md#conflicts)): `collection`, `version`, `ours`, `opened`, `observed` (each differing artifact: `sha256`, `uploaded`, `seen`, `changes` and `saved`, its key in this bucket), `acknowledged` (`at` and `note`) once a person has, and `resolved` once Galaxy serves our contents again. At most one is open per version, and none is ever removed |
 
@@ -85,24 +129,34 @@ cache to expire. Setting some but not all of them is an error.
 
 The backend uses R2's S3 API. Each bucket's objects get its Cache-Control
 from the table above (`private, no-store` for state), and a Content-Type by
-extension: JSON for `.json`, plain text for `.jsonl`. `state.json` is saved with a conditional write
+extension: JSON for `.json`, plain text for `.jsonl`. The index bucket's `index/` gets the
+artifacts' Cache-Control instead. `state.json` is saved with a conditional write
 (`If-Match` on the ETag of what the run read), so two runs can never both
 save it.
 
 ## CDN purging
 
-Cloudflare caches the index bucket's files for their `max-age` (60
-seconds). So that clients see a change as soon as the purge spreads,
-`sync` purges every index bucket file it changed, in the
+Cloudflare caches the index bucket's files that change (`config.json`,
+`collections.json`, `plugins.jsonl` and the conflict records) for their
+`s-maxage`, 10 minutes, and browsers and other caches for their `max-age`,
+a minute, which no purge reaches. With `stale-while-revalidate`, the first
+request after Cloudflare's copy expires gets it at once while Cloudflare
+checks R2 behind it. So that clients see a change as soon as the purge
+spreads, `sync` purges every one of those files it changed, in the
 order [the spec](index-spec/README.md#publishing-order) asks:
 `collections.json` is written last, the other changed files are purged
-before it's written, and it's purged after. Only the index bucket is
-purged.
+before it's written, and it's purged after. Index files are never purged:
+each is published under a new key. Only the index bucket is purged.
 
-A failed purge doesn't stop the run, and isn't retried, since the old
-files expire within a minute anyway. It's recorded in the failure ledger
-as `*` / `purge` / `cdn_purge` and cleared by the next purge that works,
-so a token that's expired or been revoked shows up on the tracking issue.
+10 minutes is the sync's schedule (`*/10` in `scheduler/wrangler.toml`), so
+a failed purge leaves Cloudflare at most one sync behind; change
+`storage.INDEX_CACHE` with the schedule. A failed purge doesn't stop the
+run, and isn't retried, since the old files expire by then anyway. A stale
+`collections.json` only names older index files, which are kept for a week,
+so clients see an older index, never a broken one. It's recorded in the
+failure ledger as `*` / `purge` / `cdn_purge` and cleared by the next purge
+that works, so a token that's expired or been revoked shows up on the
+tracking issue.
 
 ### The purge token
 
@@ -181,7 +235,10 @@ works on:
 - **Unchanged writes are skipped** by reading each object first. Mirroring a
   version takes two calls: `HEAD` and `PUT` for the artifact (the `HEAD`
   skips re-uploading one left by a run that stopped before writing its
-  index file).
+  index file). A changed index file is one `PUT`, as it was by name; an
+  unchanged one is told by its sha256 in state, without a request.
+- **Pruning lists the index bucket once a day**, one request per thousand
+  index files, rather than on every run.
 - **A run with nothing to do** reads `config.json` and `state.json`, lists
   `requests/`, and writes nothing.
 
