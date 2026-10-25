@@ -6,10 +6,6 @@ on:
         description: Artifact URL template; empty for the default
         type: string
         default: ""
-      ansible_core_ref:
-        description: An ansible-core tag or branch to re-extract ansible.builtin from; empty to keep it
-        type: string
-        default: ""
       galaxy_view:
         description: Also rewrite the Galaxy view, which is most of a rebuild's time; untick to only update the plugin index (needs dl empty)
         type: boolean
@@ -45,14 +41,6 @@ jobs:
         ref: ${{ vars.GALAXY_SYNC_REF }}
         persist-credentials: false
 
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      if: inputs.ansible_core_ref != ''
-      with:
-        repository: ansible/ansible
-        ref: ${{ inputs.ansible_core_ref }}
-        path: ansible-core
-        persist-credentials: false
-
     - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
 
     # A rebuild can't share the sync's concurrency group: the next dispatched
@@ -82,9 +70,6 @@ jobs:
         args=()
         if [ -n "$DL" ]; then
           args+=(--dl "$DL")
-        fi
-        if [ -d ansible-core ]; then
-          args+=(--builtin ansible-core)
         fi
         if [ "$GALAXY_VIEW" = "false" ]; then
           args+=(--no-galaxy-view)

@@ -241,7 +241,10 @@ def _module(path, name, version_added):
     (path / f"{name}.py").write_text(f'DOCUMENTATION = "{doc}"\n')
 
 
-def test_rebuild_builtin(run, tmp_path, capsys):
+def test_builtin(galaxy, run, tmp_path, capsys, refresh):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    assert refresh("ns.coll") == 0
+
     src = tmp_path / "ansible"
     modules = src / "lib" / "ansible" / "modules"
     modules.mkdir(parents=True)
@@ -256,18 +259,21 @@ def test_rebuild_builtin(run, tmp_path, capsys):
         "plugin_routing:\n  modules:\n    gone:\n      tombstone:\n        removal_version: '2.10'\n"
     )
     (src / "lib" / "ansible" / "release.py").write_text("__version__ = '2.20.0'\n")
-    store_dir = tmp_path / "store"
-    assert cli.main(["rebuild", "--store", str(store_dir), "--builtin", str(src)]) == 0
+    capsys.readouterr()
+    assert run("builtin", str(src)) == 0
     out = capsys.readouterr().out
     assert "ansible.builtin 2.20.0: 4 entries {'module': 4}, 2 with version_added, 1 routing-only" in out
     assert "unresolved filter/test files: ['plugins/filter/odd.py']" in out
-    assert "rebuilt 0 collections (5 plugin lines)" in out
+    assert "plugin index: 6 lines" in out
 
-    # `since` is each plugin's version_added, not the release extracted.
-    Store(Buckets.local(store_dir), "").write_plugins()
+    # Only ansible.builtin's lines are replaced; `since` is each plugin's
+    # version_added, not the release extracted.
+    plugins = tmp_path / "index-root" / "plugins.jsonl"
+    assert set(_plugin_collections(tmp_path)) == {"ansible.builtin", "ns.coll"}
     lines = {
         line["name"]: line
-        for line in map(json.loads, (store_dir / "index-root" / "plugins.jsonl").read_text().splitlines())
+        for line in map(json.loads, plugins.read_text().splitlines())
+        if line["collection"] == "ansible.builtin"
     }
     assert {name: line.get("since") for name, line in lines.items()} == {
         "gone": None,
@@ -278,12 +284,20 @@ def test_rebuild_builtin(run, tmp_path, capsys):
     }
     assert lines["pong"]["short_description"] == "The pong module"
     assert lines["gone"]["routing"] == {"tombstone": {"removal_version": "2.10"}}
-    assert all(line["collection"] == "ansible.builtin" and "until" not in line for line in lines.values())
+    assert all("until" not in line for line in lines.values())
+
+    # A sync merging plugins.jsonl takes ansible.builtin from builtin.jsonl,
+    # so one that read the file before a `builtin` run can't undo it.
+    plugins.write_text("".join(line for line in plugins.read_text().splitlines(True) if "ansible.builtin" not in line))
+    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
+    assert refresh("ns.coll") == 0
+    assert set(_plugin_collections(tmp_path)) == {"ansible.builtin", "ns.coll"}
+    assert sum(json.loads(line)["collection"] == "ansible.builtin" for line in plugins.read_text().splitlines()) == 5
 
 
 def test_usage_errors(run, tmp_path, capsys, monkeypatch):
     with pytest.raises(SystemExit) as e:
-        run("rebuild", "--builtin", str(tmp_path / "missing.tar.gz"))
+        run("builtin", str(tmp_path / "missing.tar.gz"))
     assert e.value.code == 2
     assert "can't extract" in capsys.readouterr().err
 

@@ -292,7 +292,8 @@ The workflows are in `.github/workflows/`:
 |---|---|---|
 | `sync.yml` | dispatched every 10 minutes by the scheduler; runs once `GALAXY_SYNC_REF` is set | `sync --report --alerts`, then the tracking issue update, the notification and the heartbeat |
 | `refresh.yml` | manual, with targets and `revalidate` | `refresh`, which only writes a request |
-| `rebuild.yml` | manual, with `dl`, an ansible-core ref and `galaxy_view` | pauses syncs by disabling `sync.yml`, waits for a running sync, `rebuild`, resumes; syncs already paused by hand stay paused |
+| `rebuild.yml` | manual, with `dl` and `galaxy_view` | pauses syncs by disabling `sync.yml`, waits for a running sync, `rebuild`, resumes; syncs already paused by hand stay paused |
+| `builtin.yml` | manual, with an ansible-core tag | `builtin`, alongside any sync: it writes only `builtin.jsonl` and `plugins.jsonl`, and a sync's merge takes `ansible.builtin` from `builtin.jsonl` |
 
 GitHub's `schedule` trigger runs late or not at all too often to rely on, so
 `sync.yml` has none. A Cloudflare Worker with a cron trigger, in

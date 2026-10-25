@@ -697,17 +697,21 @@ class Store:
         )
 
     def write_plugins(self) -> int:
-        """Merge the collections reconciled since the last merge into plugins.jsonl; returns its line count.
+        """Merge ansible.builtin and the collections reconciled since the last merge into plugins.jsonl.
 
-        Reads only plugins.jsonl, and for a collection reconciled by a run that
-        stopped before merging, its index file and extractions. A store
-        without plugins.jsonl gets it built from every collection's.
+        Returns its line count. Reads only plugins.jsonl, builtin.jsonl, and
+        for a collection reconciled by a run that stopped before merging, its
+        index file and extractions. A store without plugins.jsonl gets it
+        built from every collection's. ansible.builtin's lines are always
+        taken from builtin.jsonl, so a `builtin` run that overlapped a sync
+        can't be undone by it.
         """
         if (merged := self.index.read("plugins.jsonl")) is None:
             return self.merge_plugins()
-        pending = set(self.state.get("plugins_pending", []))
-        lines = [line for line in cast(list[PluginLine], _read_jsonl(merged)) if line["collection"] not in pending]
-        for fqcn in pending:
+        replaced = set(self.state.get("plugins_pending", [])) | {"ansible.builtin"}
+        lines = self.load_builtin()
+        lines.extend(line for line in cast(list[PluginLine], _read_jsonl(merged)) if line["collection"] not in replaced)
+        for fqcn in replaced - {"ansible.builtin"}:
             lines.extend(self._collection_plugins(fqcn))
         return self._write_plugins(lines)
 

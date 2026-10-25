@@ -6,6 +6,8 @@
     refresh    ask the next sync to reconcile NS[.NAME] first, to sweep, or
                to acknowledge a conflict
     rebuild    regenerate the files derived from the index
+    builtin    re-extract ansible.builtin from an ansible-core release into
+               the plugin index
 
 Recorded failures and conflicts don't fail a run; they're reported in
 failures.json in the state bucket and, through --report and --alerts, on a
@@ -672,6 +674,16 @@ def _extract_builtin(store: Store, src: Path) -> None:
         print(f"  unresolved filter/test files: {unresolved}")
 
 
+def cmd_builtin(args: argparse.Namespace) -> int:
+    """Re-extract ansible.builtin and replace its lines in plugins.jsonl."""
+    store = _open_store(args)
+    _extract_builtin(store, args.src)
+    plugins = store.write_plugins()
+    store.purge()
+    print(f"plugin index: {plugins} lines")
+    return 0
+
+
 def cmd_rebuild(args: argparse.Namespace) -> int:
     """Regenerate every file derived from the index, without contacting Galaxy."""
     if args.dl and not args.galaxy_view:
@@ -679,8 +691,6 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
     store = _open_store(args)
     if args.galaxy_view:
         store.dl_url = args.dl or DEFAULT_DL  # rebuild is the one place the artifact URL changes
-    if args.builtin is not None:
-        _extract_builtin(store, args.builtin)
     collections = store.index_collections()
     width = len(str(len(collections)))
     for i, (ns, name) in enumerate(collections):
@@ -785,15 +795,20 @@ def _parser() -> argparse.ArgumentParser:
         help="artifact URL template for config.json and the Galaxy view (default: the dl.alai.sh one)",
     )
     _ = p.add_argument(
-        "--builtin", type=Path, metavar="SRC", help="re-extract ansible.builtin from this checkout or sdist"
-    )
-    _ = p.add_argument(
         "--no-galaxy-view",
         dest="galaxy_view",
         action="store_false",
         help="leave the Galaxy view and the artifact URL template as they are; much faster",
     )
     p.set_defaults(func=cmd_rebuild)
+
+    p = sub.add_parser(
+        "builtin",
+        parents=[storage],
+        help="re-extract ansible.builtin from an ansible-core checkout or sdist into the plugin index",
+    )
+    _ = p.add_argument("src", type=Path, metavar="SRC")
+    p.set_defaults(func=cmd_builtin)
     return parser
 
 

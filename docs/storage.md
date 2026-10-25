@@ -42,7 +42,7 @@ state bucket
   state.json                   cursors, the queue, per-collection state, the failure ledger, conflicts
   requests/<time>-<id>.json    `refresh` requests (reconcile, sweep or acknowledge) waiting for the next sync
   failures.json                the failure report
-  builtin.jsonl                ansible.builtin's plugin lines (rebuild --builtin)
+  builtin.jsonl                ansible.builtin's plugin lines (`builtin`)
   extract/<ns>/<name>.json.zst each collection's stored extractions, by artifact sha256
   conflicts/<aa>/<sha256>.tar.gz  Galaxy's artifact for each conflict
 ```
@@ -175,7 +175,8 @@ works on:
 - **`plugins.jsonl`** is patched, not rebuilt. Reconcile works out each
   collection's plugin lines from the extractions it already read, and
   queues the collection in `plugins_pending`. The run ends by reading
-  `plugins.jsonl`, replacing those collections' lines and writing it back.
+  `plugins.jsonl`, replacing those collections' lines, and
+  `ansible.builtin`'s with `builtin.jsonl`, and writing it back.
   A collection left pending by a run that stopped before merging has its
   lines worked out again from its index file and extractions. Only
   `rebuild` reads every collection's (~4.6k of each once the mirror is
