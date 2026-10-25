@@ -29,16 +29,8 @@ jobs:
       contents: read
       issues: write
     steps:
-    # The release to run, not main: see "Releases" in docs/sync.md.
-    - name: Check the release
-      env:
-        REF: ${{ vars.GALAXY_SYNC_REF }}
-      run: |
-        if [ -z "$REF" ]; then
-          echo "::error::set the GALAXY_SYNC_REF repository variable to the tag to run"
-          exit 1
-        fi
-
+    # The release to run, not main: see "Releases" in docs/sync.md. The job's
+    # `if` skips the run until it's set.
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
         ref: ${{ vars.GALAXY_SYNC_REF }}
@@ -54,7 +46,6 @@ jobs:
         R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         ALAI_INDEX_BUCKET: ${{ vars.ALAI_INDEX_BUCKET }}
         ALAI_DL_BUCKET: ${{ vars.ALAI_DL_BUCKET }}
-        ALAI_GALAXY_BUCKET: ${{ vars.ALAI_GALAXY_BUCKET }}
         ALAI_STATE_BUCKET: ${{ vars.ALAI_STATE_BUCKET }}
         CLOUDFLARE_PURGE_TOKEN: ${{ secrets.CLOUDFLARE_PURGE_TOKEN }}
         CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}

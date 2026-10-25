@@ -43,11 +43,9 @@ def test_local_buckets_layout(tmp_path):
     buckets = Buckets.local(tmp_path)
     buckets.index.write("config.json", b"{}")
     buckets.dl.write("sha256/aa/x.tar.gz", b"")
-    buckets.galaxy.write("api/index.json", b"{}")
     buckets.state.write("state.json", b"{}")
     assert (tmp_path / "index-root" / "config.json").is_file()
     assert (tmp_path / "dl-root" / "sha256" / "aa" / "x.tar.gz").is_file()
-    assert (tmp_path / "galaxy-root" / "api" / "index.json").is_file()
     assert (tmp_path / "state" / "state.json").is_file()
 
 
@@ -65,19 +63,13 @@ R2_ENVIRON = {
     "R2_SECRET_ACCESS_KEY": "s3cret",
     "ALAI_INDEX_BUCKET": "alai-index",
     "ALAI_DL_BUCKET": "alai-dl",
-    "ALAI_GALAXY_BUCKET": "alai-galaxy",
     "ALAI_STATE_BUCKET": "alai-sync-state",
 }
 
 
 def test_r2_config_from_env():
     config = R2Config.from_env(R2_ENVIRON)
-    assert (config.account_id, config.index_bucket, config.galaxy_bucket, config.state_bucket) == (
-        "acct",
-        "alai-index",
-        "alai-galaxy",
-        "alai-sync-state",
-    )
+    assert (config.account_id, config.index_bucket, config.state_bucket) == ("acct", "alai-index", "alai-sync-state")
     assert "s3cret" not in repr(config)
 
 
@@ -123,9 +115,9 @@ def test_r2_read(r2):
 def test_r2_write_sets_headers(r2):
     backend, stub = r2
     stub.add_response("put_object", {}, _put("index/ns/coll.jsonl", b"x", "text/plain; charset=utf-8"))
-    stub.add_response("put_object", {}, _put("api/v3/index.html", b"{}", "application/json"))
+    stub.add_response("put_object", {}, _put("collections.json", b"{}", "application/json"))
     backend.write("index/ns/coll.jsonl", b"x")
-    backend.write("api/v3/index.html", b"{}")
+    backend.write("collections.json", b"{}")
 
 
 def test_r2_replace_is_conditional(r2):

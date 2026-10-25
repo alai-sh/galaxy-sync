@@ -1,6 +1,6 @@
 // Starts sync.yml every 10 minutes with a workflow_dispatch, because GitHub's
 // own schedule trigger is late or skipped too often. Overlap is still handled
-// by the workflow's concurrency group, and a sync paused by rebuild.yml (the
+// by the workflow's concurrency group, and a sync paused by hand (the
 // workflow disabled) is skipped here. See "Scheduling" in docs/sync.md.
 
 const API_VERSION = "2022-11-28";

@@ -10,6 +10,7 @@ REPO_METADATA = "/api/v3/plugin/ansible/content/published/collections/"
 SEARCH = "/api/v3/plugin/ansible/search/collection-versions/"
 FEED = SEARCH + "?repository_name=published&order_by=-pulp_created&limit=100"
 COUNT = SEARCH + "?repository_name=published&limit=1"
+PYPI = "/pypi/ansible-core/json"
 
 
 def feed_row(ns, name, version, created):

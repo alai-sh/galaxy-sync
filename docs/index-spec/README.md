@@ -495,10 +495,6 @@ fields in `config.json`:
 
 - **Catalog:** every collection with its description, links and tags, for
   search.
-- **Galaxy v3 view:** a static copy of the Galaxy v3 endpoints that
-  `ansible-galaxy` reads, so existing tooling can use the mirror. It lives on
-  its own host rather than in the index; the galaxy-sync draft is in
-  [`../galaxy-v3-view.md`](../galaxy-v3-view.md).
 
 ## Differences from Cargo
 

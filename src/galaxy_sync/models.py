@@ -90,6 +90,26 @@ class GalaxySearchPage(TypedDict):
     meta: GalaxyCount
 
 
+# PyPI's JSON API, for ansible-core releases.
+
+
+class PyPIDigests(TypedDict):
+    sha256: str
+
+
+class PyPIFile(TypedDict):
+    """One file of a release in PyPI's JSON API (`/pypi/<project>/json`)."""
+
+    packagetype: str  # "sdist" or "bdist_wheel"
+    url: str
+    digests: PyPIDigests
+    yanked: NotRequired[bool]
+
+
+class PyPIProject(TypedDict):
+    releases: dict[str, list[PyPIFile]]
+
+
 # Index and plugin index lines (docs/index-spec/).
 
 
@@ -220,6 +240,17 @@ class Pending(TypedDict):
     unseen: NotRequired[list[str]]  # mirrored versions the sweep didn't see in the upload feed
 
 
+class BuiltinState(TypedDict):
+    checked: str  # when PyPI was last checked for a new ansible-core minor release
+    version: NotRequired[str]  # the ansible-core release builtin.jsonl was extracted from
+    format: NotRequired[int]  # its plugins.EXTRACTION_FORMAT
+
+
+class RebuildState(TypedDict):
+    requested: str
+    after: NotRequired[str]  # the last collection rebuilt, in (namespace, name) order
+
+
 class SyncState(TypedDict):
     collections: dict[str, CollectionState]
     conflicts: list[Conflict]
@@ -230,16 +261,20 @@ class SyncState(TypedDict):
     last_sweep: NotRequired[str]  # when the last full sweep finished
     published_count: NotRequired[int]  # versions Galaxy published at the last count check
     plugins_pending: NotRequired[list[str]]  # collections whose plugin lines aren't in plugins.jsonl yet
+    builtin: NotRequired[BuiltinState]
+    rebuild: NotRequired[RebuildState]  # a requested rebuild that isn't finished yet
 
 
 # requests/ in the state bucket.
 
 
 class Request(TypedDict):
-    """A `refresh` asking the next sync to reconcile collections, or to sweep."""
+    """A `refresh` asking the next sync to reconcile collections, sweep, rebuild or acknowledge conflicts."""
 
     requested: str
     targets: list[str]  # NS or NS.NAME; empty for a sweep, unless it acknowledges
     revalidate: bool
     acknowledge: NotRequired[list[str]]  # NS.NAME:VERSION conflicts to acknowledge, instead of targets
     note: NotRequired[str]  # why, for the acknowledgements
+    rebuild: NotRequired[bool]  # regenerate every file derived from the index, instead of targets
+    dl: NotRequired[str]  # a new artifact URL template for config.json, instead of targets

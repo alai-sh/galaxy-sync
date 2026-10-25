@@ -1,23 +1,20 @@
 # Storage
 
-galaxy-sync writes four buckets. With `--store DIR` (the default, `./out`)
+galaxy-sync writes three buckets. With `--store DIR` (the default, `./out`)
 each is a subdirectory of `DIR`; with `--r2` they're R2 buckets. Clients
-read the index and artifact buckets, `ansible-galaxy` reads the Galaxy view,
-and only the sync reads the state bucket.
+read the index and artifact buckets, and only the sync reads the state
+bucket.
 
 | Bucket | Local directory | Served as | Cache |
 |---|---|---|---|
 | Index | `index-root/` | `index.alai.sh` | Short (`max-age=60`) with ETags |
 | Artifacts | `dl-root/` | `dl.alai.sh` | `public, max-age=31536000, immutable` |
-| Galaxy view | `galaxy-root/` | `galaxy.alai.sh` | Short |
 | State | `state/` | Private | |
 
 `config.json` holds the artifact URL template, so the artifact bucket can
-move without changing clients. It's set by `rebuild --dl TEMPLATE` (or the
-`dl.alai.sh` default on a new store or a plain `rebuild`), which also
-rewrites every Galaxy page's download URL to match; `sync` keeps whatever
-it holds. To try a different location with alai clients
-only, editing `config.json` is enough; the next `rebuild` resets it.
+move without changing clients. A new store starts with the `dl.alai.sh`
+one, and `refresh --dl TEMPLATE` moves it; every other run keeps whatever
+it holds, so editing `config.json` by hand works too.
 
 ## Layout
 
@@ -32,28 +29,19 @@ index bucket
 artifact bucket
   sha256/<aa>/<sha256>.tar.gz  the exact bytes Galaxy published
 
-Galaxy view bucket
-  index.html, api/index.html   API roots
-  api/v3/collections/<ns>/<name>/index.html
-  api/v3/collections/<ns>/<name>/versions/index.html
-  api/v3/collections/<ns>/<name>/versions/<ver>/index.html
-
 state bucket
   state.json                   cursors, the queue, per-collection state, the failure ledger, conflicts
-  requests/<time>-<id>.json    `refresh` requests (reconcile, sweep or acknowledge) waiting for the next sync
+  requests/<time>-<id>.json    `refresh` requests (reconcile, sweep, rebuild, dl or acknowledge) waiting for the next sync
   failures.json                the failure report
-  builtin.jsonl                ansible.builtin's plugin lines (`builtin`)
+  builtin.jsonl                ansible.builtin's plugin lines, from ansible-core's sdist
   extract/<ns>/<name>.json.zst each collection's stored extractions, by artifact sha256
   conflicts/<aa>/<sha256>.tar.gz  Galaxy's artifact for each conflict
 ```
 
-The formats clients read are specified in [index-spec/](index-spec/README.md)
-and [galaxy-v3-view.md](galaxy-v3-view.md). The Galaxy view needs one rewrite
-rule on its host, described there.
+The formats clients read are specified in [index-spec/](index-spec/README.md).
 
 Every write is skipped when the stored content is already the same, so an
-unchanged run writes nothing. A new version's Galaxy page is written
-without that check, since it can't exist yet.
+unchanged run writes nothing.
 
 ## state.json
 
@@ -62,9 +50,11 @@ without that check, since it can't exist yet.
 | `feed_cursor` | `pulp_created` of the newest upload `sync` has seen |
 | `repo_published` | The repo metadata timestamp at the last `sync` |
 | `last_sweep` | When the last sweep finished; the next is due a day later |
+| `builtin` | The daily ansible-core check: `checked`, and the `version` and `format` (`EXTRACTION_FORMAT`) `builtin.jsonl` was extracted with |
+| `rebuild` | A requested rebuild that isn't finished: `requested`, and `after`, the last collection done |
 | `plugins_pending` | Collections reconciled since `plugins.jsonl` was last merged; normally empty between runs |
 | `pending.<ns.name>` | The queue: `source` (`requested`, `uploaded`, `listed` or `swept`), `queued`, `revalidate` if asked for, and what change detection saw, so a reconcile that changes nothing can say why it ran: `uploads` (versions the upload feed saw), `unseen` (mirrored versions the sweep didn't see) and `reasons` (e.g. `updated_at changed` from the listing, `gone: 1.1.0` from the sweep) |
-| `collections.<ns.name>` | Per collection: `updated` (when its index file last changed), `sha256` (of its index file as stored, so writing `collections.json` reads no index files; one missing is filled in from the file, and `rebuild` takes every one from its file), `upstream_updated`, `upstream_deprecated` and `upstream_count` (Galaxy's values at the last reconcile), `unindexed` (versions Galaxy serves that its search index leaves out), and `versions.<v>` with `created_at` and the cached `upstream` comparison verdict |
+| `collections.<ns.name>` | Per collection: `updated` (when its index file last changed), `sha256` (of its index file as stored, so writing `collections.json` reads no index files; one missing is filled in from the file, and a rebuild takes every one from its file), `upstream_updated`, `upstream_deprecated` and `upstream_count` (Galaxy's values at the last reconcile), `unindexed` (versions Galaxy serves that its search index leaves out), and `versions.<v>` with `created_at` and the cached `upstream` comparison verdict |
 | `failures` | The failure ledger, keyed `<ns.name>@<version>#<kind>`: `collection`, `version`, `kind`, `message`, `first_seen`, `last_seen`, `attempts`, and `alerted` once it was notified as persistent |
 | `conflicts` | Versions where Galaxy serves different contents from the mirror ([conflicts](sync.md#conflicts)): `collection`, `version`, `ours`, `opened`, `observed` (each differing artifact: `sha256`, `uploaded`, `seen`, `changes` and `saved`, its key in this bucket), `acknowledged` (`at` and `note`) once a person has, and `resolved` once Galaxy serves our contents again. At most one is open per version, and none is ever removed |
 
@@ -78,7 +68,7 @@ up in a command line, shell history or workflow log:
 | Variable | |
 |---|---|
 | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | A scoped R2 API token |
-| `ALAI_INDEX_BUCKET`, `ALAI_DL_BUCKET`, `ALAI_GALAXY_BUCKET`, `ALAI_STATE_BUCKET` | Bucket names |
+| `ALAI_INDEX_BUCKET`, `ALAI_DL_BUCKET`, `ALAI_STATE_BUCKET` | Bucket names |
 
 Locally, keep them in a gitignored `.env` and run
 `uv run --env-file .env galaxy-sync sync --r2 ...`.
@@ -95,8 +85,7 @@ cache to expire. Setting some but not all of them is an error.
 
 The backend uses R2's S3 API. Each bucket's objects get its Cache-Control
 from the table above (`private, no-store` for state), and a Content-Type by
-extension: JSON for `.json` and the Galaxy view's `index.html` pages, plain
-text for `.jsonl`. `state.json` is saved with a conditional write
+extension: JSON for `.json`, plain text for `.jsonl`. `state.json` is saved with a conditional write
 (`If-Match` on the ETag of what the run read), so two runs can never both
 save it.
 
@@ -104,11 +93,11 @@ save it.
 
 Cloudflare caches the index bucket's files for their `max-age` (60
 seconds). So that clients see a change as soon as the purge spreads,
-`sync` and `rebuild` purge every index bucket file they changed, in the
+`sync` purges every index bucket file it changed, in the
 order [the spec](index-spec/README.md#publishing-order) asks:
 `collections.json` is written last, the other changed files are purged
 before it's written, and it's purged after. Only the index bucket is
-purged; the Galaxy view expires on its own.
+purged.
 
 A failed purge doesn't stop the run, and isn't retried, since the old
 files expire within a minute anyway. It's recorded in the failure ledger
@@ -178,8 +167,8 @@ works on:
   `plugins.jsonl`, replacing those collections' lines, and
   `ansible.builtin`'s with `builtin.jsonl`, and writing it back.
   A collection left pending by a run that stopped before merging has its
-  lines worked out again from its index file and extractions. Only
-  `rebuild` reads every collection's (~4.6k of each once the mirror is
+  lines worked out again from its index file and extractions. Only a
+  rebuild reads every collection's (~4.6k of each once the mirror is
   full) to make them all again.
 - **Extractions are one object per collection**, Zstandard-compressed JSON
   keyed by artifact sha256. Reconcile needs every version's extraction, to
@@ -189,27 +178,21 @@ works on:
   Zstandard's long window finds and gzip's 32 KB one doesn't:
   community.general's 243 versions are 41 MB of JSON, 5.3 MB gzipped and
   0.27 MB as stored.
-- **Unchanged writes are skipped** by reading each object first. A change to
-  a collection reads every one of its existing version pages, which is
-  bounded by the size of the collections that changed. New versions' pages
-  skip the read, so mirroring a version takes three calls: `HEAD` and `PUT`
-  for the artifact (the `HEAD` skips re-uploading one left by a run that
-  stopped before writing its index file), and a `PUT` for the Galaxy page.
+- **Unchanged writes are skipped** by reading each object first. Mirroring a
+  version takes two calls: `HEAD` and `PUT` for the artifact (the `HEAD`
+  skips re-uploading one left by a run that stopped before writing its
+  index file).
 - **A run with nothing to do** reads `config.json` and `state.json`, lists
   `requests/`, and writes nothing.
 
 ## Trying the output locally
 
-Python's own HTTP server serves the Galaxy view and the artifacts the way the
-production host must. On a fresh store, `sync --budget 1` reconciles the
-requested collection first, then works the initial import's backlog until
-the minute is up; the rest stays queued. Point the artifact URLs at the local server with `rebuild --dl`:
+On a fresh store, `sync --budget 1` reconciles the requested collection
+first, then works the initial import's backlog until the minute is up; the
+rest stays queued. The index lands in `out/index-root/` and the artifacts in
+`out/dl-root/`:
 
 ```bash
 uv run galaxy-sync refresh community.library_inventory_filtering_v1
 uv run galaxy-sync sync --budget 1
-uv run galaxy-sync rebuild --dl 'http://127.0.0.1:8766/sha256/{sha256-prefix}/{sha256-checksum}.tar.gz'
-python -m http.server -d out/galaxy-root 8765 &
-python -m http.server -d out/dl-root 8766 &
-ansible-galaxy collection install -s http://127.0.0.1:8765/ community.library_inventory_filtering_v1
 ```

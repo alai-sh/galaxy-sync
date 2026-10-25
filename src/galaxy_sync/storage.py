@@ -1,4 +1,4 @@
-"""Where the sync's output lives: the index, artifact, Galaxy view and state buckets.
+"""Where the sync's output lives: the index, artifact and state buckets.
 
 `Store` reads and writes through one `Backend` per bucket. `LocalBackend` is a
 directory standing in for a bucket, used for tests and local runs.
@@ -106,7 +106,6 @@ class LocalBackend:
 class Buckets:
     index: Backend
     dl: Backend
-    galaxy: Backend
     state: Backend
 
     @classmethod
@@ -115,7 +114,6 @@ class Buckets:
         return cls(
             LocalBackend(root / "index-root"),
             LocalBackend(root / "dl-root"),
-            LocalBackend(root / "galaxy-root"),
             LocalBackend(root / "state"),
         )
 
@@ -125,7 +123,6 @@ class Buckets:
         return cls(
             R2Backend(client, config.index_bucket, INDEX_CACHE),
             R2Backend(client, config.dl_bucket, ARTIFACT_CACHE),
-            R2Backend(client, config.galaxy_bucket, INDEX_CACHE),
             R2Backend(client, config.state_bucket, PRIVATE),
         )
 
@@ -138,11 +135,9 @@ ARTIFACT_CACHE = "public, max-age=31536000, immutable"
 PRIVATE = "private, no-store"
 
 # Clients mustn't depend on Content-Type; these let Cloudflare compress the
-# text and browsers show it. Galaxy view pages are JSON despite their
-# index.html name.
+# text and browsers show it.
 CONTENT_TYPES = {
     ".json": "application/json",
-    ".html": "application/json",
     ".jsonl": "text/plain; charset=utf-8",
     ".tar.gz": "application/gzip",
     ".zst": "application/zstd",
@@ -219,7 +214,6 @@ R2_ENV = {
     "secret_access_key": "R2_SECRET_ACCESS_KEY",
     "index_bucket": "ALAI_INDEX_BUCKET",
     "dl_bucket": "ALAI_DL_BUCKET",
-    "galaxy_bucket": "ALAI_GALAXY_BUCKET",
     "state_bucket": "ALAI_STATE_BUCKET",
 }
 
@@ -231,7 +225,6 @@ class R2Config:
     secret_access_key: str = field(repr=False)
     index_bucket: str
     dl_bucket: str
-    galaxy_bucket: str
     state_bucket: str
 
     @classmethod

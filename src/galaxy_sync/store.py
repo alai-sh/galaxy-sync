@@ -2,7 +2,6 @@
 
     index bucket   config.json, collections.json, plugins.jsonl, index/, conflicts/
     dl bucket      sha256/<aa>/<sha256>.tar.gz
-    galaxy bucket  the static Galaxy v3 view (galaxy_api.py)
     state bucket   state.json, failures.json, builtin.jsonl, extract/, conflicts/, requests/
 
 See docs/storage.md. Writes go through `_write`, which skips objects whose
@@ -16,10 +15,9 @@ import logging
 import secrets
 from collections.abc import Collection, Sequence
 from compression import zstd
-from dataclasses import dataclass
 from typing import cast
 
-from . import galaxy_api, report
+from . import report
 from .cdn import PurgeError, Purger
 from .models import (
     CollectionState,
@@ -38,7 +36,7 @@ from .times import now
 
 log = logging.getLogger(__name__)
 
-# The artifact URL template a new store starts with; `rebuild --dl` changes it.
+# The artifact URL template a new store starts with; `refresh --dl` changes it.
 DEFAULT_DL = "https://dl.alai.sh/sha256/{sha256-prefix}/{sha256-checksum}.tar.gz"
 
 # Ledger "collection" for failures of the Galaxy-wide checks (feed, listing,
@@ -159,15 +157,6 @@ def _fold_conflicts(state: SyncState) -> bool:
     return True
 
 
-@dataclass(frozen=True)
-class Rebuilt:
-    """What `rebuild` did for one collection."""
-
-    versions: int
-    pages: int  # Galaxy view pages that changed
-    plugins: int  # plugin lines
-
-
 class StateChanged(StorageError):
     """Another run saved state.json since this one read it."""
 
@@ -181,7 +170,6 @@ class Store:
         self.purger = purger
         self.index = buckets.index
         self.dl = buckets.dl
-        self.galaxy = buckets.galaxy
         self.state_bucket = buckets.state
         self.dl_url = dl_url or self._configured_dl() or DEFAULT_DL
         self.state: SyncState = {"collections": {}, "conflicts": [], "failures": {}, "pending": {}}
@@ -339,7 +327,13 @@ class Store:
     # it can run alongside a sync; the next sync queues it and deletes it.
 
     def add_request(
-        self, targets: list[str], revalidate: bool, acknowledge: list[str] | None = None, note: str = ""
+        self,
+        targets: list[str],
+        revalidate: bool,
+        acknowledge: list[str] | None = None,
+        note: str = "",
+        rebuild: bool = False,
+        dl: str = "",
     ) -> str:
         requested = now()
         key = f"requests/{requested.replace(':', '')}-{secrets.token_hex(4)}.json"
@@ -347,6 +341,10 @@ class Store:
         if acknowledge:
             request["acknowledge"] = acknowledge
             request["note"] = note
+        if rebuild:
+            request["rebuild"] = True
+        if dl:
+            request["dl"] = dl
         self.state_bucket.write(key, (json.dumps(request) + "\n").encode())
         return key
 
@@ -532,89 +530,30 @@ class Store:
     def read_index(self, namespace: str, name: str) -> list[IndexLine]:
         return cast(list[IndexLine], _read_jsonl(self.index.read(self.index_key(namespace, name))))
 
-    def write_index(
-        self,
-        namespace: str,
-        name: str,
-        lines: list[IndexLine],
-        added: Collection[str] = (),
-        *,
-        view: bool = False,
-        partial: bool = False,
-    ) -> bool:
-        """Write an index file and, if it changed or with `view`, the collection's Galaxy view.
-
-        `added` names versions new to the index, whose Galaxy pages are
-        written without reading them first. `partial` writes only those
-        pages and the listings, for progress saved part way through.
-        """
+    def write_index(self, namespace: str, name: str, lines: list[IndexLine]) -> bool:
+        """Write an index file, returning False if it was already the same."""
         text = "".join(_dump(ordered_line(line)) + "\n" for line in lines)
         changed = self._write_index_file(self.index_key(namespace, name), text)
         state = self.collection_state(f"{namespace}.{name}")
         state["sha256"] = _sha256(text.encode())  # what's stored now, changed or not
         if changed:
             state["updated"] = now()
-        if changed or view:
-            _ = self.write_galaxy_collection(namespace, name, lines, added, partial=partial)
         return changed
 
-    def _write_galaxy_page(self, path: str, body: dict[str, object], *, new: bool = False) -> bool:
-        """Write one page, returning False if it was already the same."""
-        key = galaxy_api.page_key(path)
-        text = json.dumps(body, ensure_ascii=False) + "\n"
-        if new:
-            self.galaxy.write(key, text.encode())
-        elif not _write(self.galaxy, key, text):
-            return False
-        log.debug("wrote %s", key)
-        return True
+    def rebuild_collection(self, namespace: str, name: str) -> None:
+        """Work out one collection's plugin lines and index file sha256 again, for a rebuild.
 
-    def write_galaxy_collection(
-        self, namespace: str, name: str, lines: list[IndexLine], added: Collection[str] = (), *, partial: bool = False
-    ) -> int:
-        """Write one collection's Galaxy v3 pages from its index lines; returns how many changed.
-
-        Version pages come first, so the listing never names a page that isn't
-        written yet. Yanked versions keep their page but leave the listing.
-        """
-        written = 0
-        for line in (line for line in lines if line["vers"] in added) if partial else lines:
-            written += self._write_galaxy_page(
-                galaxy_api.version_path(namespace, name, line["vers"]),
-                galaxy_api.version(line, self.dl_url),
-                new=line["vers"] in added,
-            )
-        written += self._write_galaxy_page(
-            galaxy_api.versions_path(namespace, name), galaxy_api.versions(namespace, name, lines)
-        )
-        updated = self.collection_state(f"{namespace}.{name}").get("updated") or now()
-        written += self._write_galaxy_page(
-            galaxy_api.collection_path(namespace, name), galaxy_api.collection(namespace, name, lines, updated)
-        )
-        return written
-
-    def write_galaxy_root(self) -> None:
-        for path in (galaxy_api.SERVER_ROOT, galaxy_api.API_ROOT):
-            _ = self._write_galaxy_page(path, galaxy_api.root(path))
-
-    def rebuild_collection(self, namespace: str, name: str, *, view: bool = True) -> Rebuilt:
-        """Rewrite one collection's Galaxy view and plugin lines from its index file and extractions.
-
-        `rebuild` runs this for every collection, then `merge_plugins`.
-        Without `view` the Galaxy view is left alone: it reads every version
-        page, so it's most of a rebuild's time.
+        The lines are merged by the next `write_plugins`, like a reconcile's.
         """
         data = self.index.read(self.index_key(namespace, name))
         self.collection_state(f"{namespace}.{name}")["sha256"] = _sha256(data or b"")
         lines = cast(list[IndexLine], _read_jsonl(data))
-        pages = self.write_galaxy_collection(namespace, name, lines) if view else 0
         extractions = self.load_extractions(namespace, name)
-        plugins = self.set_collection_plugins(
+        _ = self.set_collection_plugins(
             namespace,
             name,
             {line["vers"]: extractions[line["cksum"]] for line in lines if line["cksum"] in extractions},
         )
-        return Rebuilt(len(lines), pages, plugins)
 
     def write_config(self) -> None:
         config = {
@@ -703,8 +642,7 @@ class Store:
         for a collection reconciled by a run that stopped before merging, its
         index file and extractions. A store without plugins.jsonl gets it
         built from every collection's. ansible.builtin's lines are always
-        taken from builtin.jsonl, so a `builtin` run that overlapped a sync
-        can't be undone by it.
+        taken from builtin.jsonl.
         """
         if (merged := self.index.read("plugins.jsonl")) is None:
             return self.merge_plugins()

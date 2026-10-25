@@ -126,8 +126,7 @@ class _Reconcile:
         # New versions to mirror, and how many have been tried, for the progress log.
         self.missing = 0
         self.attempted = 0
-        # Versions added since progress was last saved, whose Galaxy pages aren't written yet.
-        self.unwritten: list[str] = []
+        # Whether progress was saved part way, so the index file changed this run.
         self.saved_progress = False
 
     def run(self) -> Result:
@@ -202,29 +201,20 @@ class _Reconcile:
         self.res.upstream = len(upstream_vers)
         self.res.listed = upstream_vers
         if self.lines or not self.res.deferred:  # no empty index file for an import that hasn't started
-            # After saving progress, the whole view is rewritten: yanks,
-            # deprecation and rechecks can have changed lines already written.
             self.store.save_extractions(self.namespace, self.name, self.extractions)
-            changed = self.store.write_index(
-                self.namespace, self.name, self.lines, self.unwritten, view=self.saved_progress
-            )
+            changed = self.store.write_index(self.namespace, self.name, self.lines)
             self.res.changed = changed or self.saved_progress
         self._write_plugins(self.lines)
         self.store.clear_collection_failures(self.fqcn)
         return self.res
 
     def _save_progress(self, lines: list[IndexLine]) -> None:
-        """Write what's mirrored so far and save state, so a run that stops loses little of a long collection.
-
-        Only the pages for versions added since the last save are written
-        here; the end of the reconcile writes the rest of the view.
-        """
+        """Write what's mirrored so far and save state, so a run that stops loses little of a long collection."""
         log.info("%s: saving progress, %d of %d new versions done", self.fqcn, self.attempted, self.missing)
         self.store.save_extractions(self.namespace, self.name, self.extractions)
-        _ = self.store.write_index(self.namespace, self.name, lines, self.unwritten, partial=True)
+        _ = self.store.write_index(self.namespace, self.name, lines)
         self._write_plugins(lines)
         self.store.save_state()
-        self.unwritten = []
         self.saved_progress = True
 
     def _deleted_upstream(self, vers: str) -> bool:
@@ -331,7 +321,6 @@ class _Reconcile:
             line["requires_ansible"] = req
         self.cstate["versions"][vers] = {"created_at": created}
         self.res.added.append(vers)
-        self.unwritten.append(vers)
         return line
 
     def _needs_recheck(self, line: IndexLine, v: GalaxyVersion) -> bool:

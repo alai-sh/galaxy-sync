@@ -5,7 +5,7 @@ import threading
 import urllib.parse
 
 import pytest
-from helpers import COUNT, FEED, LISTING, REPO_METADATA, artifact, feed_row
+from helpers import COUNT, FEED, LISTING, PYPI, REPO_METADATA, artifact, feed_row
 
 from galaxy_sync.galaxy import GalaxyClient
 from galaxy_sync.storage import Buckets
@@ -13,7 +13,7 @@ from galaxy_sync.store import Store
 
 
 class MockGalaxy:
-    """A local HTTP server answering like Galaxy.
+    """A local HTTP server answering like Galaxy, and like PyPI for ansible-core.
 
     `routes` maps a path, including any query string, to a response
     `(status, body, headers)` or a list of them that are served in turn, the
@@ -52,6 +52,21 @@ class MockGalaxy:
         self.uploads = 0
         self.unindexed = set()  # (ns, name, version) served but left out of the feed and count
         self.collections = {}  # (ns, name) -> add_collection arguments, for replace()
+        self.json(PYPI, {"releases": {}})
+
+    def add_core_release(self, version, sdist, *, yanked=False, sha256=None):
+        """Publish an ansible-core release on the mock PyPI, with `sdist` as its only file."""
+        releases = self.routes[PYPI][1]["releases"]
+        path = f"/packages/ansible_core-{version}.tar.gz"
+        releases[version] = [
+            {
+                "packagetype": "sdist",
+                "url": self.url + path,
+                "digests": {"sha256": sha256 or hashlib.sha256(sdist).hexdigest()},
+                "yanked": yanked,
+            }
+        ]
+        self.routes[path] = (200, sdist, {})
 
     def json(self, path, body, status=200):
         self.routes[path] = (status, body, {})

@@ -1,10 +1,12 @@
+import datetime
 import hashlib
 import json
 import re
 
 import pytest
-from helpers import DETAIL, FEED, LISTING, REPO_METADATA, UNAVAILABLE, artifact, tarball
+from helpers import DETAIL, FEED, LISTING, PYPI, REPO_METADATA, UNAVAILABLE, artifact, tarball
 
+from galaxy_sync import builtin as builtin_mod
 from galaxy_sync import cli
 from galaxy_sync import store as store_mod
 from galaxy_sync.storage import Buckets, LocalBackend
@@ -19,7 +21,7 @@ def run(galaxy, tmp_path, monkeypatch):
     def run(command, *args):
         options = ["--store", str(tmp_path)]
         if command == "sync":
-            options += ["--galaxy-url", galaxy.url]
+            options += ["--galaxy-url", galaxy.url, "--pypi-url", galaxy.url]
         return cli.main([command, *options, *args])
 
     return run
@@ -78,7 +80,7 @@ def _plugin_collections(tmp_path):
     return sorted(json.loads(line)["collection"] for line in index_file(tmp_path, "plugins.jsonl").splitlines())
 
 
-def test_plugins_jsonl_is_patched(galaxy, tmp_path, run):
+def test_plugins_jsonl_is_patched(galaxy, tmp_path, run, refresh):
     galaxy.add_collection("ns", "one", ["1.0.0"])
     galaxy.add_collection("ns", "two", ["1.0.0"])
     assert run("sync") == 0
@@ -95,10 +97,10 @@ def test_plugins_jsonl_is_patched(galaxy, tmp_path, run):
     assert _plugin_collections(tmp_path) == ["ns.one", "ns.two"]
     assert "plugins_pending" not in Store(Buckets.local(tmp_path)).state
 
-    # rebuild works every collection's plugin lines out again from its extractions.
+    # A rebuild works every collection's plugin lines out again from its extractions.
     _ = one.write_bytes(saved)
     (tmp_path / "index-root" / "plugins.jsonl").unlink()
-    assert run("rebuild") == 0
+    assert refresh("--rebuild") == 0
     assert _plugin_collections(tmp_path) == ["ns.one", "ns.two"]
 
 
@@ -234,47 +236,54 @@ def test_sync_retries_failures_and_reads_nothing_on_failure(galaxy, run, tmp_pat
     ]
 
 
-def _module(path, name, version_added):
-    doc = f"module: {name}\\nshort_description: The {name} module\\n"
-    if version_added is not None:
-        doc += f"version_added: {version_added}\\n"
-    (path / f"{name}.py").write_text(f'DOCUMENTATION = "{doc}"\n')
-
-
-def test_builtin(galaxy, run, tmp_path, capsys, refresh):
-    galaxy.add_collection("ns", "coll", ["1.0.0"])
-    assert refresh("ns.coll") == 0
-
-    src = tmp_path / "ansible"
-    modules = src / "lib" / "ansible" / "modules"
-    modules.mkdir(parents=True)
-    _module(modules, "ping", "historical")
-    _module(modules, "pong", '\\"2.15\\"')
-    _module(modules, "unquoted", "2.18")  # YAML reads this as a number
-    _module(modules, "undated", None)
-    (src / "lib" / "ansible" / "plugins" / "filter").mkdir(parents=True)
-    (src / "lib" / "ansible" / "plugins" / "filter" / "odd.py").write_text("x = 1\n")
-    (src / "lib" / "ansible" / "config").mkdir(parents=True)
-    (src / "lib" / "ansible" / "config" / "ansible_builtin_runtime.yml").write_text(
+def _core_sdist(version, modules):
+    """An ansible-core sdist with these {name: version_added} modules, plus an unresolvable filter and a tombstone."""
+    top = f"ansible_core-{version}/lib/ansible"
+    files = {f"{top}/release.py": f"__version__ = '{version}'\n", f"{top}/plugins/filter/odd.py": "x = 1\n"}
+    for name, version_added in modules.items():
+        doc = f"module: {name}\\nshort_description: The {name} module\\n"
+        if version_added is not None:
+            doc += f"version_added: {version_added}\\n"
+        files[f"{top}/modules/{name}.py"] = f'DOCUMENTATION = "{doc}"\n'
+    files[f"{top}/config/ansible_builtin_runtime.yml"] = (
         "plugin_routing:\n  modules:\n    gone:\n      tombstone:\n        removal_version: '2.10'\n"
     )
-    (src / "lib" / "ansible" / "release.py").write_text("__version__ = '2.20.0'\n")
-    capsys.readouterr()
-    assert run("builtin", str(src)) == 0
+    files[f"ansible_core-{version}/test/units/ignored.py"] = "x = 1\n"
+    return tarball(files)
+
+
+def _builtin_lines(tmp_path):
+    return {
+        line["name"]: line
+        for line in map(json.loads, index_file(tmp_path, "plugins.jsonl").splitlines())
+        if line["collection"] == "ansible.builtin"
+    }
+
+
+def _days_later(monkeypatch, days):
+    """Move ansible.builtin's clock on, past the daily PyPI check."""
+    later = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=days, minutes=1)).isoformat()
+    monkeypatch.setattr(builtin_mod, "now", lambda: later)
+
+
+def test_builtin(galaxy, run, tmp_path, capsys, refresh, monkeypatch):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    modules = {"ping": "historical", "pong": '\\"2.15\\"', "unquoted": "2.18", "undated": None}
+    galaxy.add_core_release("2.20.0", _core_sdist("2.20.0", modules))
+    # Neither a patch release nor a pre-release counts.
+    galaxy.add_core_release("2.20.1", _core_sdist("2.20.1", {**modules, "patched": None}))
+    galaxy.add_core_release("2.21.0rc1", _core_sdist("2.21.0rc1", {**modules, "early": None}))
+    assert refresh("ns.coll") == 0
     out = capsys.readouterr().out
-    assert "ansible.builtin 2.20.0: 4 entries {'module': 4}, 2 with version_added, 1 routing-only" in out
+    assert (
+        "builtin: extracted ansible-core 2.20.0: 4 entries {'module': 4}, 2 with version_added, 1 routing-only" in out
+    )
     assert "unresolved filter/test files: ['plugins/filter/odd.py']" in out
     assert "plugin index: 6 lines" in out
 
-    # Only ansible.builtin's lines are replaced; `since` is each plugin's
-    # version_added, not the release extracted.
-    plugins = tmp_path / "index-root" / "plugins.jsonl"
+    # `since` is each plugin's version_added, not the release extracted.
     assert set(_plugin_collections(tmp_path)) == {"ansible.builtin", "ns.coll"}
-    lines = {
-        line["name"]: line
-        for line in map(json.loads, plugins.read_text().splitlines())
-        if line["collection"] == "ansible.builtin"
-    }
+    lines = _builtin_lines(tmp_path)
     assert {name: line.get("since") for name, line in lines.items()} == {
         "gone": None,
         "ping": None,
@@ -286,20 +295,53 @@ def test_builtin(galaxy, run, tmp_path, capsys, refresh):
     assert lines["gone"]["routing"] == {"tombstone": {"removal_version": "2.10"}}
     assert all("until" not in line for line in lines.values())
 
-    # A sync merging plugins.jsonl takes ansible.builtin from builtin.jsonl,
-    # so one that read the file before a `builtin` run can't undo it.
-    plugins.write_text("".join(line for line in plugins.read_text().splitlines(True) if "ansible.builtin" not in line))
+    # PyPI is asked once a day; merging plugins.jsonl keeps ansible.builtin's lines.
+    galaxy.requests.clear()
     galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
     assert refresh("ns.coll") == 0
-    assert set(_plugin_collections(tmp_path)) == {"ansible.builtin", "ns.coll"}
-    assert sum(json.loads(line)["collection"] == "ansible.builtin" for line in plugins.read_text().splitlines()) == 5
+    assert PYPI not in galaxy.requests
+    assert len(_builtin_lines(tmp_path)) == 5
+
+    # A day later, with no new minor release, nothing is downloaded.
+    _days_later(monkeypatch, 1)
+    galaxy.requests.clear()
+    assert run("sync") == 0
+    assert "builtin: ansible-core 2.20.0 is still the latest minor release" in capsys.readouterr().out
+    assert galaxy.requests.count(PYPI) == 1
+    assert not any(r.startswith("/packages/") for r in galaxy.requests)
+    galaxy.requests.clear()
+    assert run("sync") == 0
+    assert PYPI not in galaxy.requests  # the check's time was saved
+
+    # A new minor release whose sdist doesn't match PyPI's sha256 is a failure, retried every run.
+    galaxy.add_core_release("2.21.0", _core_sdist("2.21.0", {**modules, "new": "2.21"}), sha256="0" * 64)
+    _days_later(monkeypatch, 2)
+    assert run("sync") == 0
+    assert "builtin: FAILED, retried next run" in capsys.readouterr().err
+    assert [(f["collection"], f["version"], f["kind"]) for f in state(tmp_path)["failures"].values()] == [
+        ("*", "builtin", "sha256_mismatch")
+    ]
+    galaxy.add_core_release("2.21.0", _core_sdist("2.21.0", {**modules, "new": "2.21"}))
+    assert run("sync") == 0
+    assert "builtin: extracted ansible-core 2.21.0" in capsys.readouterr().out
+    assert _builtin_lines(tmp_path)["new"]["since"] == "2.21"
+    assert state(tmp_path)["failures"] == {}
+    assert state(tmp_path)["builtin"]["version"] == "2.21.0"
+
+
+def test_builtin_pypi_unavailable(galaxy, run, tmp_path, capsys):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    galaxy.routes[PYPI] = UNAVAILABLE
+    assert run("sync") == 0
+    assert "builtin: couldn't check PyPI" in capsys.readouterr().err
+    assert [f["kind"] for f in state(tmp_path)["failures"].values()] == ["pypi_unavailable"]
 
 
 def test_usage_errors(run, tmp_path, capsys, monkeypatch):
     with pytest.raises(SystemExit) as e:
-        run("builtin", str(tmp_path / "missing.tar.gz"))
+        run("refresh", "--rebuild", "ns.coll")
     assert e.value.code == 2
-    assert "can't extract" in capsys.readouterr().err
+    assert "--rebuild and --dl can't be combined with targets or --ack" in capsys.readouterr().err
 
     with pytest.raises(SystemExit):
         run("refresh", "--revalidate")
@@ -347,10 +389,7 @@ def test_sync(galaxy, run, tmp_path, capsys, refresh):
 
     assert run("sync") == 0
     assert "ns.coll: +2" in capsys.readouterr().out
-    assert (
-        tmp_path / "galaxy-root" / "api" / "v3" / "collections" / "ns" / "coll" / "versions" / "index.html"
-    ).is_file()
-    assert json.loads((tmp_path / "galaxy-root" / "index.html").read_text())["available_versions"] == {"v3": "api/v3/"}
+    assert (tmp_path / "index-root" / "index" / "ns" / "coll.jsonl").is_file()
     state = json.loads((tmp_path / "state" / "state.json").read_text())
     assert state["feed_cursor"] == galaxy.uploaded[("ns", "coll", "2.0.0")]
 
@@ -414,47 +453,78 @@ def test_sweep_unindexed_versions(galaxy, run, tmp_path, capsys, refresh):
 
 def test_rebuild(galaxy, run, tmp_path, capsys, refresh):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
+    galaxy.add_core_release("2.20.0", _core_sdist("2.20.0", {"ping": None}))
     assert refresh("ns.coll") == 0
     config_file = tmp_path / "index-root" / "config.json"
-    pages = tmp_path / "galaxy-root" / "api" / "v3" / "collections" / "ns" / "coll" / "versions"
 
-    def urls():
-        """config.json's template and every Galaxy page's download URL."""
-        return json.loads(config_file.read_text())["dl"], {
-            json.loads(page.read_text())["download_url"].split("/")[2] for page in pages.glob("*/index.html")
-        }
+    def dl():
+        return json.loads(config_file.read_text())["dl"]
 
-    assert urls() == (DEFAULT_DL, {"dl.alai.sh"})
+    assert dl() == DEFAULT_DL
 
-    # rebuild --dl moves every URL at once, and later runs keep it.
-    assert run("rebuild", "--dl", "https://moved.example/{sha256-checksum}") == 0
+    # --dl moves the template, and later runs keep it.
+    capsys.readouterr()
+    assert refresh("--dl", "https://moved.example/{sha256-checksum}") == 0
     out = capsys.readouterr().out
-    assert "[1/1] ns.coll: 1 versions, Galaxy view: 1 pages written, 1 plugin lines\n" in out
-    assert "rebuilt 1 collections (1 plugin lines)\n" in out
-    assert urls() == ("https://moved.example/{sha256-checksum}", {"moved.example"})
+    assert "queued moving the artifact URLs to https://moved.example/{sha256-checksum} for the next sync" in out
+    assert "artifact URLs moved to https://moved.example/{sha256-checksum}" in out
+    assert "rebuild:" not in out
+    assert dl() == "https://moved.example/{sha256-checksum}"
     galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
     assert refresh("ns.coll") == 0
-    assert run("sync") == 0
-    assert urls() == ("https://moved.example/{sha256-checksum}", {"moved.example"})
+    assert dl() == "https://moved.example/{sha256-checksum}"
 
-    # --no-galaxy-view keeps the template and doesn't touch the view, but
-    # still rebuilds the plugin index.
-    (pages / "1.1.0" / "index.html").unlink()
+    # A rebuild works out the plugin index again, ansible.builtin included,
+    # and keeps the template.
     (tmp_path / "index-root" / "plugins.jsonl").unlink()
     capsys.readouterr()
-    assert run("rebuild", "--no-galaxy-view") == 0
+    assert refresh("--rebuild") == 0
     out = capsys.readouterr().out
-    assert "[1/1] ns.coll: 2 versions, 1 plugin lines\n" in out
-    assert urls() == ("https://moved.example/{sha256-checksum}", {"moved.example"})
-    assert not (pages / "1.1.0" / "index.html").exists()
-    assert (tmp_path / "index-root" / "plugins.jsonl").exists()
-    with pytest.raises(SystemExit):
-        run("rebuild", "--no-galaxy-view", "--dl", "https://elsewhere.example/{sha256-checksum}")
-    assert "--dl needs the Galaxy view" in capsys.readouterr().err
+    assert "rebuilding, starting this run" in out
+    assert "rebuild: 1 collections to go\n" in out
+    assert "builtin: extracted ansible-core 2.20.0" in out
+    assert "rebuild: done" in out
+    assert set(_plugin_collections(tmp_path)) == {"ansible.builtin", "ns.coll"}
+    assert dl() == "https://moved.example/{sha256-checksum}"
+    assert "rebuild" not in state(tmp_path)
 
-    # A plain rebuild resets it.
-    assert run("rebuild") == 0
-    assert urls() == (DEFAULT_DL, {"dl.alai.sh"})
+
+def test_rebuild_resumes(galaxy, run, tmp_path, capsys, refresh, monkeypatch):
+    for name in ("a", "b", "c"):
+        galaxy.add_collection("ns", name, ["1.0.0"])
+    assert run("sync") == 0
+    monkeypatch.setattr(store_mod, "SAVE_EVERY", 1)
+    rebuild_collection = Store.rebuild_collection
+
+    def stopping(self, namespace, name):
+        if name == "b":
+            raise KeyboardInterrupt  # the run stops
+        rebuild_collection(self, namespace, name)
+
+    monkeypatch.setattr(Store, "rebuild_collection", stopping)
+    assert run("refresh", "--rebuild") == 0
+    with pytest.raises(KeyboardInterrupt):
+        run("sync")
+    assert state(tmp_path)["rebuild"]["after"] == "ns.a"
+    assert state(tmp_path)["plugins_pending"] == ["ns.a"]
+
+    # Out of time: nothing more is done, and the rebuild waits.
+    monkeypatch.setattr(Store, "rebuild_collection", rebuild_collection)
+    capsys.readouterr()
+    assert run("sync", "--budget", "0") == 0
+    assert "rebuild: out of time, 2 collections left for the next run" in capsys.readouterr().out
+    assert state(tmp_path)["rebuild"]["after"] == "ns.a"
+
+    # The next run carries on after ns.a.
+    rebuilt: list[str] = []
+    monkeypatch.setattr(
+        Store, "rebuild_collection", lambda self, ns, name: rebuilt.append(name) or rebuild_collection(self, ns, name)
+    )
+    assert run("sync") == 0
+    assert "rebuild: 2 collections to go\n" in capsys.readouterr().out
+    assert rebuilt == ["b", "c"]
+    assert "rebuild" not in state(tmp_path)
+    assert _plugin_collections(tmp_path) == ["ns.a", "ns.b", "ns.c"]
 
 
 def state(tmp_path):
@@ -633,7 +703,7 @@ def test_alerts(galaxy, run, tmp_path, capsys):
     assert comments(alerts) == []
 
 
-def test_acknowledge(galaxy, run, tmp_path, capsys):
+def test_acknowledge(galaxy, run, tmp_path, capsys, refresh):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     assert run("refresh", "ns.coll") == 0
     assert run("sync") == 0
@@ -702,9 +772,9 @@ def test_acknowledge(galaxy, run, tmp_path, capsys):
     assert "resolved" in entry
     assert entry["acknowledged"]["note"] == "the author republished 1.0.0"
 
-    # rebuild writes the records again.
+    # A rebuild writes the records again.
     record.unlink()
-    assert run("rebuild") == 0
+    assert refresh("--rebuild") == 0
     assert json.loads(record.read_text())["conflicts"] == [entry]
 
 
@@ -802,7 +872,10 @@ def test_run_output_explains_itself(galaxy, run, capsys):
     galaxy.add_collection("ns", "other", ["1.0.0"])
     assert run("sync") == 0
     out = capsys.readouterr().out
-    assert "plan (budget 45m):\n  queue: 2 collections (0 requested, 0 uploaded, 2 listed, 0 swept)\n" in out
+    assert (
+        "plan (budget 45m):\n  builtin: check PyPI for a new ansible-core minor release\n"
+        + "  queue: 2 collections (0 requested, 0 uploaded, 2 listed, 0 swept)\n"
+    ) in out
     assert "\n    ns.coll, ns.other\n" in out
     assert re.search(r"^sweep: next due \S+ \S+Z \(in 24h\)$", out, re.MULTILINE)
 

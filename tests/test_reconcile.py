@@ -415,18 +415,14 @@ def test_deadline_defers_new_versions(galaxy, client, store, monkeypatch):
     assert store.collection_state("ns.coll")["upstream_updated"]
 
 
-def test_new_objects_are_written_without_reading_them(galaxy, client, store, monkeypatch):
+def test_extractions_are_read_once(galaxy, client, store, monkeypatch):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     assert reconcile(client, store, "ns", "coll").added == ["1.0.0"]
     galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
 
     reads: list[str] = []
-    for backend in (store.galaxy, store.state_bucket):
-        monkeypatch.setattr(backend, "read", _recording(backend.read, reads))
+    monkeypatch.setattr(store.state_bucket, "read", _recording(store.state_bucket.read, reads))
     assert reconcile(client, store, "ns", "coll").added == ["1.1.0"]
-    # The existing version's page is compared; the new one's isn't.
-    assert "api/v3/collections/ns/coll/versions/1.0.0/index.html" in reads
-    assert "api/v3/collections/ns/coll/versions/1.1.0/index.html" not in reads
     assert reads.count("extract/ns/coll.json.zst") == 1  # every extraction in one read
 
 
@@ -454,18 +450,14 @@ def test_progress_is_saved_part_way(galaxy, client, store, monkeypatch):
         reconcile(client, store, "ns", "coll")
     monkeypatch.setattr(reconcile_mod._Reconcile, "_mirror", mirror)
 
-    # What the next run sees: four versions written, with their pages and state.
+    # What the next run sees: four versions written, with their state.
     later = Store(store.buckets, store.dl_url)
     assert [line["vers"] for line in later.read_index("ns", "coll")] == versions[:4]
     assert sorted(later.collection_state("ns.coll")["versions"]) == versions[:4]
-    listing = json.loads(later.galaxy.read("api/v3/collections/ns/coll/versions/index.html"))
-    assert listing["meta"]["count"] == 4
-    assert later.galaxy.exists("api/v3/collections/ns/coll/versions/1.3.0/index.html")
 
     res = reconcile(client, later, "ns", "coll")
     assert res.added == ["1.4.0"]
-    listing = json.loads(later.galaxy.read("api/v3/collections/ns/coll/versions/index.html"))
-    assert listing["meta"]["count"] == 5
+    assert [line["vers"] for line in later.read_index("ns", "coll")] == versions
 
 
 def test_lost_version_state_is_recorded_again(galaxy, client, store):

@@ -2,12 +2,11 @@
 
     sync       every 10 minutes: queue what changed on Galaxy (and, once a
                day, everything that differs), then work the queue for up
-               to --budget minutes
-    refresh    ask the next sync to reconcile NS[.NAME] first, to sweep, or
-               to acknowledge a conflict
-    rebuild    regenerate the files derived from the index
-    builtin    re-extract ansible.builtin from an ansible-core release into
-               the plugin index
+               to --budget minutes; re-extract ansible.builtin when
+               ansible-core has a new minor release
+    refresh    ask the next sync to reconcile NS[.NAME] first, to sweep, to
+               rebuild, to move the artifact URLs, or to acknowledge a
+               conflict
 
 Recorded failures and conflicts don't fail a run; they're reported in
 failures.json in the state bucket and, through --report and --alerts, on a
@@ -20,13 +19,12 @@ import datetime
 import io
 import logging
 import sys
-import tarfile
 import time
 import traceback
 from pathlib import Path
 
-import alai_plugin_extractor as ext
-
+from . import builtin
+from .builtin import BuiltinError
 from .cdn import Purger
 from .changes import (
     FEED_OVERLAP,
@@ -42,10 +40,9 @@ from .changes import (
 )
 from .galaxy import BASE_URL, GalaxyClient, GalaxyError
 from .models import Pending, Request
-from .plugins import builtin_lines
 from .reconcile import Result, reconcile
 from .storage import Buckets, R2Config, StorageError
-from .store import DEFAULT_DL, GLOBAL, SOURCES, Store
+from .store import GLOBAL, SOURCES, Store
 from .times import now
 
 # How often `sync` runs the full sweep.
@@ -240,6 +237,7 @@ GLOBAL_RETRIES = {
     "sweep": "retried with the sweep",
     "count": "checked again after reconciling",
     "purge": "cleared by the next purge that works",
+    "builtin": "retried every run",
 }
 
 
@@ -287,10 +285,19 @@ def _print_outstanding(store: Store, requests: list[tuple[str, Request]]) -> Non
         print(f"  and {len(failures) - SHOW_FAILURES} more; see failures.json in the state bucket")
 
 
+def _is_sweep(request: Request) -> bool:
+    return not (request["targets"] or request.get("acknowledge") or request.get("rebuild") or request.get("dl"))
+
+
 def _asks(request: Request) -> list[str]:
     """What a `refresh` request asks for, one line each."""
     if acknowledge := request.get("acknowledge"):
         return [f"acknowledge {target}: {request.get('note', '')}" for target in acknowledge]
+    asks = ["rebuild"] if request.get("rebuild") else []
+    if dl := request.get("dl"):
+        asks.append(f"move the artifact URLs to {dl}")
+    if asks:
+        return asks
     if not request["targets"]:
         return ["sweep"]
     flags = " (revalidating)" if request["revalidate"] else ""
@@ -317,6 +324,11 @@ def _print_plan(store: Store, requests: list[tuple[str, Request]], sweep_due: bo
         for key, request in requests:
             lines.append(f"    {key}, from {_when(request['requested'])}")
             lines.extend(f"      {ask}" for ask in _asks(request))
+    if rebuild := store.state.get("rebuild"):
+        after = f", continuing after {last}" if (last := rebuild.get("after")) else ""
+        lines.append(f"  rebuild: requested {_when(rebuild['requested'])}{after}")
+    if builtin.due(store):
+        lines.append("  builtin: check PyPI for a new ansible-core minor release")
     if sweep_due:
         lines.append("  sweep: queues everything that differs from Galaxy")
     pending = store.state["pending"]
@@ -371,6 +383,15 @@ def _queue_requests(client: GalaxyClient, store: Store, requests: list[tuple[str
         what = f"request {key}"
         if acknowledge := request.get("acknowledge"):
             _acknowledge(store, key, acknowledge, request.get("note", ""))
+        elif request.get("rebuild") or request.get("dl"):
+            if dl := request.get("dl"):
+                store.dl_url = dl
+                store.write_config()  # now, so the move doesn't wait for the end of the run
+                print(f"{what}: artifact URLs moved to {dl}")
+            if request.get("rebuild"):
+                store.state["rebuild"] = {"requested": request["requested"]}  # from the start, if one was running
+                _ = store.state.pop("builtin", None)  # extracted again too
+                print(f"{what}: rebuilding, starting this run")
         elif not request["targets"]:
             _ = store.state.pop("last_sweep", None)  # sweep this run
             print(f"{what}: sweeping this run")
@@ -410,6 +431,64 @@ def _acknowledge(store: Store, key: str, targets: list[str], note: str) -> None:
             print(f"{what} dropped: it has no open conflict", file=sys.stderr)
         else:
             print(f"{what}: acknowledged")
+
+
+def _rebuild(store: Store, deadline: float) -> bool:
+    """Work through a requested rebuild until `deadline`; False if none was requested.
+
+    Progress is kept in state, so a rebuild that runs out of time, or a run
+    that stops, carries on from the last collection done.
+    """
+    if (progress := store.state.get("rebuild")) is None:
+        return False
+    after = tuple(progress["after"].split(".", 1)) if "after" in progress else None
+    targets = [c for c in store.index_collections() if after is None or c > after]
+    print(f"rebuild: {len(targets)} collections to go")
+    for i, (ns, name) in enumerate(targets):
+        if time.monotonic() >= deadline:
+            print(f"rebuild: out of time, {len(targets) - i} collections left for the next run")
+            return True
+        store.rebuild_collection(ns, name)
+        progress["after"] = f"{ns}.{name}"
+        store.add_work()
+        if store.save_due():
+            store.save_state()  # keep progress if the run stops
+    _ = store.write_conflict_records(store.conflicted_collections())
+    del store.state["rebuild"]
+    print(f"rebuild: done, requested {_when(progress['requested'])}")
+    return True
+
+
+def _builtin(client: GalaxyClient, store: Store) -> bool:
+    """Re-extract ansible.builtin if ansible-core has a new minor release; True if it changed."""
+    try:
+        res = builtin.check(client, store)
+    except GalaxyError as e:
+        store.record_failure(GLOBAL, "builtin", e.kind.replace("galaxy_", "pypi_", 1), str(e))
+        print(f"builtin: couldn't check PyPI; retried next run: {e}", file=sys.stderr)
+        return False
+    except BuiltinError as e:
+        store.record_failure(GLOBAL, "builtin", e.kind, str(e))
+        print(f"builtin: FAILED, retried next run: {e}", file=sys.stderr)
+        return False
+    store.clear_failures(GLOBAL, "builtin")
+    if res is None:
+        current = store.state.get("builtin", {}).get("version")
+        print(
+            f"builtin: ansible-core {current} is still the latest minor release"
+            if current
+            else "builtin: no release found"
+        )
+        return False
+    counts = collections.Counter(p.type for p in res.result.plugins)
+    dated = sum(1 for line in res.lines if "since" in line)
+    print(
+        f"builtin: extracted ansible-core {res.release.version}: {sum(counts.values())} entries {dict(counts)}, "
+        + f"{dated} with version_added, {len(res.lines) - len(res.result.plugins)} routing-only"
+    )
+    if unresolved := [i.path for i in res.result.issues if i.kind == "filter_test_unresolved"]:
+        print(f"  unresolved filter/test files: {unresolved}")
+    return True
 
 
 def _sweep_due(store: Store) -> bool:
@@ -539,7 +618,6 @@ def _finish(
     elapsed: float,
 ) -> None:
     """Write the aggregate files, the failure report and the state, then the run's summary."""
-    store.write_galaxy_root()
     store.write_config()
     plugins = store.write_plugins()
     _ = store.write_conflict_records()
@@ -611,19 +689,22 @@ def cmd_sync(args: argparse.Namespace) -> int:
     store.save_state()
 
     requests = store.requests()
-    asked = any(not r["targets"] and not r.get("acknowledge") for _, r in requests)
+    asked = any(_is_sweep(r) for _, r in requests)
     print(_sweep_status(store, asked))
     _print_plan(store, requests, asked or _sweep_due(store), args.budget)
     _print_outstanding(store, requests)
     taken = _queue_requests(client, store, requests)
-    # Requested collections go before the sweep, which can take most of the budget.
+    # What a person asked for goes before the sweep, which can take most of the budget.
     worked: dict[str, Result | str] = {}
     _work(client, store, deadline, worked, requested=True)
+    rebuilt = _rebuild(store, deadline)
+    extracted = builtin.due(store) and _builtin(GalaxyClient(args.pypi_url), store)
     # Once started, the sweep runs to the end, so it isn't started after the
     # budget has run out; the next run starts with it instead.
     swept = time.monotonic() < deadline and _sweep_due(store) and _sweep(client, store)
     _work(client, store, deadline, worked)
-    if res.unchanged and not (taken or swept or worked):
+    if res.unchanged and not (taken or rebuilt or extracted or swept or worked):
+        store.save_state()  # the builtin check's time, and any failure recorded
         return _exit_code(store, args)  # nothing changed: skip rewriting the aggregate files
     if not res.unchanged or swept:
         _report_count(client, store)
@@ -632,11 +713,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
-    """Ask the next sync to reconcile collections first, or to sweep."""
+    """Ask the next sync to reconcile collections first, sweep, rebuild, move the artifact URLs or acknowledge conflicts."""
     if args.revalidate and not args.targets:
         raise UsageError("--revalidate needs NS or NS.NAME targets")
     if args.acknowledge and args.targets:
         raise UsageError("--ack can't be combined with targets")
+    if (args.rebuild or args.dl) and (args.targets or args.acknowledge):
+        raise UsageError("--rebuild and --dl can't be combined with targets or --ack")
     if bool(args.acknowledge) != bool(args.note):
         raise UsageError("--ack and --note go together")
     try:
@@ -647,67 +730,18 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     except ValueError as e:
         raise UsageError(str(e)) from None
     store = _open_store(args)
-    key = store.add_request(args.targets, args.revalidate, args.acknowledge, args.note)
+    key = store.add_request(args.targets, args.revalidate, args.acknowledge, args.note, args.rebuild, args.dl)
     if args.acknowledge:
         what = f"acknowledging {', '.join(args.acknowledge)}"
+    elif args.rebuild and args.dl:
+        what = f"a rebuild, moving the artifact URLs to {args.dl}"
+    elif args.rebuild:
+        what = "a rebuild"
+    elif args.dl:
+        what = f"moving the artifact URLs to {args.dl}"
     else:
         what = ", ".join(args.targets) if args.targets else "a full sweep"
     print(f"queued {what} for the next sync ({key})")
-    return 0
-
-
-def _extract_builtin(store: Store, src: Path) -> None:
-    """Extract ansible.builtin's plugins from an ansible-core checkout or sdist."""
-    try:
-        result = ext.extract(src, type="ansible", docs=True)
-    except (OSError, tarfile.TarError, ValueError) as e:
-        raise UsageError(f"can't extract {src}: {e}") from None
-    lines = builtin_lines(result)
-    store.save_builtin(lines)
-    counts = collections.Counter(p.type for p in result.plugins)
-    dated = sum(1 for line in lines if "since" in line)
-    print(
-        f"ansible.builtin {result.version or '(unknown version)'}: {sum(counts.values())} entries {dict(counts)}, "
-        + f"{dated} with version_added, {len(lines) - len(result.plugins)} routing-only"
-    )
-    if unresolved := [i.path for i in result.issues if i.kind == "filter_test_unresolved"]:
-        print(f"  unresolved filter/test files: {unresolved}")
-
-
-def cmd_builtin(args: argparse.Namespace) -> int:
-    """Re-extract ansible.builtin and replace its lines in plugins.jsonl."""
-    store = _open_store(args)
-    _extract_builtin(store, args.src)
-    plugins = store.write_plugins()
-    store.purge()
-    print(f"plugin index: {plugins} lines")
-    return 0
-
-
-def cmd_rebuild(args: argparse.Namespace) -> int:
-    """Regenerate every file derived from the index, without contacting Galaxy."""
-    if args.dl and not args.galaxy_view:
-        raise UsageError("--dl needs the Galaxy view, which has the artifact URLs too")
-    store = _open_store(args)
-    if args.galaxy_view:
-        store.dl_url = args.dl or DEFAULT_DL  # rebuild is the one place the artifact URL changes
-    collections = store.index_collections()
-    width = len(str(len(collections)))
-    for i, (ns, name) in enumerate(collections):
-        res = store.rebuild_collection(ns, name, view=args.galaxy_view)
-        parts = [f"{res.versions} versions"]
-        if args.galaxy_view:
-            parts.append(f"Galaxy view: {res.pages} pages written" if res.pages else "Galaxy view unchanged")
-        parts.append(f"{res.plugins} plugin lines")
-        print(f"[{i + 1:{width}}/{len(collections)}] {ns}.{name}: {', '.join(parts)}")
-    if args.galaxy_view:
-        store.write_galaxy_root()
-    store.write_config()
-    plugins = store.merge_plugins()
-    _ = store.write_conflict_records(store.conflicted_collections())
-    store.write_collections()  # last, as it purges the others from the CDN
-    store.save_state()
-    print(f"rebuilt {len(collections)} collections ({plugins} plugin lines)")
     return 0
 
 
@@ -761,6 +795,9 @@ def _parser() -> argparse.ArgumentParser:
         help="write the outstanding failures and conflicts here as a Markdown block for the tracking issue",
     )
     _ = p.add_argument("--galaxy-url", default=BASE_URL, help=f"Galaxy server (default: {BASE_URL})")
+    _ = p.add_argument(
+        "--pypi-url", default=builtin.PYPI_URL, help=f"PyPI, for ansible-core releases (default: {builtin.PYPI_URL})"
+    )
     _ = p.add_argument("--strict", action="store_true", help="exit 1 if any failure or conflict is outstanding")
     _ = p.add_argument("--dry-run", action="store_true", help="only report what changed; queue nothing")
     p.set_defaults(func=cmd_sync)
@@ -769,7 +806,7 @@ def _parser() -> argparse.ArgumentParser:
         "refresh",
         parents=[storage],
         help="ask the next sync to reconcile NS[.NAME] first, with no targets to run the sweep, "
-        + "or to acknowledge conflicts",
+        + "or to rebuild, move the artifact URLs or acknowledge conflicts",
     )
     _ = p.add_argument("targets", nargs="*", metavar="NS[.NAME]")
     _ = p.add_argument(
@@ -786,29 +823,16 @@ def _parser() -> argparse.ArgumentParser:
         help="acknowledge a version's open conflict, so it's no longer reported (repeatable; needs --note)",
     )
     _ = p.add_argument("--note", default="", help="why the conflicts are acknowledged; published with them")
+    _ = p.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="regenerate every file derived from the index, and extract ansible.builtin again",
+    )
+    _ = p.add_argument(
+        "--dl", metavar="TEMPLATE", default="", help="move the artifact URL template in config.json to TEMPLATE"
+    )
     p.set_defaults(func=cmd_refresh)
 
-    p = sub.add_parser("rebuild", parents=[storage], help="regenerate the files derived from the index")
-    _ = p.add_argument(
-        "--dl",
-        metavar="TEMPLATE",
-        help="artifact URL template for config.json and the Galaxy view (default: the dl.alai.sh one)",
-    )
-    _ = p.add_argument(
-        "--no-galaxy-view",
-        dest="galaxy_view",
-        action="store_false",
-        help="leave the Galaxy view and the artifact URL template as they are; much faster",
-    )
-    p.set_defaults(func=cmd_rebuild)
-
-    p = sub.add_parser(
-        "builtin",
-        parents=[storage],
-        help="re-extract ansible.builtin from an ansible-core checkout or sdist into the plugin index",
-    )
-    _ = p.add_argument("src", type=Path, metavar="SRC")
-    p.set_defaults(func=cmd_builtin)
     return parser
 
 

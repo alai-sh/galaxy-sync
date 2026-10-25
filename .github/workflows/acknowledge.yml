@@ -1,25 +1,27 @@
-name: Builtin
+name: Acknowledge
 on:
   workflow_dispatch:
     inputs:
-      ansible_core_ref:
-        description: The ansible-core release tag to extract ansible.builtin from, e.g. v2.21.5
+      conflicts:
+        description: Space-separated NS.NAME:VERSION conflicts to acknowledge, once inspected
+        type: string
+        required: true
+      note:
+        description: Why they're acknowledged; published with them
         type: string
         required: true
 
 permissions:
   contents: read
 
-# Syncs keep running: this writes only builtin.jsonl and plugins.jsonl, and a
-# sync merging plugins.jsonl takes ansible.builtin from builtin.jsonl.
-concurrency:
-  group: builtin
+# No shared concurrency group: like a refresh, this only writes its own
+# request object, which the next sync takes, so it can run alongside one.
 
 jobs:
-  builtin:
-    name: builtin
+  acknowledge:
+    name: acknowledge
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     environment: r2
     steps:
     # The release to run, not main: see "Releases" in docs/sync.md.
@@ -37,25 +39,23 @@ jobs:
         ref: ${{ vars.GALAXY_SYNC_REF }}
         persist-credentials: false
 
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      with:
-        repository: ansible/ansible
-        ref: ${{ inputs.ansible_core_ref }}
-        path: ansible-core
-        persist-credentials: false
-
     - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
 
-    - name: Extract ansible.builtin
-      run: uv run --locked galaxy-sync builtin --r2 -v ansible-core
+    - name: Queue the request
+      # Inputs go through the environment, never into the script itself.
+      run: |
+        read -ra conflicts <<< "$CONFLICTS"
+        args=()
+        for conflict in "${conflicts[@]}"; do
+          args+=(--ack "$conflict")
+        done
+        uv run --locked galaxy-sync refresh --r2 -v "${args[@]}" --note "$NOTE"
       env:
+        CONFLICTS: ${{ inputs.conflicts }}
+        NOTE: ${{ inputs.note }}
         R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
         R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         ALAI_INDEX_BUCKET: ${{ vars.ALAI_INDEX_BUCKET }}
         ALAI_DL_BUCKET: ${{ vars.ALAI_DL_BUCKET }}
-        ALAI_GALAXY_BUCKET: ${{ vars.ALAI_GALAXY_BUCKET }}
         ALAI_STATE_BUCKET: ${{ vars.ALAI_STATE_BUCKET }}
-        CLOUDFLARE_PURGE_TOKEN: ${{ secrets.CLOUDFLARE_PURGE_TOKEN }}
-        CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}
-        ALAI_INDEX_URL: ${{ vars.ALAI_INDEX_URL }}

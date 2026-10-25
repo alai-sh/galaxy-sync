@@ -1,8 +1,8 @@
 # galaxy-sync
 
 Mirrors every collection on galaxy.ansible.com into the alai static index and
-artifact store, so the alai client (and, meanwhile, `ansible-galaxy`) can
-install collections without depending on Galaxy.
+artifact store, so the alai client can install collections without
+depending on Galaxy.
 
 ## Goals
 
@@ -14,8 +14,6 @@ install collections without depending on Galaxy.
   static host can serve.
 - **Be polite to Galaxy:** one request at a time, backoff, a descriptive
   User-Agent, and as few requests as possible when nothing has changed.
-- **Support existing tooling** with a static copy of the Galaxy endpoints
-  `ansible-galaxy collection install` reads, until the alai client exists.
 
 ## Usage
 
@@ -25,11 +23,11 @@ uv run galaxy-sync COMMAND [OPTIONS] ...
 
 | Command | Purpose |
 |---|---|
-| `sync [--budget MINUTES] [--dry-run]` | Find what changed on Galaxy and queue it, reconcile `refresh` requests first, sweep once a day, then reconcile the rest of the queue until the budget (default 45 minutes) runs out. The rest stays queued for the next run, so the initial import is built up over many runs. `--dry-run` only reports what changed |
+| `sync [--budget MINUTES] [--dry-run]` | Find what changed on Galaxy and queue it, reconcile `refresh` requests first, carry on any rebuild, re-extract `ansible.builtin` when ansible-core has a new minor release on PyPI, sweep once a day, then reconcile the rest of the queue until the budget (default 45 minutes) runs out. The rest stays queued for the next run, so the initial import is built up over many runs. `--dry-run` only reports what changed |
 | `refresh [NS[.NAME]...] [--revalidate]` | Ask the next `sync` to reconcile these namespaces or collections ahead of everything else, or with no targets to sweep: compare every published version with the mirror. `--revalidate` also checks every mirrored version's artifact against the one Galaxy publishes now. Writes a request and returns; it doesn't contact Galaxy |
 | `refresh --ack NS.NAME:VERSION... --note TEXT` | Ask the next `sync` to acknowledge these versions' conflicts once a person has inspected them, so they're no longer reported. The note is published with the conflict ([conflicts](docs/sync.md#conflicts)) |
-| `rebuild [--dl TEMPLATE] [--no-galaxy-view]` | Regenerate the files derived from the index without contacting Galaxy. `--dl` sets the artifact URL template used by `config.json` and the Galaxy view (default: `dl.alai.sh`); later runs keep it, and a plain `rebuild` resets it. `--no-galaxy-view` leaves the Galaxy view and the artifact URL template alone, which skips most of a rebuild's time (it can't be combined with `--dl`) |
-| `builtin SRC` | Re-extract `ansible.builtin`'s plugins from an ansible-core checkout or sdist and replace its lines in `plugins.jsonl`. Every later `sync` keeps them, so it can run alongside one |
+| `refresh --rebuild` | Ask the next `sync` to regenerate every file derived from the index, without contacting Galaxy: the plugin index (`ansible.builtin` extracted again too), the conflict records and `collections.json`. A rebuild that runs out of time carries on in the next `sync` |
+| `refresh --dl TEMPLATE` | Ask the next `sync` to move the artifact URL template in `config.json`; later runs keep it. Can be combined with `--rebuild` |
 
 | Option | Commands | |
 |---|---|---|
@@ -37,6 +35,7 @@ uv run galaxy-sync COMMAND [OPTIONS] ...
 | `--r2` | all | Write to the R2 buckets, configured from the environment ([storage](docs/storage.md)) |
 | `-v` | all | Debug logging |
 | `--galaxy-url URL` | `sync` | Galaxy server (default `https://galaxy.ansible.com`) |
+| `--pypi-url URL` | `sync` | PyPI, for ansible-core releases (default `https://pypi.org`) |
 | `--strict` | `sync` | Exit 1 while any failure or unacknowledged conflict is outstanding |
 | `--report FILE` | `sync` | Write the outstanding failures and unacknowledged conflicts as a Markdown block for the tracking issue |
 | `--alerts DIR` | `sync` | Write a Markdown comment per conflict opened this run, and one for the failures that became persistent, into `DIR` |
@@ -55,9 +54,9 @@ The workflows are described in [scheduling](docs/sync.md#scheduling).
 | Every 10 minutes, dispatched by the scheduler in `scheduler/` | `sync.yml` | Picks up new versions, deletions and deprecations; sweeps once a day for what that can't see quickly; works through the initial import 45 minutes at a time |
 | Manual | `refresh.yml` with targets | Resyncs specific collections on the next run, ahead of any backlog: a release needed urgently, a collection that looks out of date, or a version that keeps failing |
 | Manual | `refresh.yml` without targets | Sweeps on the next run, e.g. after `deletions_suspected`, instead of waiting for the daily one |
-| Manual, after inspecting a conflict | `refresh.yml` with `acknowledge` and `note` | Stops reporting the conflict, records the note publicly, and marks its alert comment resolved |
-| After moving the artifacts or changing the Galaxy view format | `rebuild.yml` with `dl` | Rewrites every derived file |
-| After an ansible-core minor release | `builtin.yml` with its release tag, e.g. `v2.21.0` | Updates `ansible.builtin` in the plugin index |
+| After changing how plugin lines are derived | `refresh.yml` with `rebuild` | Rewrites every derived file over the next syncs |
+| After moving the artifacts | `refresh.yml` with `dl` | Points `config.json` at the new location on the next sync |
+| Manual, after inspecting a conflict | `acknowledge.yml` with the conflicts and a note | Stops reporting the conflict, records the note publicly, and marks its alert comment resolved |
 
 The scheduled run keeps the outstanding failures and unacknowledged
 conflicts at the top of a tracking issue's description, and posts each new
@@ -74,7 +73,5 @@ heartbeat ping from every successful run catches the runs stopping.
   credentials.
 - [Index format](docs/index-spec/README.md) and [plugin index](docs/index-spec/plugins.md):
   what clients read.
-- [Galaxy v3 view](docs/galaxy-v3-view.md): the static copy of Galaxy's API
-  for `ansible-galaxy`.
 
 Development notes are in [AGENTS.md](AGENTS.md).

@@ -10,12 +10,12 @@ on:
         description: Also check every mirrored artifact against the one Galaxy publishes now (needs targets)
         type: boolean
         default: false
-      acknowledge:
-        description: Space-separated NS.NAME:VERSION conflicts to acknowledge instead (leave targets empty)
-        type: string
-        default: ""
-      note:
-        description: Why the conflicts are acknowledged; published with them
+      rebuild:
+        description: Rebuild every file derived from the index instead, over as many syncs as it takes (leave targets empty)
+        type: boolean
+        default: false
+      dl:
+        description: Move the artifact URL template in config.json to this instead (leave targets empty)
         type: string
         default: ""
 
@@ -53,27 +53,25 @@ jobs:
       # Inputs go through the environment, never into the script itself.
       run: |
         read -ra targets <<< "$TARGETS"
-        read -ra acknowledge <<< "$ACKNOWLEDGE"
         args=()
         if [ "$REVALIDATE" = "true" ]; then
           args+=(--revalidate)
         fi
-        for conflict in "${acknowledge[@]}"; do
-          args+=(--ack "$conflict")
-        done
-        if [ -n "$NOTE" ]; then
-          args+=(--note "$NOTE")
+        if [ "$REBUILD" = "true" ]; then
+          args+=(--rebuild)
+        fi
+        if [ -n "$DL" ]; then
+          args+=(--dl "$DL")
         fi
         uv run --locked galaxy-sync refresh --r2 -v "${args[@]}" -- "${targets[@]}"
       env:
         TARGETS: ${{ inputs.targets }}
         REVALIDATE: ${{ inputs.revalidate }}
-        ACKNOWLEDGE: ${{ inputs.acknowledge }}
-        NOTE: ${{ inputs.note }}
+        REBUILD: ${{ inputs.rebuild }}
+        DL: ${{ inputs.dl }}
         R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
         R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         ALAI_INDEX_BUCKET: ${{ vars.ALAI_INDEX_BUCKET }}
         ALAI_DL_BUCKET: ${{ vars.ALAI_DL_BUCKET }}
-        ALAI_GALAXY_BUCKET: ${{ vars.ALAI_GALAXY_BUCKET }}
         ALAI_STATE_BUCKET: ${{ vars.ALAI_STATE_BUCKET }}
