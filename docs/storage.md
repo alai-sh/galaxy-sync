@@ -69,19 +69,7 @@ recording when in `state.json` (`retired_index_files`). One still retired
 yank is undone, stops being retired. The spec asks for 7 days, far longer
 than any copy of `collections.json` lives in a cache, so a client holding an
 older one still finds the files it names. Pruning also clears files left by
-a run that stopped, and the old files by name from before this layout.
-
-**Moving to this layout.** Index files used to be published by name in the
-index bucket, which was also the copy the sync read. The first sync of a
-store like that moves them before doing anything else, as nothing can be
-reconciled until state points at them: for each collection, in
-(namespace, name) order, it publishes the file by its sha256 and points
-state at it, keeping its place in `state.json` (`migration.after`)
-so a run that runs out of budget carries on in the next. Once every file is
-moved, it sets `index_files` and writes `config.json`, `plugins.jsonl` and
-`collections.json` even where unchanged, so they get the new Cache-Control.
-The old files are left for pruning, a week later. Remove this once the
-stored index has been moved.
+a run that stopped.
 
 ## state.json
 
@@ -92,8 +80,6 @@ stored index has been moved.
 | `last_sweep` | When the last sweep finished; the next is due a day later |
 | `builtin` | The daily ansible-core check: `checked`, and the `version` and `format` (`EXTRACTION_FORMAT`) `builtin.jsonl` was extracted with |
 | `rebuild` | A requested rebuild that isn't finished: `requested`, and `after`, the last collection done |
-| `index_files` | `sha256` once index files are published by their sha256 ([index files](#index-files)) |
-| `migration` | Moving index files to that layout, until it's done: `after`, the last collection moved |
 | `retired_index_files` | Index bucket keys under `index/` that no `collections.json` names, and when a prune first found each |
 | `last_prune` | When retired index files were last pruned; the next is due a day later |
 | `plugins_pending` | Collections reconciled since `plugins.jsonl` was last merged; normally empty between runs |

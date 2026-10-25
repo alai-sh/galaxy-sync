@@ -4,6 +4,12 @@ Mirrors every collection on galaxy.ansible.com into the alai static index and
 artifact store, so the alai client can install collections without
 depending on Galaxy.
 
+> [!WARNING]
+> This isn't designed for public use. It exists only to sync the alai index
+> at index.alai.sh, and its commands, options, storage layout and state can
+> change at any time without notice. To install collections, use the alai
+> client, which reads the published index.
+
 ## Goals
 
 - **Mirror everything Galaxy publishes**, pre-releases and dev builds

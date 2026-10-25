@@ -15,9 +15,8 @@ import datetime
 import hashlib
 import json
 import logging
-import re
 import secrets
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Sequence
 from compression import zstd
 from typing import cast
 
@@ -96,9 +95,6 @@ LINE_FIELDS = (
 )
 
 
-_SHA256_RE = re.compile(r"[0-9a-f]{64}")
-
-
 def _dump(obj: object) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
@@ -118,18 +114,6 @@ def _write(backend: Backend, key: str, text: str) -> bool:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def _name_keys(keys: Iterable[str]) -> list[tuple[str, str]]:
-    """(namespace, name) of each `index/<ns>/<name>.jsonl` key, leaving out any published by sha256."""
-    result: list[tuple[str, str]] = []
-    for key in keys:
-        parts = key.split("/")
-        if len(parts) == 3 and parts[2].endswith(".jsonl"):
-            stem = parts[2].removesuffix(".jsonl")
-            if not (_SHA256_RE.fullmatch(stem) and parts[1] == stem[:2]):
-                result.append((parts[1], stem))
-    return result
 
 
 def _read_jsonl(data: bytes | None) -> list[object]:
@@ -604,60 +588,15 @@ class Store:
             {line["vers"]: extractions[line["cksum"]] for line in lines if line["cksum"] in extractions},
         )
 
-    # Index files used to be published by name in the index bucket, and read
-    # from there. The first sync after that changed publishes each one by its
-    # sha256 and points state at it, before doing anything else, as nothing
-    # can be reconciled until it's done. Remove this once the stored index has
-    # been moved.
-
-    def needs_migration(self) -> bool:
-        """Whether index files still have to be moved to the sha256 layout. A new store has nothing to move."""
-        if "index_files" in self.state:
-            return False
-        if "migration" not in self.state:
-            if not self.legacy_index_files():
-                self.state["index_files"] = "sha256"
-                return False
-            self.state["migration"] = {}
-        return True
-
-    def legacy_index_files(self) -> list[tuple[str, str]]:
-        """(namespace, name) of every index file still published by name in the index bucket, from before."""
-        return _name_keys(self.index.list("index/"))
-
-    def migrate_collection(self, namespace: str, name: str) -> None:
-        """Publish one collection's index file by its sha256, from its old file by name, and point state at it.
-
-        The old file stays until pruning removes it, as no listing names it.
-        """
-        data = self.index.read(f"index/{namespace}/{name}.jsonl") or b""
-        sha256 = _sha256(data)
-        self.index.write(self.index_key(sha256), data)
-        self.collection_state(f"{namespace}.{name}")["sha256"] = sha256
-
-    def finish_migration(self) -> None:
-        """Point config.json at the sha256 layout, once every index file is published by it.
-
-        config.json, collections.json and plugins.jsonl are written even if
-        their content is the same, so they get the index bucket's new
-        Cache-Control.
-        """
-        _ = self.state.pop("migration", None)
-        self.state["index_files"] = "sha256"
-        self.write_config(force=True)
-        if (plugins := self.index.read("plugins.jsonl")) is not None:
-            _ = self._write_index_file("plugins.jsonl", plugins.decode(), force=True)
-        self.write_collections(force=True)
-
-    def write_config(self, *, force: bool = False) -> None:
+    def write_config(self) -> None:
         config = {
             "formats": {"1": {"index": INDEX_TEMPLATE, "collections": "collections.json", "plugins": "plugins.jsonl"}},
             "dl": self.dl_url,
             "moved-to": None,
         }
-        _ = self._write_index_file("config.json", json.dumps(config, indent=2) + "\n", force=force)
+        _ = self._write_index_file("config.json", json.dumps(config, indent=2) + "\n")
 
-    def write_collections(self, *, force: bool = False) -> None:
+    def write_collections(self) -> None:
         """Write collections.json, after every other index bucket file.
 
         Each collection's `sha256` comes from state, so writing it reads no
@@ -673,18 +612,13 @@ class Store:
             namespaces.setdefault(ns, {})[name] = {"updated": state.get("updated") or now(), "sha256": sha256}
         self.purge()
         text = json.dumps({"v": 1, "namespaces": namespaces}, indent=1) + "\n"
-        _ = self._write_index_file("collections.json", text, force=force)
+        _ = self._write_index_file("collections.json", text)
         self.purge()
         self._listed = {entry["sha256"] for entries in namespaces.values() for entry in entries.values()}
 
-    def _write_index_file(self, key: str, text: str, *, force: bool = False) -> bool:
-        """Write one index bucket file, noting it for the next purge if it changed. With `force`, written and purged
-        even if it's the same."""
-        if force:
-            self.index.write(key, text.encode())
-            changed = True
-        else:
-            changed = _write(self.index, key, text)
+    def _write_index_file(self, key: str, text: str) -> bool:
+        """Write one index bucket file, noting it for the next purge if it changed."""
+        changed = _write(self.index, key, text)
         if changed:
             self._unpurged[key] = None
         return changed

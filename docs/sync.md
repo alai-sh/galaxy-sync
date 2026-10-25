@@ -55,29 +55,26 @@ What to reconcile is kept in `state.json` (`pending`), not in the run. A run
 that's stopped, times out or crashes loses nothing, and every run does the
 same work, so it doesn't matter which run picks it up. Each `sync`:
 
-1. **Moves index files** to the sha256 layout, for a store from before it,
-   and does nothing else until that's done
-   ([storage](storage.md#index-files)).
-2. **Finds changes** (below) and queues them, then saves the feed cursor.
+1. **Finds changes** (below) and queues them, then saves the feed cursor.
    Something found is saved in the queue before the cursor moves past it.
-3. **Takes requests.** `refresh` doesn't reconcile anything itself. It writes
+2. **Takes requests.** `refresh` doesn't reconcile anything itself. It writes
    a request object under `requests/` in the state bucket, which the next
    sync queues and deletes. A request names collections or namespaces,
    asks for a sweep, a rebuild or a new artifact URL template, or
    acknowledges conflicts. A namespace that can't be listed keeps its
    request for the next run.
-4. **Works what was requested,** ahead of everything else: the requested
+3. **Works what was requested,** ahead of everything else: the requested
    collections, then any rebuild ([below](#rebuilds)).
-5. **Checks ansible-core** once a day ([below](#ansiblebuiltin)).
-6. **Sweeps** once a day (below), queueing everything that differs. It comes
+4. **Checks ansible-core** once a day ([below](#ansiblebuiltin)).
+5. **Sweeps** once a day (below), queueing everything that differs. It comes
    after the requested work, since it can take most of the budget,
    and isn't started once the budget has run out: it runs to the end once
    started, so the next run does it instead.
-7. **Works the rest of the queue** in order: new uploads, then what the
+6. **Works the rest of the queue** in order: new uploads, then what the
    listing and the sweep found, which includes the initial import's backlog.
    Collections with outstanding failures come last. A collection leaves the
    queue once reconciled; one that ran out of time part way stays queued.
-8. **Stops starting new work** once `--budget` minutes (default 45) have
+7. **Stops starting new work** once `--budget` minutes (default 45) have
    passed since the run started, sweep included. That applies to requested
    collections too, so a requested collection too big for one run carries on
    in the next, still first in the queue. The run then writes the aggregate

@@ -241,62 +241,6 @@ def test_stopped_run_keeps_the_old_file(tmp_path):
     assert Store(Buckets.local(tmp_path)).read_index("ns", "coll") == [LINE]
 
 
-def _legacy_store(tmp_path):
-    """A store from before index files were published by sha256: each by name in the index bucket."""
-    buckets = Buckets.local(tmp_path)
-    for name in ("one", "two"):
-        buckets.index.write(f"index/ns/{name}.jsonl", (json.dumps({**LINE, "name": f"ns.{name}"}) + "\n").encode())
-    buckets.index.write("plugins.jsonl", b"")
-    state = {"collections": {"ns.one": {"versions": {}, "updated": "2026-01-01T00:00:00Z", "sha256": "x" * 64}}}
-    buckets.state.write("state.json", json.dumps({**state, "conflicts": [], "failures": {}, "pending": {}}).encode())
-    return buckets
-
-
-def test_new_store_needs_no_migration(tmp_path):
-    store = Store(Buckets.local(tmp_path))
-    assert not store.needs_migration()
-    assert store.state["index_files"] == "sha256"
-
-
-def test_migration(tmp_path):
-    buckets = _legacy_store(tmp_path)
-    store = Store(buckets)
-    assert store.needs_migration()
-    assert store.legacy_index_files() == [("ns", "one"), ("ns", "two")]
-
-    for ns, name in store.legacy_index_files():
-        store.migrate_collection(ns, name)
-    store.finish_migration()
-
-    assert not store.needs_migration()
-    assert "migration" not in store.state
-    config = json.loads(buckets.index.read("config.json") or b"")
-    assert config["formats"]["1"]["index"] == "index/{sha256-prefix}/{sha256-checksum}.jsonl"
-    assert store.index_collections() == [("ns", "one"), ("ns", "two")]
-    for name in ("one", "two"):
-        data = buckets.index.read(f"index/ns/{name}.jsonl")  # the old file stays until pruned
-        assert data is not None
-        assert _published(store, data) == data
-        assert store.read_index("ns", name) == [{**LINE, "name": f"ns.{name}"}]
-        # The sha256 is taken from the file, replacing whatever state had.
-        assert _listed(store, name)["sha256"] == hashlib.sha256(data).hexdigest()
-    assert _listed(store, "one")["updated"] == "2026-01-01T00:00:00Z"
-    # Old files by name aren't mistaken for collections, nor published ones for old files.
-    assert store.legacy_index_files() == [("ns", "one"), ("ns", "two")]
-
-
-def test_migration_rewrites_unchanged_files(tmp_path):
-    buckets = _legacy_store(tmp_path)
-    store = Store(buckets)
-    written = []
-    write = buckets.index.write
-    buckets.index.write = lambda key, data: (written.append(key), write(key, data))  # pyright: ignore[reportAttributeAccessIssue]
-    assert store.needs_migration()
-    store.finish_migration()
-    # Rewritten even where unchanged, so each gets the bucket's new Cache-Control.
-    assert {"config.json", "plugins.jsonl", "collections.json"} <= set(written)
-
-
 def test_prune(tmp_path, monkeypatch):
     store = Store(Buckets.local(tmp_path))
     _ = store.write_index("ns", "coll", [LINE])

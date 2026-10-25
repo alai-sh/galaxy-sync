@@ -459,35 +459,6 @@ def _rebuild(store: Store, deadline: float) -> bool:
     return True
 
 
-def _migrate(store: Store, deadline: float) -> bool:
-    """Move index files to the sha256 layout until `deadline`; True once nothing is left to move.
-
-    Progress is kept in state, like a rebuild's, so a run that runs out of
-    time, or stops, carries on from the last collection moved. Remove this
-    once the stored index has been moved.
-    """
-    if not store.needs_migration():
-        return True
-    progress = store.state.setdefault("migration", {})
-    after = tuple(progress["after"].split(".", 1)) if "after" in progress else None
-    targets = [c for c in store.legacy_index_files() if after is None or c > after]
-    print(f"moving index files to the sha256 layout: {len(targets)} collections to go")
-    for i, (ns, name) in enumerate(targets):
-        if time.monotonic() >= deadline:
-            print(f"moving index files: out of time, {len(targets) - i} collections left for the next run")
-            store.save_state()
-            return False
-        store.migrate_collection(ns, name)
-        progress["after"] = f"{ns}.{name}"
-        store.add_work()
-        if store.save_due():
-            store.save_state()  # keep progress if the run stops
-    store.finish_migration()
-    store.save_state()
-    print("moving index files: done; config.json now points at index files by sha256")
-    return True
-
-
 def _builtin(client: GalaxyClient, store: Store) -> bool:
     """Re-extract ansible.builtin if ansible-core has a new minor release; True if it changed."""
     try:
@@ -691,8 +662,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
     deadline = started + args.budget * 60
     client = GalaxyClient(args.galaxy_url)
     store = _open_store(args)
-    if not args.dry_run and not _migrate(store, deadline):
-        return _exit_code(store, args)  # nothing else until every index file is moved
     initial = "feed_cursor" not in store.state
     previous = store.state.get("repo_published")
     res = discover(client, store)
