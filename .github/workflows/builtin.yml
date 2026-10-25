@@ -1,0 +1,61 @@
+name: Builtin
+on:
+  workflow_dispatch:
+    inputs:
+      ansible_core_ref:
+        description: The ansible-core release tag to extract ansible.builtin from, e.g. v2.21.5
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+# Syncs keep running: this writes only builtin.jsonl and plugins.jsonl, and a
+# sync merging plugins.jsonl takes ansible.builtin from builtin.jsonl.
+concurrency:
+  group: builtin
+
+jobs:
+  builtin:
+    name: builtin
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: r2
+    steps:
+    # The release to run, not main: see "Releases" in docs/sync.md.
+    - name: Check the release
+      env:
+        REF: ${{ vars.GALAXY_SYNC_REF }}
+      run: |
+        if [ -z "$REF" ]; then
+          echo "::error::set the GALAXY_SYNC_REF repository variable to the tag to run"
+          exit 1
+        fi
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        ref: ${{ vars.GALAXY_SYNC_REF }}
+        persist-credentials: false
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        repository: ansible/ansible
+        ref: ${{ inputs.ansible_core_ref }}
+        path: ansible-core
+        persist-credentials: false
+
+    - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+
+    - name: Extract ansible.builtin
+      run: uv run --locked galaxy-sync builtin --r2 -v ansible-core
+      env:
+        R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        ALAI_INDEX_BUCKET: ${{ vars.ALAI_INDEX_BUCKET }}
+        ALAI_DL_BUCKET: ${{ vars.ALAI_DL_BUCKET }}
+        ALAI_GALAXY_BUCKET: ${{ vars.ALAI_GALAXY_BUCKET }}
+        ALAI_STATE_BUCKET: ${{ vars.ALAI_STATE_BUCKET }}
+        CLOUDFLARE_PURGE_TOKEN: ${{ secrets.CLOUDFLARE_PURGE_TOKEN }}
+        CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}
+        ALAI_INDEX_URL: ${{ vars.ALAI_INDEX_URL }}

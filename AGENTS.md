@@ -41,7 +41,7 @@ never a real bucket.
 
 | Module | |
 |---|---|
-| `cli.py` | The `sync`, `refresh` and `rebuild` commands. The only module allowed to `print`; the others log decisions at INFO and each request or step at DEBUG (`-v`) |
+| `cli.py` | The `sync`, `refresh`, `rebuild` and `builtin` commands. The only module allowed to `print`; the others log decisions at INFO and each request or step at DEBUG (`-v`) |
 | `reconcile.py` | `reconcile()`, the single per-collection code path, and the only code that adds, yanks or flags a version |
 | `changes.py` | Finding which collections to reconcile: `discover()` every run, the daily `sweep()`, `check_count()`, `resolve_targets()` |
 | `galaxy.py` | The Galaxy HTTP client, with retries. Contract endpoints unless a method's docstring says best effort |
@@ -77,7 +77,9 @@ gitignored.
 - **Runs never overlap, and work lives in the queue.** Every run reads
   `state.json` and writes it back whole. Anything found is queued in state
   before the cursor moves past it, so a run that stops early loses nothing.
-  `refresh` only writes a request object, never state.
+  `refresh` only writes a request object, never state. `builtin` never
+  writes state either: it can overlap a sync because every merge of
+  `plugins.jsonl` takes `ansible.builtin`'s lines from `builtin.jsonl`.
 - **Failures never stop a run.** Record them in the ledger (per version where
   possible) and carry on. Extraction failures still mirror the artifact and
   index line. Recorded failures exit `0`; `--strict` exits `1`.
