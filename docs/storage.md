@@ -71,6 +71,16 @@ than any copy of `collections.json` lives in a cache, so a client holding an
 older one still finds the files it names. Pruning also clears files left by
 a run that stopped.
 
+**Dropping fields.** Index lines used to carry `origin` and
+`upstream_conflict`, which the spec no longer has (`store.DROPPED_FIELDS`).
+The first syncs after they were dropped publish every collection's index
+file again without them, after the requested collections, in (namespace,
+name) order, keeping their place in `state.json` (`migration.after`) so a
+run that runs out of budget carries on in the next. Until a file is
+rewritten, `read_index` leaves those fields out of its lines, so a
+reconcile writes it without them too. The old files are left for pruning.
+Remove this once `migration.done` is set in the stored state.
+
 ## state.json
 
 | Key | Meaning |
@@ -80,6 +90,7 @@ a run that stopped.
 | `last_sweep` | When the last sweep finished; the next is due a day later |
 | `builtin` | The daily ansible-core check: `checked`, and the `version` and `format` (`EXTRACTION_FORMAT`) `builtin.jsonl` was extracted with |
 | `rebuild` | A requested rebuild that isn't finished: `requested`, and `after`, the last collection done |
+| `migration` | Rewriting index files without the dropped fields: `after`, the last collection rewritten, until `done` |
 | `retired_index_files` | Index bucket keys under `index/` that no `collections.json` names, and when a prune first found each |
 | `last_prune` | When retired index files were last pruned; the next is due a day later |
 | `plugins_pending` | Collections reconciled since `plugins.jsonl` was last merged; normally empty between runs |

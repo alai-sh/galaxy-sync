@@ -128,9 +128,7 @@ class IndexLine(TypedDict):
     requires_ansible: NotRequired[str]
     yanked: bool
     deprecated: NotRequired[bool]
-    origin: str
     published: str
-    upstream_conflict: NotRequired[bool]
 
 
 class PluginLine(TypedDict):
@@ -251,6 +249,11 @@ class RebuildState(TypedDict):
     after: NotRequired[str]  # the last collection rebuilt, in (namespace, name) order
 
 
+class MigrationState(TypedDict):
+    after: NotRequired[str]  # the last collection rewritten without the dropped fields, in (namespace, name) order
+    done: NotRequired[bool]  # every index file is without them
+
+
 class SyncState(TypedDict):
     collections: dict[str, CollectionState]
     conflicts: list[Conflict]
@@ -263,6 +266,7 @@ class SyncState(TypedDict):
     plugins_pending: NotRequired[list[str]]  # collections whose plugin lines aren't in plugins.jsonl yet
     builtin: NotRequired[BuiltinState]
     rebuild: NotRequired[RebuildState]  # a requested rebuild that isn't finished yet
+    migration: NotRequired[MigrationState]  # rewriting index files without fields dropped from the spec
     retired_index_files: NotRequired[dict[str, str]]  # index bucket keys no listing names, and since when
     last_prune: NotRequired[str]  # when retired index files were last pruned
 

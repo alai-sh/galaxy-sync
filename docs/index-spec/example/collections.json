@@ -4,17 +4,17 @@
     "alai_example": {
       "demo": {
         "updated": "2026-09-20T09:00:00Z",
-        "sha256": "e1fb67d80905db40370edd06446b9617c8ade7ef6458c38f14f6a86dc2cdd332"
+        "sha256": "605a4d6889b5538c4898bf11276f380f8146b5e017735926cf9516c9432ebf9b"
       }
     },
     "community": {
       "general": {
         "updated": "2026-10-05T17:30:02Z",
-        "sha256": "59976e13dfbe811cee5e2c21744daf8eeda377a3a0f7f618a538a42ad947fcd2"
+        "sha256": "a4472ff7659bc3d80663664d2abe233c48b8cc40af100c5d43b4efb4dc1a29cf"
       },
       "library_inventory_filtering_v1": {
         "updated": "2025-10-25T11:31:55Z",
-        "sha256": "f92ce559b6ca24a4f01855d02195e086e399df38de461b596999b2930857b9c3"
+        "sha256": "6cdcc7c93ebabc19be364ff579267dce86961c1c0f4fd24ee7b530597b2c007b"
       }
     }
   }

@@ -42,7 +42,7 @@ never a real bucket.
 | Module | |
 |---|---|
 | `cli.py` | The `sync` and `refresh` commands. The only module allowed to `print`; the others log decisions at INFO and each request or step at DEBUG (`-v`) |
-| `reconcile.py` | `reconcile()`, the single per-collection code path, and the only code that adds, yanks or flags a version |
+| `reconcile.py` | `reconcile()`, the single per-collection code path, and the only code that adds, yanks a version, or opens a conflict |
 | `changes.py` | Finding which collections to reconcile: `discover()` every run, the daily `sweep()`, `check_count()`, `resolve_targets()` |
 | `galaxy.py` | The Galaxy HTTP client, with retries. Contract endpoints unless a method's docstring says best effort |
 | `artifacts.py` | Reading tarballs held in memory: `MANIFEST.json` and the contents digest |
