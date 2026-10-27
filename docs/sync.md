@@ -64,9 +64,7 @@ same work, so it doesn't matter which run picks it up. Each `sync`:
    acknowledges conflicts. A namespace that can't be listed keeps its
    request for the next run.
 3. **Works what was requested,** ahead of everything else: the requested
-   collections, then rewriting index files with `sha256` for `cksum`
-   until that's done ([storage](storage.md#index-files)),
-   then any rebuild ([below](#rebuilds)).
+   collections, then any rebuild ([below](#rebuilds)).
 4. **Checks ansible-core** once a day ([below](#ansiblebuiltin)).
 5. **Sweeps** once a day (below), queueing everything that differs. It comes
    after the requested work, since it can take most of the budget,

@@ -71,16 +71,6 @@ than any copy of `collections.json` lives in a cache, so a client holding an
 older one still finds the files it names. Pruning also clears files left by
 a run that stopped.
 
-**Renaming `cksum`.** Index lines used to call the artifact's `sha256`
-`cksum` (`store.RENAMED_FIELD`). The first syncs after the rename publish
-every collection's index file again with `sha256`, after the requested
-collections, in (namespace, name) order, keeping their place in
-`state.json` (`migrate_cksum.after`) so a run that runs out of budget
-carries on in the next. Until a file is rewritten, `read_index` renames
-the field in its lines, so a reconcile writes it with `sha256` too. The old
-files are left for pruning. Remove this once `migrate_cksum.done` is set in
-the stored state.
-
 ## state.json
 
 | Key | Meaning |
@@ -90,7 +80,6 @@ the stored state.
 | `last_sweep` | When the last sweep finished; the next is due a day later |
 | `builtin` | The daily ansible-core check: `checked`, and the `version` and `format` (`EXTRACTION_FORMAT`) `builtin.jsonl` was extracted with |
 | `rebuild` | A requested rebuild that isn't finished: `requested`, and `after`, the last collection done |
-| `migrate_cksum` | Rewriting index files with `sha256` for `cksum`: `after`, the last collection rewritten, until `done` |
 | `retired_index_files` | Index bucket keys under `index/` that no `collections.json` names, and when a prune first found each |
 | `last_prune` | When retired index files were last pruned; the next is due a day later |
 | `plugins_pending` | Collections reconciled since `plugins.jsonl` was last merged; normally empty between runs |

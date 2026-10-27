@@ -41,7 +41,7 @@ from .galaxy import BASE_URL, GalaxyClient, GalaxyError
 from .models import Pending, Request
 from .reconcile import Result, reconcile
 from .storage import Buckets, R2Config, StorageError
-from .store import GLOBAL, RENAMED_FIELD, RETIRED_GRACE, SOURCES, Store
+from .store import GLOBAL, RETIRED_GRACE, SOURCES, Store
 from .times import now
 
 # How often `sync` runs the full sweep.
@@ -457,35 +457,6 @@ def _rebuild(store: Store, deadline: float) -> bool:
     return True
 
 
-def _migrate(store: Store, deadline: float) -> int:
-    """Rewrite index files with `sha256` in place of RENAMED_FIELD until `deadline`; returns how many changed.
-
-    Progress is kept in state, like a rebuild's, so a run that runs out of
-    time, or stops, carries on from the last collection rewritten. Remove
-    this once every index file has been rewritten.
-    """
-    if not store.needs_migration():
-        return 0
-    progress = store.state.setdefault("migrate_cksum", {})
-    after = tuple(progress["after"].split(".", 1)) if "after" in progress else None
-    targets = [c for c in store.index_collections() if after is None or c > after]
-    print(f"rewriting index files with sha256 for {RENAMED_FIELD}: {len(targets)} collections to go")
-    changed = 0
-    for i, (ns, name) in enumerate(targets):
-        if time.monotonic() >= deadline:
-            print(f"rewriting index files: out of time, {len(targets) - i} collections left for the next run")
-            return changed
-        changed += store.migrate_collection(ns, name)
-        progress["after"] = f"{ns}.{name}"
-        store.add_work()
-        if store.save_due():
-            store.save_state()  # keep progress if the run stops
-    progress["done"] = True
-    _ = progress.pop("after", None)
-    print(f"rewriting index files: done, {changed} changed")
-    return changed
-
-
 def _builtin(client: GalaxyClient, store: Store) -> bool:
     """Re-extract ansible.builtin if ansible-core has a new minor release; True if it changed."""
     try:
@@ -727,14 +698,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
     # What a person asked for goes before the sweep, which can take most of the budget.
     worked: dict[str, Result | str] = {}
     _work(client, store, deadline, worked, requested=True)
-    migrated = _migrate(store, deadline)
     rebuilt = _rebuild(store, deadline)
     extracted = builtin.due(store) and _builtin(GalaxyClient(args.pypi_url), store)
     # Once started, the sweep runs to the end, so it isn't started after the
     # budget has run out; the next run starts with it instead.
     swept = time.monotonic() < deadline and _sweep_due(store) and _sweep(client, store)
     _work(client, store, deadline, worked)
-    if res.unchanged and not (taken or migrated or rebuilt or extracted or swept or worked):
+    if res.unchanged and not (taken or rebuilt or extracted or swept or worked):
         store.save_state()  # the builtin check's time, and any failure recorded
         return _exit_code(store, args)  # nothing changed: skip rewriting the aggregate files
     if not res.unchanged or swept:

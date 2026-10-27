@@ -152,17 +152,6 @@ def test_read_index_missing_file(tmp_path):
         _ = store.read_index("ns", "coll")
 
 
-def test_read_index_renames_cksum(tmp_path):
-    store = Store(Buckets.local(tmp_path))
-    old = {("cksum" if k == "sha256" else k): v for k, v in LINE.items()}
-    _ = store.write_index("ns", "coll", [old])  # pyright: ignore[reportArgumentType]
-    old_sha256 = store.state["collections"]["ns.coll"]["sha256"]
-    assert store.read_index("ns", "coll") == [LINE]
-    assert store.migrate_collection("ns", "coll")
-    assert store.state["collections"]["ns.coll"]["sha256"] != old_sha256
-    assert not store.migrate_collection("ns", "coll")  # already has sha256
-
-
 def _published(store, data):
     sha256 = hashlib.sha256(data).hexdigest()
     return store.index.read(f"index/{sha256[:2]}/{sha256}.jsonl")

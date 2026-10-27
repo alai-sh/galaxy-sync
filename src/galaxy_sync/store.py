@@ -91,10 +91,6 @@ LINE_FIELDS = (
     "published",
 )
 
-# Index lines used to call `sha256` this; read_index renames it until every
-# index file is rewritten (Store.migrate_collection).
-RENAMED_FIELD = "cksum"
-
 
 def _dump(obj: object) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
@@ -551,11 +547,7 @@ class Store:
         if (data := self.index.read(self.index_key(sha256))) is None:
             # Never treated as empty, which would mirror the whole collection again.
             raise StorageError(f"{fqcn}'s index file {self.index_key(sha256)} is missing")
-        lines = cast(list[dict[str, object]], _read_jsonl(data))
-        for line in lines:
-            if RENAMED_FIELD in line:
-                line["sha256"] = line.pop(RENAMED_FIELD)
-        return cast(list[IndexLine], lines)
+        return cast(list[IndexLine], _read_jsonl(data))
 
     def write_index(self, namespace: str, name: str, lines: list[IndexLine]) -> bool:
         """Publish an index file by its sha256 and point state at it, returning False if it was already the same.
@@ -588,23 +580,6 @@ class Store:
             name,
             {line["vers"]: extractions[line["sha256"]] for line in lines if line["sha256"] in extractions},
         )
-
-    # Index lines used to call `sha256` RENAMED_FIELD. The first syncs after
-    # the rename publish every index file again with `sha256`, keeping their
-    # place in state (`migrate_cksum.after`), and read_index renames it in
-    # lines read until then. Remove this once every index file has been
-    # rewritten.
-
-    def needs_migration(self) -> bool:
-        """Whether index files may still have lines with RENAMED_FIELD."""
-        return not self.state.get("migrate_cksum", {}).get("done", False)
-
-    def migrate_collection(self, namespace: str, name: str) -> bool:
-        """Publish one collection's index file again with `sha256`; False if it already had it.
-
-        The old file stays until pruning removes it, as no listing names it.
-        """
-        return self.write_index(namespace, name, self.read_index(namespace, name))
 
     def write_config(self) -> None:
         config = {

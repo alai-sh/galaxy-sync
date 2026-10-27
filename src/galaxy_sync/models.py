@@ -249,11 +249,6 @@ class RebuildState(TypedDict):
     after: NotRequired[str]  # the last collection rebuilt, in (namespace, name) order
 
 
-class MigrationState(TypedDict):
-    after: NotRequired[str]  # the last collection rewritten with `sha256` for `cksum`, in (namespace, name) order
-    done: NotRequired[bool]  # every index file has `sha256`
-
-
 class SyncState(TypedDict):
     collections: dict[str, CollectionState]
     conflicts: list[Conflict]
@@ -266,7 +261,6 @@ class SyncState(TypedDict):
     plugins_pending: NotRequired[list[str]]  # collections whose plugin lines aren't in plugins.jsonl yet
     builtin: NotRequired[BuiltinState]
     rebuild: NotRequired[RebuildState]  # a requested rebuild that isn't finished yet
-    migrate_cksum: NotRequired[MigrationState]  # rewriting index files with `sha256` for `cksum`
     retired_index_files: NotRequired[dict[str, str]]  # index bucket keys no listing names, and since when
     last_prune: NotRequired[str]  # when retired index files were last pruned
 
