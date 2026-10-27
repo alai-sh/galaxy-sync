@@ -152,16 +152,6 @@ def test_read_index_missing_file(tmp_path):
         _ = store.read_index("ns", "coll")
 
 
-def test_read_index_drops_removed_fields(tmp_path):
-    store = Store(Buckets.local(tmp_path))
-    _ = store.write_index("ns", "coll", [{**LINE, "origin": "galaxy", "upstream_conflict": True}])  # pyright: ignore[reportArgumentType]
-    old = store.state["collections"]["ns.coll"]["sha256"]
-    assert store.read_index("ns", "coll") == [LINE]
-    assert store.migrate_collection("ns", "coll")
-    assert store.state["collections"]["ns.coll"]["sha256"] != old
-    assert not store.migrate_collection("ns", "coll")  # already without them
-
-
 def _published(store, data):
     sha256 = hashlib.sha256(data).hexdigest()
     return store.index.read(f"index/{sha256[:2]}/{sha256}.jsonl")

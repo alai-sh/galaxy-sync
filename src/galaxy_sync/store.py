@@ -91,10 +91,6 @@ LINE_FIELDS = (
     "published",
 )
 
-# Fields dropped from the spec, left out of lines read until every index file
-# is rewritten without them (Store.migrate_collection).
-DROPPED_FIELDS = ("origin", "upstream_conflict")
-
 
 def _dump(obj: object) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
@@ -551,11 +547,7 @@ class Store:
         if (data := self.index.read(self.index_key(sha256))) is None:
             # Never treated as empty, which would mirror the whole collection again.
             raise StorageError(f"{fqcn}'s index file {self.index_key(sha256)} is missing")
-        lines = cast(list[dict[str, object]], _read_jsonl(data))
-        for line in lines:
-            for key in DROPPED_FIELDS:
-                _ = line.pop(key, None)
-        return cast(list[IndexLine], lines)
+        return cast(list[IndexLine], _read_jsonl(data))
 
     def write_index(self, namespace: str, name: str, lines: list[IndexLine]) -> bool:
         """Publish an index file by its sha256 and point state at it, returning False if it was already the same.
@@ -588,23 +580,6 @@ class Store:
             name,
             {line["vers"]: extractions[line["cksum"]] for line in lines if line["cksum"] in extractions},
         )
-
-    # Index lines used to carry DROPPED_FIELDS. The first syncs after they
-    # were dropped publish every index file again without them, keeping their
-    # place in state (`migration.after`), and read_index leaves them out of
-    # lines read until then. Remove this once every index file has been
-    # rewritten.
-
-    def needs_migration(self) -> bool:
-        """Whether index files may still have lines with DROPPED_FIELDS."""
-        return not self.state.get("migration", {}).get("done", False)
-
-    def migrate_collection(self, namespace: str, name: str) -> bool:
-        """Publish one collection's index file again without DROPPED_FIELDS; False if it was already without them.
-
-        The old file stays until pruning removes it, as no listing names it.
-        """
-        return self.write_index(namespace, name, self.read_index(namespace, name))
 
     def write_config(self) -> None:
         config = {
