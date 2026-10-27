@@ -38,7 +38,6 @@ def test_new_versions_are_mirrored(galaxy, client, store):
         "size": len(blob),
         "requires_ansible": ">=2.16",
         "yanked": False,
-        "origin": "galaxy",
         "published": rfc3339(galaxy.uploaded[("ns", "coll", "1.0.0")]),
     }
     assert store.read_artifact(first["cksum"]) == blob
@@ -249,8 +248,7 @@ def test_changed_contents_are_a_conflict(galaxy, client, store):
     res = reconcile(client, store, "ns", "coll")
     assert res.conflicts == ["1.0.0"]
     (line,) = store.read_index("ns", "coll")
-    assert line["cksum"] == original["cksum"]
-    assert line["upstream_conflict"] is True
+    assert line == original  # ours is kept, and the index doesn't change
     (conflict,) = store.open_conflicts()
     upstream = hashlib.sha256(changed).hexdigest()
     (observed,) = conflict["observed"]
@@ -295,8 +293,6 @@ def test_changed_contents_are_a_conflict(galaxy, client, store):
     galaxy.replace("ns", "coll", "1.0.0", first_blob, uploaded=first_upload)
     res = reconcile(client, store, "ns", "coll")
     assert (res.resolved, res.conflicts) == (["1.0.0"], [])
-    (line,) = store.read_index("ns", "coll")
-    assert "upstream_conflict" not in line
     assert store.open_conflicts() == []
     assert "resolved" in store.state["conflicts"][0]
 

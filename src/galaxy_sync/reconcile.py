@@ -1,7 +1,7 @@
 """reconcile(): bring one collection's index file in line with Galaxy.
 
 Every command ends here. It only uses the contract endpoints, and it's the
-only code that adds, yanks or flags a version; the change detection in
+only code that adds or yanks a version or opens a conflict; the change detection in
 changes.py just decides which collections to reconcile. See docs/sync.md.
 """
 
@@ -314,7 +314,6 @@ class _Reconcile:
             "cksum": sha,
             "size": len(data),
             "yanked": False,
-            "origin": "galaxy",
             "published": rfc3339(detail.get("created_at")) or created or now(),
         }
         if req := (v.get("requires_ansible") or detail.get("requires_ansible")):
@@ -374,13 +373,11 @@ class _Reconcile:
         # version are over. Extraction failures heal separately.
         self.store.clear_failures(self.fqcn, vers, exclude=("extract_error",))
         if same:
-            flagged = line.pop("upstream_conflict", None) is not None
-            if self.store.resolve_conflicts(self.fqcn, vers) or flagged:
+            if self.store.resolve_conflicts(self.fqcn, vers):
                 self.res.resolved.append(vers)
             elif sha != line["cksum"]:
                 self.res.repacked[vers] = (line["cksum"], sha)
         else:
-            line["upstream_conflict"] = True
             self.res.conflicts.append(vers)
         if line["yanked"]:
             line["yanked"] = False  # back upstream

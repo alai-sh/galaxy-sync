@@ -64,7 +64,9 @@ same work, so it doesn't matter which run picks it up. Each `sync`:
    acknowledges conflicts. A namespace that can't be listed keeps its
    request for the next run.
 3. **Works what was requested,** ahead of everything else: the requested
-   collections, then any rebuild ([below](#rebuilds)).
+   collections, then rewriting index files without the fields dropped
+   from the spec until that's done ([storage](storage.md#index-files)),
+   then any rebuild ([below](#rebuilds)).
 4. **Checks ansible-core** once a day ([below](#ansiblebuiltin)).
 5. **Sweeps** once a day (below), queueing everything that differs. It comes
    after the requested work, since it can take most of the budget,
@@ -184,10 +186,9 @@ count.
 
 - **Same contents** (a rebuild of unchanged sources): ours is kept and
   nothing is flagged. Reported as `repacked`.
-- **Different contents:** ours is kept, the index line gets
-  `upstream_conflict: true`, Galaxy's artifact is saved under `conflicts/` in
-  the state bucket, and it's recorded in the version's conflict
-  ([below](#conflicts)).
+- **Different contents:** ours is kept and the index line doesn't change.
+  Galaxy's artifact is saved under `conflicts/` in the state bucket, and it's
+  recorded in the version's conflict ([below](#conflicts)).
 
 Each version's verdict is cached with Galaxy's sha256, so the same
 artifact is downloaded once.
@@ -210,12 +211,10 @@ changed from ours. Its life:
    comment gets the note and is marked resolved (minimized), and later
    artifacts are still recorded but never reported. `--strict` ignores it.
    Acknowledging again replaces the note.
-4. **Resolved** if Galaxy serves our contents again: the index line's flag
-   clears. A later difference opens a new conflict.
+4. **Resolved** if Galaxy serves our contents again. A later difference
+   opens a new conflict.
 
-Acknowledging doesn't change the index: the flag stays while Galaxy serves
-something else, since that's what clients need to know. Nothing is ever
-removed. Each collection's conflicts, in every state, are published as
+Conflicts never change the index, and nothing is ever removed. Each collection's conflicts, in every state, are published as
 `conflicts/<ns>/<name>.json` in the index bucket
 ([format](index-spec/README.md#conflict-records)), the public audit trail of
 why the mirror's artifact differs from Galaxy's. Galaxy's artifacts stay in

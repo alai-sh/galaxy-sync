@@ -146,7 +146,7 @@ Which placeholders an index uses decides how it works:
   without `collections.json`, and an index can generate files on request.
   `sha256` in `collections.json` stays optional.
 - **By SHA-256**, such as `index/{sha256-prefix}/{sha256-checksum}.jsonl`,
-  which gives `index/59/59976e13….jsonl`. A file's URL changes with its
+  which gives `index/a4/a4472ff7….jsonl`. A file's URL changes with its
   content, so a file never changes and can be cached as long as an artifact.
   Only `collections.json` says where a collection's file is, which makes it
   required reading, and its `sha256` required in every entry (see
@@ -169,11 +169,11 @@ index file last changed.
   "v": 1,
   "namespaces": {
     "alai_example": {
-      "demo": {"updated": "2026-09-20T09:00:00Z", "sha256": "e1fb67d80905db40370edd06446b9617c8ade7ef6458c38f14f6a86dc2cdd332"}
+      "demo": {"updated": "2026-09-20T09:00:00Z", "sha256": "605a4d6889b5538c4898bf11276f380f8146b5e017735926cf9516c9432ebf9b"}
     },
     "community": {
-      "general": {"updated": "2026-10-05T17:30:02Z", "sha256": "59976e13dfbe811cee5e2c21744daf8eeda377a3a0f7f618a538a42ad947fcd2"},
-      "library_inventory_filtering_v1": {"updated": "2025-10-25T11:31:55Z", "sha256": "f92ce559b6ca24a4f01855d02195e086e399df38de461b596999b2930857b9c3"}
+      "general": {"updated": "2026-10-05T17:30:02Z", "sha256": "a4472ff7659bc3d80663664d2abe233c48b8cc40af100c5d43b4efb4dc1a29cf"},
+      "library_inventory_filtering_v1": {"updated": "2025-10-25T11:31:55Z", "sha256": "6cdcc7c93ebabc19be364ff579267dce86961c1c0f4fd24ee7b530597b2c007b"}
     }
   }
 }
@@ -241,13 +241,13 @@ not just a shortcut:
 Each collection's index file is where the
 [`index` template](#the-index-template) in `config.json` says: by name, such
 as `index/community/general.jsonl`, or by SHA-256, such as
-`index/59/59976e13….jsonl`.
+`index/a4/a4472ff7….jsonl`.
 
 Each line describes one version of the collection. Lines appear in **order of
 publication**, so clients MUST NOT assume they're sorted by version.
 
 ```json
-{"v":1,"name":"community.general","vers":"13.5.0","deps":[{"name":"community.library_inventory_filtering_v1","req":">=1.0.0"}],"cksum":"54598287e0ea0504aee2d32c884208ddf26f3ac41e0b4e773ff514af210787c4","size":2913455,"requires_ansible":">=2.18.0","yanked":false,"origin":"galaxy","published":"2026-10-05T17:30:02Z"}
+{"v":1,"name":"community.general","vers":"13.5.0","deps":[{"name":"community.library_inventory_filtering_v1","req":">=1.0.0"}],"cksum":"54598287e0ea0504aee2d32c884208ddf26f3ac41e0b4e773ff514af210787c4","size":2913455,"requires_ansible":">=2.18.0","yanked":false,"published":"2026-10-05T17:30:02Z"}
 ```
 
 | Field | Type | Required | Meaning |
@@ -256,14 +256,12 @@ publication**, so clients MUST NOT assume they're sorted by version.
 | `name` | string | yes | Full collection name, `<namespace>.<name>`. MUST match the file's path |
 | `vers` | string | yes | The version |
 | `deps` | array | yes | Collection dependencies, possibly empty. See below |
-| `cksum` | string | yes | Lowercase hex sha256 of the artifact. For `galaxy` origin this equals Galaxy's `artifact.sha256` |
+| `cksum` | string | yes | Lowercase hex sha256 of the artifact. For a version mirrored from Galaxy this equals Galaxy's `artifact.sha256` |
 | `size` | integer | yes | Artifact size in bytes |
 | `requires_ansible` | string | no | ansible-core version requirement from `meta/runtime.yml`, a [PEP 440 specifier](#requires_ansible-syntax). Absent means no constraint |
 | `yanked` | bool | yes | See [Yanking and removal](#yanking-and-removal) |
-| `deprecated` | `true` or string | no | The version is deprecated. A string is a message to show the user. Galaxy deprecation is collection-level, so for `galaxy` origin it appears on every line |
-| `origin` | string | yes | Where the version was published: `galaxy` (mirrored from galaxy.ansible.com) or `native` (published to this index directly). Other indexes MAY define their own values, and clients MUST treat unknown values as opaque |
-| `published` | string | yes | When this version was first published at its origin (RFC 3339). For `galaxy` origin this is Galaxy's `created_at`, which for versions published before Galaxy's 2023-05 migration is the migration time, not the real publication time |
-| `upstream_conflict` | bool | no | `true` if the origin now serves a different artifact for this version whose contents differ from the one at `cksum`. A repack of the same files doesn't count. The index keeps the original. Clients SHOULD warn, and MAY point to the collection's [conflict record](#conflict-records) |
+| `deprecated` | `true` or string | no | The version is deprecated. A string is a message to show the user. Galaxy deprecation is collection-level, so for a version mirrored from Galaxy it appears on every line |
+| `published` | string | yes | When this version was first published at its origin (RFC 3339). For a version mirrored from Galaxy this is Galaxy's `created_at`, which for versions published before Galaxy's 2023-05 migration is the migration time, not the real publication time |
 
 ### `deps` entries
 
@@ -318,8 +316,8 @@ Examples: `>=2.17.0`, `>=2.15.0,<2.19.0`, `>=2.19.0b1`.
 ### Line mutability
 
 Once published, a line's `name`, `vers`, `deps`, `cksum`, `size`,
-`requires_ansible`, `origin` and `published` MUST NOT change. The only fields
-that may change afterwards are `yanked`, `deprecated` and `upstream_conflict`.
+`requires_ansible` and `published` MUST NOT change. The only fields
+that may change afterwards are `yanked` and `deprecated`.
 A version's `cksum` never changes, for any reason.
 
 ## Yanking and removal
@@ -334,9 +332,11 @@ A version's `cksum` never changes, for any reason.
 
 ## Conflict records
 
-A mirror that sets `upstream_conflict` SHOULD publish a conflict record for
-the collection at `conflicts/<namespace>/<name>.json`, so anyone can see why
-the index's artifact differs from the origin's. A record lists every
+When the origin serves a different artifact for a version the index holds,
+and its contents differ from the one at `cksum` (a repack of the same files
+doesn't count), the index keeps the original. A mirror SHOULD then publish a
+conflict record for the collection at `conflicts/<namespace>/<name>.json`,
+so anyone can see why the index's artifact differs from the origin's. A record lists every
 conflict the collection has had, including settled ones, and entries are
 never removed. A collection that never had one has no record (404).
 
@@ -366,11 +366,10 @@ never removed. A collection that never had one has no record (404).
 | `conflicts[].opened` | string | yes | When the mirror first saw the origin serve different contents |
 | `conflicts[].observed` | array | yes | Each differing artifact the origin served, oldest first: `sha256`, `uploaded` (the origin's upload time, or `null` if unknown), `seen` (when the mirror first compared it), and `changes` (the files added, removed and changed from ours, or why they couldn't be compared) |
 | `conflicts[].acknowledged` | object | no | The mirror's operators inspected it and keep the original: `at`, and a `note` saying why |
-| `conflicts[].resolved` | string | no | When the origin served the original's contents again. The line's `upstream_conflict` is cleared then |
+| `conflicts[].resolved` | string | no | When the origin served the original's contents again |
 
-A version has at most one conflict without `resolved`. The index line's
-`upstream_conflict` reflects whether the origin currently differs;
-acknowledging doesn't change it.
+A version has at most one conflict without `resolved`. Conflicts never
+change the index: its line stays as it was, acknowledged or not.
 
 ## Index completeness
 
@@ -423,8 +422,8 @@ mismatch.
 ### Trust model
 
 As with crates.io, trust comes from HTTPS and `cksum`: clients trust the
-index, and the hash proves the artifact is the one the index lists. For
-`galaxy` origin, `cksum` also equals Galaxy's own sha256, so anyone can
+index, and the hash proves the artifact is the one the index lists. For a
+version mirrored from Galaxy, `cksum` also equals Galaxy's own sha256, so anyone can
 cross-check the mirror.
 
 Signatures aren't carried yet. No version on galaxy.ansible.com was signed as
@@ -601,5 +600,5 @@ fields in `config.json`:
 | `deps` entries | `name`, `req`, `features`, `optional`, `default_features`, `target`, `kind`, `registry`, `package` | `name`, `req`. `registry` is reserved; the others have no Ansible equivalent |
 | Requirement syntax | Cargo semver (`1.2` means `^1.2`) | Ansible's (`1.2` means `==1.2.0`) |
 | Cross-index dependencies | Allowed via `deps[].registry`. crates.io forbids them | Not allowed; every index is self-contained |
-| Other line fields | `features`, `features2`, `links`, `rust_version` | `size`, `requires_ansible`, `deprecated`, `origin`, `published`, `upstream_conflict` |
+| Other line fields | `features`, `features2`, `links`, `rust_version` | `size`, `requires_ansible`, `deprecated`, `published` |
 | Collection listing | None (crates.io lists crates through its web API) | `collections.json`, with per-collection `updated` times |
