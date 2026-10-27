@@ -50,7 +50,7 @@ Resolving a collection:
    Requests SHOULD run in parallel.
 4. Resolve offline using the lines.
 5. Download each chosen artifact using the `dl` template, and verify its
-   sha256 against `cksum`.
+   sha256 against the line's `sha256`.
 
 ## Conventions
 
@@ -301,7 +301,7 @@ Each line describes one version of the collection. Lines appear in **order of
 publication**, so clients MUST NOT assume they're sorted by version.
 
 ```json
-{"v":1,"name":"community.general","vers":"13.5.0","deps":[{"name":"community.library_inventory_filtering_v1","req":">=1.0.0"}],"cksum":"54598287e0ea0504aee2d32c884208ddf26f3ac41e0b4e773ff514af210787c4","size":2913455,"requires_ansible":">=2.18.0","yanked":false,"published":"2026-10-05T17:30:02Z"}
+{"v":1,"name":"community.general","vers":"13.5.0","deps":[{"name":"community.library_inventory_filtering_v1","req":">=1.0.0"}],"sha256":"54598287e0ea0504aee2d32c884208ddf26f3ac41e0b4e773ff514af210787c4","size":2913455,"requires_ansible":">=2.18.0","yanked":false,"published":"2026-10-05T17:30:02Z"}
 ```
 
 | Field | Type | Required | Meaning |
@@ -310,7 +310,7 @@ publication**, so clients MUST NOT assume they're sorted by version.
 | `name` | string | yes | Full collection name, `<namespace>.<name>`. MUST match the file's path |
 | `vers` | string | yes | The version |
 | `deps` | array | yes | Collection dependencies, possibly empty. See below |
-| `cksum` | string | yes | Lowercase hex sha256 of the artifact. For a version mirrored from Galaxy this equals Galaxy's `artifact.sha256` |
+| `sha256` | string | yes | Lowercase hex sha256 of the artifact. For a version mirrored from Galaxy this equals Galaxy's `artifact.sha256` |
 | `size` | integer | yes | Artifact size in bytes |
 | `requires_ansible` | string | no | ansible-core version requirement from `meta/runtime.yml`, a [PEP 440 specifier](#requires_ansible-syntax). Absent means no constraint |
 | `yanked` | bool | yes | See [Yanking and removal](#yanking-and-removal) |
@@ -369,10 +369,10 @@ Examples: `>=2.17.0`, `>=2.15.0,<2.19.0`, `>=2.19.0b1`.
 
 ### Line mutability
 
-Once published, a line's `name`, `vers`, `deps`, `cksum`, `size`,
+Once published, a line's `name`, `vers`, `deps`, `sha256`, `size`,
 `requires_ansible` and `published` MUST NOT change. The only fields
 that may change afterwards are `yanked` and `deprecated`.
-A version's `cksum` never changes, for any reason.
+A version's `sha256` never changes, for any reason.
 
 ## Yanking and removal
 
@@ -387,7 +387,7 @@ A version's `cksum` never changes, for any reason.
 ## Conflict records
 
 When the origin serves a different artifact for a version the index holds,
-and its contents differ from the one at `cksum` (a repack of the same files
+and its contents differ from the one at `sha256` (a repack of the same files
 doesn't count), the index keeps the original. A mirror SHOULD then publish a
 conflict record for the collection at `conflicts/<namespace>/<name>.json`,
 so anyone can see why the index's artifact differs from the origin's. A record lists every
@@ -416,7 +416,7 @@ never removed. A collection that never had one has no record (404).
 |---|---|---|---|
 | `collection` | string | yes | `<namespace>.<name>` |
 | `conflicts[].version` | string | yes | The version |
-| `conflicts[].ours` | string | yes | The index's `cksum` for it |
+| `conflicts[].ours` | string | yes | The index's `sha256` for it |
 | `conflicts[].opened` | string | yes | When the mirror first saw the origin serve different contents |
 | `conflicts[].observed` | array | yes | Each differing artifact the origin served, oldest first: `sha256`, `uploaded` (the origin's upload time, or `null` if unknown), `seen` (when the mirror first compared it), and `changes` (the files added, removed and changed from ours, or why they couldn't be compared) |
 | `conflicts[].acknowledged` | object | no | The mirror's operators inspected it and keep the original: `at`, and a `note` saying why |
@@ -451,7 +451,7 @@ same index as the collection that needs them.
   incompatible versions of the same dependency.
 
 Private indexes usually meet this by copying the public collections they
-depend on. Because artifacts are copied byte for byte, the `cksum` values are
+depend on. Because artifacts are copied byte for byte, the `sha256` values are
 unchanged and client caches share them.
 
 ## Artifacts
@@ -462,22 +462,22 @@ to a template without placeholders. Placeholders:
 
 | Placeholder | Replaced with |
 |---|---|
-| `{sha256-checksum}` | `cksum` |
-| `{sha256-prefix}` | First two characters of `cksum` |
+| `{sha256-checksum}` | `sha256` |
+| `{sha256-prefix}` | First two characters of `sha256` |
 | `{namespace}` | Namespace |
 | `{name}` | Collection name, without the namespace |
 | `{version}` | `vers`, percent-encoded (`+` becomes `%2B`) |
 
 Artifacts are the exact tarballs published at the origin, byte for byte, and
 are never repackaged. Clients MUST verify the sha256 of every download
-against `cksum`, regardless of where it came from, and MUST reject a
+against `sha256`, regardless of where it came from, and MUST reject a
 mismatch.
 
 ### Trust model
 
-As with crates.io, trust comes from HTTPS and `cksum`: clients trust the
+As with crates.io, trust comes from HTTPS and `sha256`: clients trust the
 index, and the hash proves the artifact is the one the index lists. For a
-version mirrored from Galaxy, `cksum` also equals Galaxy's own sha256, so anyone can
+version mirrored from Galaxy, `sha256` also equals Galaxy's own sha256, so anyone can
 cross-check the mirror.
 
 Signatures aren't carried yet. No version on galaxy.ansible.com was signed as
@@ -575,9 +575,9 @@ to resolve consistently.
   `ansible_collections/<ns>/<name>` directory. If two requirements would pull
   the same name from different indexes, the client MUST fail and ask the user
   to pin one.
-- **Lock files** record the index, `name`, `vers` and `cksum` of everything
+- **Lock files** record the index, `name`, `vers` and `sha256` of everything
   installed.
-- **Cache:** clients SHOULD store extracted collections keyed by `cksum`, not
+- **Cache:** clients SHOULD store extracted collections keyed by `sha256`, not
   by index or name, so identical artifacts from different indexes are stored
   once and an index being renamed or moved doesn't invalidate anything.
 - **Pre-releases** are skipped unless the user asks for them, or a
@@ -658,5 +658,6 @@ fields in `config.json`:
 | `deps` entries | `name`, `req`, `features`, `optional`, `default_features`, `target`, `kind`, `registry`, `package` | `name`, `req`. `registry` is reserved; the others have no Ansible equivalent |
 | Requirement syntax | Cargo semver (`1.2` means `^1.2`) | Ansible's (`1.2` means `==1.2.0`) |
 | Cross-index dependencies | Allowed via `deps[].registry`. crates.io forbids them | Not allowed; every index is self-contained |
+| Artifact hash field | `cksum` | `sha256`, named for what it holds |
 | Other line fields | `features`, `features2`, `links`, `rust_version` | `size`, `requires_ansible`, `deprecated`, `published` |
 | Collection listing | None (crates.io lists crates through its web API) | `collections.json`, with per-collection `updated` times; optional, for an index by name |

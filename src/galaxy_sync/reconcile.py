@@ -121,7 +121,7 @@ class _Reconcile:
         self.res = Result()
         self.cstate = store.collection_state(self.fqcn)
         self.lines = store.read_index(namespace, name)
-        # Each mirrored artifact's extraction, by cksum, for the plugin lines.
+        # Each mirrored artifact's extraction, by sha256, for the plugin lines.
         self.extractions = store.load_extractions(namespace, name)
         # New versions to mirror, and how many have been tried, for the progress log.
         self.missing = 0
@@ -248,11 +248,11 @@ class _Reconcile:
     def _heal_extractions(self) -> None:
         """Re-extract mirrored versions with no stored result, or one in an older format."""
         for line in self.lines:
-            stored = self.extractions.get(line["cksum"])
+            stored = self.extractions.get(line["sha256"])
             if (
                 (stored is None or stored.get("format", 0) < EXTRACTION_FORMAT)
-                and (data := self.store.read_artifact(line["cksum"])) is not None
-                and self._extract(line["vers"], line["cksum"], data, "re-extracted")
+                and (data := self.store.read_artifact(line["sha256"])) is not None
+                and self._extract(line["vers"], line["sha256"], data, "re-extracted")
             ):
                 self.res.reextracted.append(line["vers"])
 
@@ -261,7 +261,11 @@ class _Reconcile:
             _ = self.store.set_collection_plugins(
                 self.namespace,
                 self.name,
-                {line["vers"]: self.extractions[line["cksum"]] for line in lines if line["cksum"] in self.extractions},
+                {
+                    line["vers"]: self.extractions[line["sha256"]]
+                    for line in lines
+                    if line["sha256"] in self.extractions
+                },
             )
 
     def _deleted(self) -> Result:
@@ -311,7 +315,7 @@ class _Reconcile:
             "name": self.fqcn,
             "vers": vers,
             "deps": [{"name": d, "req": r} for d, r in (detail["metadata"].get("dependencies") or {}).items()],
-            "cksum": sha,
+            "sha256": sha,
             "size": len(data),
             "yanked": False,
             "published": rfc3339(detail.get("created_at")) or created or now(),
@@ -346,7 +350,7 @@ class _Reconcile:
         sha = detail["artifact"]["sha256"]
         seen = self.cstate["versions"].get(vers)
         state: VersionState = {"created_at": rfc3339(v.get("created_at"))}
-        if sha == line["cksum"]:
+        if sha == line["sha256"]:
             log.info("%s %s: Galaxy's sha256 matches ours", self.fqcn, vers)
             same = True
         elif seen and (verdict := seen.get("upstream")) and verdict["sha256"] == sha:
@@ -361,7 +365,7 @@ class _Reconcile:
             state["upstream"] = verdict
         else:
             log.info(
-                "%s %s: Galaxy serves sha256 %s, ours is %s; comparing contents", self.fqcn, vers, sha, line["cksum"]
+                "%s %s: Galaxy serves sha256 %s, ours is %s; comparing contents", self.fqcn, vers, sha, line["sha256"]
             )
             same = self._compare(line, detail, state["created_at"])
             log.info(
@@ -375,8 +379,8 @@ class _Reconcile:
         if same:
             if self.store.resolve_conflicts(self.fqcn, vers):
                 self.res.resolved.append(vers)
-            elif sha != line["cksum"]:
-                self.res.repacked[vers] = (line["cksum"], sha)
+            elif sha != line["sha256"]:
+                self.res.repacked[vers] = (line["sha256"], sha)
         else:
             self.res.conflicts.append(vers)
         if line["yanked"]:
@@ -391,7 +395,7 @@ class _Reconcile:
         is saved for inspection and added to the version's conflict.
         """
         data = self._download(detail, "download for comparison")
-        changes = self._changes(line["cksum"], data)
+        changes = self._changes(line["sha256"], data)
         if changes is None:
             return True
         sha = detail["artifact"]["sha256"]
@@ -402,14 +406,14 @@ class _Reconcile:
             "changes": changes,
             "saved": self.store.save_upstream_artifact(sha, data),
         }
-        _ = self.store.record_conflict(self.fqcn, line["vers"], line["cksum"], observation)
+        _ = self.store.record_conflict(self.fqcn, line["vers"], line["sha256"], observation)
         return False
 
-    def _changes(self, cksum: str, theirs: bytes) -> str | None:
+    def _changes(self, sha256: str, theirs: bytes) -> str | None:
         """How Galaxy's artifact differs from ours, or None if the contents are the same."""
-        ours = self.store.read_artifact(cksum)
+        ours = self.store.read_artifact(sha256)
         if ours is None:
-            return f"the mirror's artifact {cksum} is missing"
+            return f"the mirror's artifact {sha256} is missing"
         try:
             theirs_digest = contents_digest(theirs)
         except (tarfile.TarError, ValueError) as e:
@@ -437,7 +441,7 @@ class _Reconcile:
             raise _VersionFailed("sha256_mismatch", f"downloaded {actual}, Galaxy says {sha}")
         return data
 
-    def _extract(self, vers: str, cksum: str, data: bytes, done: str) -> bool:
+    def _extract(self, vers: str, sha256: str, data: bytes, done: str) -> bool:
         """Extract plugin data. Failures are recorded but never block mirroring."""
         try:
             result = ext.extract_bytes(data)
@@ -446,6 +450,6 @@ class _Reconcile:
             self.store.record_failure(self.fqcn, vers, "extract_error", f"{type(e).__name__}: {e}")
             return False
         log.debug("%s %s: %s, %d plugins", self.fqcn, vers, done, len(result.plugins))
-        self.extractions[cksum] = extraction_data(result)
+        self.extractions[sha256] = extraction_data(result)
         self.store.clear_failures(self.fqcn, vers, kinds=("extract_error",))
         return True

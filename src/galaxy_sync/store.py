@@ -83,13 +83,17 @@ LINE_FIELDS = (
     "name",
     "vers",
     "deps",
-    "cksum",
+    "sha256",
     "size",
     "requires_ansible",
     "yanked",
     "deprecated",
     "published",
 )
+
+# Index lines used to call `sha256` this; read_index renames it until every
+# index file is rewritten (Store.migrate_collection).
+RENAMED_FIELD = "cksum"
 
 
 def _dump(obj: object) -> str:
@@ -486,16 +490,16 @@ class Store:
         return result
 
     @staticmethod
-    def artifact_key(cksum: str) -> str:
-        return f"sha256/{cksum[:2]}/{cksum}.tar.gz"
+    def artifact_key(sha256: str) -> str:
+        return f"sha256/{sha256[:2]}/{sha256}.tar.gz"
 
-    def write_artifact(self, cksum: str, data: bytes) -> None:
-        key = self.artifact_key(cksum)
+    def write_artifact(self, sha256: str, data: bytes) -> None:
+        key = self.artifact_key(sha256)
         if not self.dl.exists(key):  # content-addressed: same key means same bytes
             self.dl.write(key, data)
 
-    def read_artifact(self, cksum: str) -> bytes | None:
-        return self.dl.read(self.artifact_key(cksum))
+    def read_artifact(self, sha256: str) -> bytes | None:
+        return self.dl.read(self.artifact_key(sha256))
 
     @staticmethod
     def _extractions_key(namespace: str, name: str) -> str:
@@ -547,7 +551,11 @@ class Store:
         if (data := self.index.read(self.index_key(sha256))) is None:
             # Never treated as empty, which would mirror the whole collection again.
             raise StorageError(f"{fqcn}'s index file {self.index_key(sha256)} is missing")
-        return cast(list[IndexLine], _read_jsonl(data))
+        lines = cast(list[dict[str, object]], _read_jsonl(data))
+        for line in lines:
+            if RENAMED_FIELD in line:
+                line["sha256"] = line.pop(RENAMED_FIELD)
+        return cast(list[IndexLine], lines)
 
     def write_index(self, namespace: str, name: str, lines: list[IndexLine]) -> bool:
         """Publish an index file by its sha256 and point state at it, returning False if it was already the same.
@@ -578,8 +586,25 @@ class Store:
         _ = self.set_collection_plugins(
             namespace,
             name,
-            {line["vers"]: extractions[line["cksum"]] for line in lines if line["cksum"] in extractions},
+            {line["vers"]: extractions[line["sha256"]] for line in lines if line["sha256"] in extractions},
         )
+
+    # Index lines used to call `sha256` RENAMED_FIELD. The first syncs after
+    # the rename publish every index file again with `sha256`, keeping their
+    # place in state (`migrate_cksum.after`), and read_index renames it in
+    # lines read until then. Remove this once every index file has been
+    # rewritten.
+
+    def needs_migration(self) -> bool:
+        """Whether index files may still have lines with RENAMED_FIELD."""
+        return not self.state.get("migrate_cksum", {}).get("done", False)
+
+    def migrate_collection(self, namespace: str, name: str) -> bool:
+        """Publish one collection's index file again with `sha256`; False if it already had it.
+
+        The old file stays until pruning removes it, as no listing names it.
+        """
+        return self.write_index(namespace, name, self.read_index(namespace, name))
 
     def write_config(self) -> None:
         config = {
@@ -673,9 +698,9 @@ class Store:
         return plugin_lines(
             fqcn,
             {
-                line["vers"]: extractions[line["cksum"]]
+                line["vers"]: extractions[line["sha256"]]
                 for line in self.read_index(namespace, name)
-                if line["cksum"] in extractions
+                if line["sha256"] in extractions
             },
         )
 

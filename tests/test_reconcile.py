@@ -34,14 +34,14 @@ def test_new_versions_are_mirrored(galaxy, client, store):
         "name": "ns.coll",
         "vers": "1.0.0",
         "deps": [{"name": "other.coll", "req": ">=1.0.0"}],
-        "cksum": hashlib.sha256(blob).hexdigest(),
+        "sha256": hashlib.sha256(blob).hexdigest(),
         "size": len(blob),
         "requires_ansible": ">=2.16",
         "yanked": False,
         "published": rfc3339(galaxy.uploaded[("ns", "coll", "1.0.0")]),
     }
-    assert store.read_artifact(first["cksum"]) == blob
-    assert extraction(store, first["cksum"])["plugins"] == [
+    assert store.read_artifact(first["sha256"]) == blob
+    assert extraction(store, first["sha256"])["plugins"] == [
         {"type": "module", "name": "thing", "short_description": "A thing"}
     ]
 
@@ -91,15 +91,15 @@ def test_extraction_failure_still_mirrors_and_heals(galaxy, client, store, monke
     res = reconcile(client, store, "ns", "coll")
     assert res.added == ["1.0.0"]  # the artifact is mirrored regardless
     (line,) = store.read_index("ns", "coll")
-    assert store.read_artifact(line["cksum"]) is not None
-    assert extraction(store, line["cksum"]) is None
+    assert store.read_artifact(line["sha256"]) is not None
+    assert extraction(store, line["sha256"]) is None
     (failure,) = store.state["failures"].values()
     assert failure["kind"] == "extract_error"
 
     monkeypatch.setattr(reconcile_mod.ext, "extract_bytes", real_extract)
     res = reconcile(client, store, "ns", "coll")
     assert res.reextracted == ["1.0.0"]
-    assert extraction(store, line["cksum"])["plugins"] == [
+    assert extraction(store, line["sha256"])["plugins"] == [
         {"type": "module", "name": "thing", "short_description": "A thing"}
     ]
     assert store.state["failures"] == {}
@@ -125,7 +125,7 @@ def test_outdated_extractions_are_rerun(galaxy, client, store):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     reconcile(client, store, "ns", "coll")
     (line,) = store.read_index("ns", "coll")
-    current = extraction(store, line["cksum"])
+    current = extraction(store, line["sha256"])
     assert current["format"] == EXTRACTION_FORMAT
 
     # Up to date: left alone.
@@ -133,9 +133,9 @@ def test_outdated_extractions_are_rerun(galaxy, client, store):
 
     # An older format, or from before results had one.
     for stale in ({**current, "format": 0}, {"extractor": 2, "plugins": [], "routing": {}}):
-        store.save_extractions("ns", "coll", {line["cksum"]: stale})
+        store.save_extractions("ns", "coll", {line["sha256"]: stale})
         assert reconcile(client, store, "ns", "coll").reextracted == ["1.0.0"]
-        assert extraction(store, line["cksum"]) == current
+        assert extraction(store, line["sha256"]) == current
 
 
 def test_bad_and_mismatched_artifacts_are_not_mirrored(galaxy, client, store):
@@ -260,7 +260,7 @@ def test_changed_contents_are_a_conflict(galaxy, client, store):
     assert store.state["failures"] == {}  # reported as a conflict, not retried as a failure
     report = store.write_failure_report()
     assert "### Conflicts to inspect" in report.markdown
-    assert f"| ns.coll | 1.0.0 | {original['cksum'][:12]} | {upstream[:12]} |" in report.markdown
+    assert f"| ns.coll | 1.0.0 | {original['sha256'][:12]} | {upstream[:12]} |" in report.markdown
     assert observed["saved"] not in report.markdown  # the state bucket key stays private
     assert report.summary.alerts.conflicts == [conflict]
 
@@ -282,7 +282,7 @@ def test_changed_contents_are_a_conflict(galaxy, client, store):
     assert store.state_bucket.read(latest["saved"]) == again
     assert updated["opened"] == conflict["opened"]
     report = store.write_failure_report()
-    assert f"| ns.coll | 1.0.0 | {original['cksum'][:12]} | {latest['sha256'][:12]} | 2 |" in report.markdown
+    assert f"| ns.coll | 1.0.0 | {original['sha256'][:12]} | {latest['sha256'][:12]} | 2 |" in report.markdown
 
     # Back to a build already observed: compared again, but not repeated.
     galaxy.replace("ns", "coll", "1.0.0", changed)
@@ -325,12 +325,13 @@ def test_conflict_comparison_failures(galaxy, client, store, monkeypatch):
     reconcile(client, store, "ns", "coll")
     assert store.open_conflicts()[-1]["observed"][-1]["changes"].startswith("Galaxy's artifact can't be read")
     galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", modules=("fourth",)))
-    monkeypatch.setattr(store, "read_artifact", lambda cksum: None)
+    monkeypatch.setattr(store, "read_artifact", lambda sha256: None)
     reconcile(client, store, "ns", "coll")
     assert (
-        store.open_conflicts()[-1]["observed"][-1]["changes"] == f"the mirror's artifact {original['cksum']} is missing"
+        store.open_conflicts()[-1]["observed"][-1]["changes"]
+        == f"the mirror's artifact {original['sha256']} is missing"
     )
-    monkeypatch.setattr(store, "read_artifact", lambda cksum: b"corrupt")
+    monkeypatch.setattr(store, "read_artifact", lambda sha256: b"corrupt")
     galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", modules=("fifth",)))
     reconcile(client, store, "ns", "coll")
     assert store.open_conflicts()[-1]["observed"][-1]["changes"].startswith("the mirror's artifact can't be read")

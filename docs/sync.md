@@ -64,7 +64,9 @@ same work, so it doesn't matter which run picks it up. Each `sync`:
    acknowledges conflicts. A namespace that can't be listed keeps its
    request for the next run.
 3. **Works what was requested,** ahead of everything else: the requested
-   collections, then any rebuild ([below](#rebuilds)).
+   collections, then rewriting index files with `sha256` for `cksum`
+   until that's done ([storage](storage.md#index-files)),
+   then any rebuild ([below](#rebuilds)).
 4. **Checks ansible-core** once a day ([below](#ansiblebuiltin)).
 5. **Sweeps** once a day (below), queueing everything that differs. It comes
    after the requested work, since it can take most of the budget,
@@ -175,7 +177,7 @@ changed; and it's the API most likely to be locked down.
 
 ## Artifact checks
 
-The mirror never overwrites: a version's `cksum` never changes. If Galaxy
+The mirror never overwrites: a version's `sha256` never changes. If Galaxy
 ever serves a different sha256 for a version the mirror already holds,
 reconcile downloads it and compares its contents with ours (`artifacts.contents_digest`): each
 file's bytes and each link's target, with `MANIFEST.json` and `FILES.json`

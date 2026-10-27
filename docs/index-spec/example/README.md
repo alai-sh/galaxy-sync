@@ -27,7 +27,7 @@ index/
   - a dependency with a range requirement on another index's namespace
     (`community.general` `>=13.0.0,<14.0.0`).
 
-  Its `cksum` values are sha256 hashes of placeholder strings, not of real
+  Its `sha256` values are sha256 hashes of placeholder strings, not of real
   artifacts.
 - **`plugins.jsonl`:** mocked entries for `alai_example.demo`, showing a
   current module, a module that was removed and redirected, a tombstoned

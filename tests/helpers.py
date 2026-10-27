@@ -45,6 +45,6 @@ def artifact(ns, name, vers, mtime=0, modules=("thing",)):
     return tarball(files, mtime)
 
 
-def extraction(store, cksum, ns="ns", name="coll"):
+def extraction(store, sha256, ns="ns", name="coll"):
     """The stored extraction for one artifact, or None."""
-    return store.load_extractions(ns, name).get(cksum)
+    return store.load_extractions(ns, name).get(sha256)

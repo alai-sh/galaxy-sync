@@ -116,7 +116,7 @@ LINE = {
     "name": "ns.coll",
     "vers": "1.0.0",
     "deps": [],
-    "cksum": "a" * 64,
+    "sha256": "a" * 64,
     "size": 1,
     "yanked": False,
     "published": "2026-01-01T00:00:00Z",
@@ -150,6 +150,17 @@ def test_read_index_missing_file(tmp_path):
     # Never read as empty, which would mirror the whole collection again.
     with pytest.raises(StorageError, match=r"ns\.coll's index file .* is missing"):
         _ = store.read_index("ns", "coll")
+
+
+def test_read_index_renames_cksum(tmp_path):
+    store = Store(Buckets.local(tmp_path))
+    old = {("cksum" if k == "sha256" else k): v for k, v in LINE.items()}
+    _ = store.write_index("ns", "coll", [old])  # pyright: ignore[reportArgumentType]
+    old_sha256 = store.state["collections"]["ns.coll"]["sha256"]
+    assert store.read_index("ns", "coll") == [LINE]
+    assert store.migrate_collection("ns", "coll")
+    assert store.state["collections"]["ns.coll"]["sha256"] != old_sha256
+    assert not store.migrate_collection("ns", "coll")  # already has sha256
 
 
 def _published(store, data):

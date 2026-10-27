@@ -62,7 +62,7 @@ gitignored.
 - **Never import or execute collection code.** Collection contents are read
   only by alai-plugin-extractor and `artifacts.py`, which reads member bytes
   from a tarball in memory and never extracts to disk.
-- **A version's `cksum` never changes.** When Galaxy serves different bytes
+- **A version's `sha256` never changes.** When Galaxy serves different bytes
   for a mirrored version, reconcile compares contents: a repack is kept
   silently, a content change keeps ours and opens a conflict. Never an
   overwrite.
