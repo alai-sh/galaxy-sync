@@ -29,7 +29,7 @@ An index has two roots, which MAY be on different hosts:
 ```
 <index root>                             e.g. https://index.alai.sh/
   config.json                            how to read this index
-  collections.json                       every collection, with last-updated times and sha256s
+  collections.json                       every collection, with last-updated times and sha256s (optional)
   index/<namespace>/<name>.jsonl         one line per collection version, found by name
     or index/<aa>/<sha256>.jsonl         or by sha256, as config.json's index template says
   conflicts/<namespace>/<name>.json      mirrors: why versions differ from the origin
@@ -43,7 +43,8 @@ Resolving a collection:
 1. Fetch `config.json`, and pick the highest format the client supports.
 2. Decide which index the requested collection comes from (see [Client
    rules](#client-rules)). `collections.json` says whether an index has it
-   without probing for a 404.
+   without probing for a 404. An index without one answers through the
+   collection's index file instead (see [No listing](#no-listing)).
 3. Fetch the collection's [index file](#index-files), from the `index`
    template, and for each dependency fetch its file from the same index.
    Requests SHOULD run in parallel.
@@ -106,7 +107,7 @@ schema only ever gains fields and never changes incompatibly.
 |---|---|---|---|
 | `formats` | object | yes | Map of format number (as a string) to the paths for that format, relative to the index root. An index MAY serve several formats at once during a transition. Clients MUST pick the highest format they support, and MUST fail with a clear error ("this index requires a newer alai") if they support none |
 | `formats.<n>.index` | string | yes | URL template for each collection's [index file](#index-files), with the placeholders in [The `index` template](#the-index-template) |
-| `formats.<n>.collections` | string | yes | Path of the [collection listing](#collectionsjson) |
+| `formats.<n>.collections` | string | no | Path of the [collection listing](#collectionsjson). Absent if the index has none (see [No listing](#no-listing)). MUST be present when the `index` template is [by SHA-256](#index-templates-by-sha-256) |
 | `formats.<n>.plugins` | string | no | Path of the [plugin index](plugins.md). Absent if the index has none |
 | `dl` | string | yes | Artifact URL template. See [Artifacts](#artifacts) |
 | `moved-to` | string or null | no | If set, the index has moved to this index root URL. Clients SHOULD follow it, tell the user to update their configuration, and MAY remember it. Clients MUST NOT follow a `moved-to` that downgrades from `https` to `http` |
@@ -143,7 +144,8 @@ Which placeholders an index uses decides how it works:
   `index/community/general.jsonl`. A collection's file keeps its URL and is
   replaced in place when it changes, so it's served with a short cache
   lifetime ([HTTP behaviour](#http-behaviour)). A client can build the URL
-  without `collections.json`, and an index can generate files on request.
+  without `collections.json`, and an index can generate files on request,
+  or leave `collections.json` out altogether ([No listing](#no-listing)).
   `sha256` in `collections.json` stays optional.
 - **By SHA-256**, such as `index/{sha256-prefix}/{sha256-checksum}.jsonl`,
   which gives `index/a4/a4472ff7….jsonl`. A file's URL changes with its
@@ -162,7 +164,8 @@ A template can use both kinds, such as
 ## `collections.json`
 
 Lists every collection in the index, grouped by namespace, with the time its
-index file last changed.
+index file last changed. An index MAY leave it out; see
+[No listing](#no-listing).
 
 ```json
 {
@@ -235,6 +238,57 @@ not just a shortcut:
   mirror that polls `updated` fetches the file the new `sha256` names, and
   can reuse the `sha256` rather than hash the file again if it publishes
   the same bytes.
+
+### No listing
+
+An index MAY have no `collections.json`, by leaving `formats.<n>.collections`
+out of `config.json`. That suits two kinds of host:
+
+- **One that serves only index files.** A directory of index files and a
+  `config.json` is then a whole index, with no listing to rebuild on every
+  change, and a host that generates files on request needn't enumerate
+  them.
+- **One that shows each user only the collections they may see**, behind
+  authentication. One listing shared by every user can't do that.
+
+The rules for such an index:
+
+- **Its `index` template MUST be [by name](#the-index-template).** Only the
+  listing gives the `sha256` a template by SHA-256 needs. A client MUST
+  treat a `config.json` with a template by SHA-256 and no `collections` as
+  invalid.
+- **The index has a collection if its index file exists.** A `404`, `410`
+  or `451` for it means the index doesn't have that collection, and the
+  client goes on to the next index. Any other status, `401` and `403`
+  included, is a failure, not "not found": the index might have the
+  collection, so the client MUST NOT go on to another index for it. An
+  index that hides a collection from a user MUST answer `404` for it, as
+  it would for one that doesn't exist.
+- **It's asked before any later index.** When choosing the index a
+  collection comes from ([Client rules](#client-rules)), a client asks
+  such an index for the collection's file, and SHOULD NOT request the
+  collection from a later index until it has answered. Asking both at once
+  saves a round trip, but tells a later index, such as a public one, the
+  names of collections an earlier, private one has. An index with a
+  listing answers from it without a request, so only indexes without one
+  cost a round trip.
+- **Each index file is revalidated on every resolve**, with
+  `If-None-Match`, as there's no `sha256` to show a cached copy is current.
+  A client SHOULD NOT remember a `404` from such an index past one
+  resolve: a collection a user has just been given access to would stay
+  missing, with nothing to say why.
+- **A cached `collections.json` from before the index dropped it MUST NOT
+  be used**: `config.json` decides whether there is a listing.
+- **A listing `config.json` names MUST be there.** When `collections` is
+  present and its file is not found (`404`, `410` or `451`), the client
+  MUST fail rather than treat the index as having no listing. Falling back
+  would hide a broken or half-published index, turn every lookup into a
+  request, and leave an index found by SHA-256 with no way to find its
+  files.
+
+Without a listing the index can't be enumerated: no name completion, no
+"did you mean…?" from it, and no change feed, so a mirror of it has to
+learn the names it copies some other way.
 
 ## Index files
 
@@ -465,7 +519,7 @@ added later as an optional field without a format version change.
 - **Content-Type:** clients MUST NOT depend on it.
 - **Not found:** a `404`, `410` or `451` for an index file found by name
   means the collection doesn't exist in this index. Clients MAY cache that
-  briefly. For one found by SHA-256, see
+  briefly, except for an index with [no listing](#no-listing). For one found by SHA-256, see
   [Cached index files](#cached-index-files). Other errors are failures,
   not "not found".
 - **Redirects:** clients MUST follow redirects, but MUST NOT follow one from
@@ -474,6 +528,9 @@ added later as an optional field without a format version change.
   index needs none. A private index can put any authentication in front of
   the same files. Clients send credentials only to indexes the user has
   configured credentials for, and treat `401` as "credentials required".
+  An index that shows each user only what they may see leaves out
+  `collections.json` and answers `404` for what's hidden (see
+  [No listing](#no-listing)).
 
 ## Versioning
 
@@ -507,7 +564,8 @@ to resolve consistently.
 - **Choosing an index:** each top-level requirement resolves from exactly one
   index. That's either the index the user pinned it to (e.g.
   `<index>:ns.name`), or else the first index, in configured priority order,
-  that has the collection. A client MUST NOT pick a collection from one index
+  that has the collection: by its `collections.json`, or for an index with
+  [no listing](#no-listing), by its index file. A client MUST NOT pick a collection from one index
   just because it has a higher version than another. That is how dependency
   confusion attacks work.
 - **Dependencies** resolve from the same index as the collection that
@@ -601,4 +659,4 @@ fields in `config.json`:
 | Requirement syntax | Cargo semver (`1.2` means `^1.2`) | Ansible's (`1.2` means `==1.2.0`) |
 | Cross-index dependencies | Allowed via `deps[].registry`. crates.io forbids them | Not allowed; every index is self-contained |
 | Other line fields | `features`, `features2`, `links`, `rust_version` | `size`, `requires_ansible`, `deprecated`, `published` |
-| Collection listing | None (crates.io lists crates through its web API) | `collections.json`, with per-collection `updated` times |
+| Collection listing | None (crates.io lists crates through its web API) | `collections.json`, with per-collection `updated` times; optional, for an index by name |
