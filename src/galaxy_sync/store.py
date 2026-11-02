@@ -2,7 +2,7 @@
 
     index bucket   config.json, collections.json, plugins.jsonl, index/<aa>/<sha256>.jsonl, conflicts/
     dl bucket      sha256/<aa>/<sha256>.tar.gz
-    state bucket   state.json, failures.json, builtin.jsonl, extract/, conflicts/, requests/
+    state bucket   state.json, builtin.jsonl, extract/, conflicts/, requests/
 
 Each collection's index file is published by its sha256, and never changes;
 the sha256 in state.json says which is the collection's.
@@ -171,6 +171,18 @@ def _fold_conflicts(state: SyncState) -> bool:
     return True
 
 
+def _drop_acknowledgements(state: SyncState) -> set[str]:
+    """Remove the `acknowledged` conflicts had, so they're reported again; the collections changed.
+
+    Remove this once the stored state has been converted.
+    """
+    changed: set[str] = set()
+    for c in state["conflicts"]:
+        if cast(dict[str, object], cast(object, c)).pop("acknowledged", None) is not None:
+            changed.add(c["collection"])
+    return changed
+
+
 class StateChanged(StorageError):
     """Another run saved state.json since this one read it."""
 
@@ -189,13 +201,13 @@ class Store:
         if self._saved is not None:
             self.state.update(json.loads(self._saved))
         folded = _fold_conflicts(self.state)
+        unacknowledged = _drop_acknowledgements(self.state)
         # Ledger keys that appeared or cleared during this run, for the report.
         self._new_failures: set[str] = set()
         self._resolved_failures: set[str] = set()
         self._new_conflicts: list[Conflict] = []
-        self._acknowledged: list[Conflict] = []
         # Collections whose public conflict record needs writing.
-        self._conflicts_changed: set[str] = self.conflicted_collections() if folded else set()
+        self._conflicts_changed: set[str] = (self.conflicted_collections() if folded else set()) | unacknowledged
         # Plugin lines written this run, so merging them needn't read them back.
         self._plugin_lines: dict[str, list[PluginLine]] = {}
         # Each collection's extractions object as read or last saved, to skip unchanged saves.
@@ -342,17 +354,12 @@ class Store:
         self,
         targets: list[str],
         revalidate: bool,
-        acknowledge: list[str] | None = None,
-        note: str = "",
         rebuild: bool = False,
         dl: str = "",
     ) -> str:
         requested = now()
         key = f"requests/{requested.replace(':', '')}-{secrets.token_hex(4)}.json"
         request: Request = {"requested": requested, "targets": targets, "revalidate": revalidate}
-        if acknowledge:
-            request["acknowledge"] = acknowledge
-            request["note"] = note
         if rebuild:
             request["rebuild"] = True
         if dl:
@@ -376,9 +383,8 @@ class Store:
 
     # When Galaxy serves different contents for a mirrored version, ours is
     # kept and a conflict is opened for a person to inspect. It collects every
-    # differing artifact Galaxy serves after that, stops being reported once a
-    # person acknowledges it, and is resolved once Galaxy serves our contents
-    # again. Nothing is ever removed: each collection's conflicts are
+    # differing artifact Galaxy serves after that, and is reported until it's
+    # resolved, once Galaxy serves our contents again. Nothing is ever removed: each collection's conflicts are
     # published in full as conflicts/<ns>/<name>.json in the index bucket.
 
     @staticmethod
@@ -394,10 +400,6 @@ class Store:
 
     def open_conflicts(self) -> list[Conflict]:
         return [c for c in self.state["conflicts"] if "resolved" not in c]
-
-    def conflicts_to_inspect(self) -> list[Conflict]:
-        """Open conflicts no one has acknowledged yet."""
-        return [c for c in self.open_conflicts() if "acknowledged" not in c]
 
     def _open_conflict(self, fqcn: str, vers: str) -> Conflict | None:
         return next((c for c in self.open_conflicts() if (c["collection"], c["version"]) == (fqcn, vers)), None)
@@ -425,23 +427,14 @@ class Store:
         self._conflicts_changed.add(fqcn)
         return True
 
-    def acknowledge_conflict(self, fqcn: str, vers: str, note: str) -> Conflict | None:
-        """Acknowledge a version's open conflict, or replace its note; None if it has none."""
-        if (conflict := self._open_conflict(fqcn, vers)) is None:
-            return None
-        conflict["acknowledged"] = {"at": now(), "note": note}
-        self._acknowledged.append(conflict)
-        self._conflicts_changed.add(fqcn)
-        return conflict
-
-    @property
-    def acknowledged(self) -> list[Conflict]:
-        """The conflicts acknowledged this run."""
-        return self._acknowledged
-
     @staticmethod
     def conflict_record_key(namespace: str, name: str) -> str:
         return f"conflicts/{namespace}/{name}.json"
+
+    @property
+    def conflict_records_due(self) -> bool:
+        """Whether a conflict record needs writing, e.g. after a state migration."""
+        return bool(self._conflicts_changed)
 
     def write_conflict_records(self, fqcns: Collection[str] | None = None) -> int:
         """Write the public conflict record of each collection whose conflicts changed, or of `fqcns`.
@@ -463,8 +456,8 @@ class Store:
     def conflicted_collections(self) -> set[str]:
         return {c["collection"] for c in self.state["conflicts"]}
 
-    def write_failure_report(self) -> report.Report:
-        """Write failures.json and return the report, with the Markdown for the tracking issue."""
+    def failure_report(self) -> report.Report:
+        """The report, with the Markdown for the tracking issue. Marks the failures alerted this run."""
         failures = self.state["failures"]
         new = self._new_failures & {k for k, e in failures.items() if e["attempts"] == 1}
         generated = now()
@@ -474,16 +467,13 @@ class Store:
             if "alerted" not in entry and datetime.datetime.fromisoformat(entry["first_seen"]) <= cutoff:
                 entry["alerted"] = generated
                 persistent.append(entry)
-        result = report.render(
+        return report.render(
             failures,
             self.open_conflicts(),
             new,
             self._resolved_failures - set(failures),
-            generated,
-            alerts=report.Alerts(self._new_conflicts, persistent, self._acknowledged),
+            alerts=report.Alerts(self._new_conflicts, persistent),
         )
-        _ = _write(self.state_bucket, "failures.json", result.json)
-        return result
 
     @staticmethod
     def artifact_key(sha256: str) -> str:

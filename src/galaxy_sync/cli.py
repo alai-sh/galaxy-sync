@@ -5,11 +5,10 @@
                to --budget minutes; re-extract ansible.builtin when
                ansible-core has a new minor release
     refresh    ask the next sync to reconcile NS[.NAME] first, to sweep, to
-               rebuild, to move the artifact URLs, or to acknowledge a
-               conflict
+               rebuild, or to move the artifact URLs
 
 Recorded failures and conflicts don't fail a run; they're reported in
-failures.json in the state bucket and, through --report and --alerts, on a
+state.json in the state bucket and, through --report and --alerts, on a
 tracking issue. --strict exits 1 while any is outstanding.
 """
 
@@ -34,7 +33,6 @@ from .changes import (
     discover,
     few,
     resolve_targets,
-    split_version_target,
     sweep,
 )
 from .galaxy import BASE_URL, GalaxyClient, GalaxyError
@@ -59,7 +57,7 @@ def _open_store(args: argparse.Namespace) -> Store:
 
 
 def _exit_code(store: Store, args: argparse.Namespace) -> int:
-    return 1 if args.strict and (store.state["failures"] or store.conflicts_to_inspect()) else 0
+    return 1 if args.strict and (store.state["failures"] or store.open_conflicts()) else 0
 
 
 def _changes(res: Result) -> list[str]:
@@ -224,7 +222,7 @@ def _print_warnings(worked: dict[str, Result | str]) -> None:
         print(f"  {fqcn} {vers}: ours {ours}, Galaxy's {theirs}")
 
 
-# How many outstanding failures a run lists when it starts; the rest are in failures.json.
+# How many outstanding failures a run lists when it starts; the rest are in state.json.
 SHOW_FAILURES = 20
 
 # When each step's run-level failure (collection GLOBAL) is retried.
@@ -280,17 +278,15 @@ def _print_outstanding(store: Store, requests: list[tuple[str, Request]]) -> Non
                 print(row)
             shown += min(len(rows), SHOW_FAILURES - shown)
     if len(failures) > SHOW_FAILURES:
-        print(f"  and {len(failures) - SHOW_FAILURES} more; see failures.json in the state bucket")
+        print(f"  and {len(failures) - SHOW_FAILURES} more; see state.json in the state bucket")
 
 
 def _is_sweep(request: Request) -> bool:
-    return not (request["targets"] or request.get("acknowledge") or request.get("rebuild") or request.get("dl"))
+    return not (request["targets"] or request.get("rebuild") or request.get("dl"))
 
 
 def _asks(request: Request) -> list[str]:
     """What a `refresh` request asks for, one line each."""
-    if acknowledge := request.get("acknowledge"):
-        return [f"acknowledge {target}: {request.get('note', '')}" for target in acknowledge]
     asks = ["rebuild"] if request.get("rebuild") else []
     if dl := request.get("dl"):
         asks.append(f"move the artifact URLs to {dl}")
@@ -379,9 +375,7 @@ def _queue_requests(client: GalaxyClient, store: Store, requests: list[tuple[str
     failed = False
     for key, request in requests:
         what = f"request {key}"
-        if acknowledge := request.get("acknowledge"):
-            _acknowledge(store, key, acknowledge, request.get("note", ""))
-        elif request.get("rebuild") or request.get("dl"):
+        if request.get("rebuild") or request.get("dl"):
             if dl := request.get("dl"):
                 store.dl_url = dl
                 store.write_config()  # now, so the move doesn't wait for the end of the run
@@ -414,21 +408,6 @@ def _queue_requests(client: GalaxyClient, store: Store, requests: list[tuple[str
     if not failed:
         store.clear_failures(GLOBAL, "requests")
     return taken
-
-
-def _acknowledge(store: Store, key: str, targets: list[str], note: str) -> None:
-    """Acknowledge the conflicts a request names, so they're no longer reported."""
-    for target in targets:
-        what = f"request {key}: acknowledge {target}"
-        try:
-            fqcn, vers = split_version_target(target)
-        except ValueError as e:  # `refresh` checks names, so only a hand-written request
-            print(f"{what} dropped: {e}", file=sys.stderr)
-            continue
-        if store.acknowledge_conflict(fqcn, vers, note) is None:
-            print(f"{what} dropped: it has no open conflict", file=sys.stderr)
-        else:
-            print(f"{what}: acknowledged")
 
 
 def _rebuild(store: Store, deadline: float) -> bool:
@@ -621,7 +600,7 @@ def _finish(
     _ = store.write_conflict_records()
     store.write_collections()  # last, as it names the index files written before it
     pruned = store.prune_index_files() if store.prune_due() else None
-    failures = store.write_failure_report()
+    failures = store.failure_report()
     summary = failures.summary
     store.save_state()
     _print_summary(store, worked, elapsed)
@@ -630,7 +609,7 @@ def _finish(
         print(f"deleted {pruned} index files no listing has named for {RETIRED_GRACE.days} days")
     print(
         f"failures: {summary.outstanding} outstanding, {summary.new} new, {summary.resolved} resolved; "
-        + f"{summary.conflicts} conflicts to inspect (see failures.json in the state bucket)"
+        + f"{summary.conflicts} open conflicts (see state.json in the state bucket)"
     )
     _print_warnings(worked)
     print(_sweep_status(store))
@@ -639,8 +618,6 @@ def _finish(
         print(headline)
     if args.alerts is not None:
         _write_alerts(args.alerts, summary.alerts.comments())
-    if args.acknowledged is not None:
-        _ = args.acknowledged.write_text(summary.alerts.acknowledged_json())
     if args.report is not None:
         _ = args.report.write_text(failures.markdown)
 
@@ -704,7 +681,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     # budget has run out; the next run starts with it instead.
     swept = time.monotonic() < deadline and _sweep_due(store) and _sweep(client, store)
     _work(client, store, deadline, worked)
-    if res.unchanged and not (taken or rebuilt or extracted or swept or worked):
+    if res.unchanged and not (taken or rebuilt or extracted or swept or worked or store.conflict_records_due):
         store.save_state()  # the builtin check's time, and any failure recorded
         return _exit_code(store, args)  # nothing changed: skip rewriting the aggregate files
     if not res.unchanged or swept:
@@ -714,27 +691,19 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
-    """Ask the next sync to reconcile collections first, sweep, rebuild, move the artifact URLs or acknowledge conflicts."""
+    """Ask the next sync to reconcile collections first, sweep, rebuild, or move the artifact URLs."""
     if args.revalidate and not args.targets:
         raise UsageError("--revalidate needs NS or NS.NAME targets")
-    if args.acknowledge and args.targets:
-        raise UsageError("--ack can't be combined with targets")
-    if (args.rebuild or args.dl) and (args.targets or args.acknowledge):
-        raise UsageError("--rebuild and --dl can't be combined with targets or --ack")
-    if bool(args.acknowledge) != bool(args.note):
-        raise UsageError("--ack and --note go together")
+    if (args.rebuild or args.dl) and args.targets:
+        raise UsageError("--rebuild and --dl can't be combined with targets")
     try:
         for target in args.targets:
             check_target(target)
-        for target in args.acknowledge:
-            _ = split_version_target(target)
     except ValueError as e:
         raise UsageError(str(e)) from None
     store = _open_store(args)
-    key = store.add_request(args.targets, args.revalidate, args.acknowledge, args.note, args.rebuild, args.dl)
-    if args.acknowledge:
-        what = f"acknowledging {', '.join(args.acknowledge)}"
-    elif args.rebuild and args.dl:
+    key = store.add_request(args.targets, args.revalidate, args.rebuild, args.dl)
+    if args.rebuild and args.dl:
         what = f"a rebuild, moving the artifact URLs to {args.dl}"
     elif args.rebuild:
         what = "a rebuild"
@@ -780,14 +749,8 @@ def _parser() -> argparse.ArgumentParser:
         "--alerts",
         type=Path,
         metavar="DIR",
-        help="write a Markdown comment per conflict opened this run, and one for the failures that became "
-        + "persistent, into this directory; none if there were none",
-    )
-    _ = p.add_argument(
-        "--acknowledged",
-        type=Path,
-        metavar="FILE",
-        help="write the conflicts acknowledged this run here as JSON lines of their alert comment's marker and note",
+        help="write a Markdown comment for the failures that became persistent this run into this "
+        + "directory; none if there were none",
     )
     _ = p.add_argument(
         "--report",
@@ -807,7 +770,7 @@ def _parser() -> argparse.ArgumentParser:
         "refresh",
         parents=[storage],
         help="ask the next sync to reconcile NS[.NAME] first, with no targets to run the sweep, "
-        + "or to rebuild, move the artifact URLs or acknowledge conflicts",
+        + "or to rebuild or move the artifact URLs",
     )
     _ = p.add_argument("targets", nargs="*", metavar="NS[.NAME]")
     _ = p.add_argument(
@@ -815,15 +778,6 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also check every mirrored artifact against the one Galaxy publishes now (needs targets)",
     )
-    _ = p.add_argument(
-        "--ack",
-        dest="acknowledge",
-        action="append",
-        default=[],
-        metavar="NS.NAME:VERSION",
-        help="acknowledge a version's open conflict, so it's no longer reported (repeatable; needs --note)",
-    )
-    _ = p.add_argument("--note", default="", help="why the conflicts are acknowledged; published with them")
     _ = p.add_argument(
         "--rebuild",
         action="store_true",

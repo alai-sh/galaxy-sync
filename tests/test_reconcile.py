@@ -1,7 +1,6 @@
 """reconcile(): mirroring, yanking, conflicts and failure handling for one collection."""
 
 import hashlib
-import json
 
 import pytest
 from helpers import DETAIL, UNAVAILABLE, artifact, extraction
@@ -110,15 +109,15 @@ def test_failure_report_counts(galaxy, client, store):
     good = galaxy.routes[DETAIL.format("1.0.0")]
     galaxy.routes[DETAIL.format("1.0.0")] = UNAVAILABLE
     reconcile(client, store, "ns", "coll")
-    report = store.write_failure_report()
+    report = store.failure_report()
     assert report.summary == Summary(outstanding=1, new=1, resolved=0, conflicts=0)
     assert "| ns.coll | 1.0.0 | galaxy_unavailable | 20" in report.markdown
-    assert json.loads(store.state_bucket.read("failures.json"))["outstanding"][0]["attempts"] == 1
+    assert [f["attempts"] for f in store.state["failures"].values()] == [1]
 
     later = reload(store)
     galaxy.routes[DETAIL.format("1.0.0")] = good
     reconcile(client, later, "ns", "coll")
-    assert later.write_failure_report().summary == Summary(outstanding=0, new=0, resolved=1, conflicts=0)
+    assert later.failure_report().summary == Summary(outstanding=0, new=0, resolved=1, conflicts=0)
 
 
 def test_outdated_extractions_are_rerun(galaxy, client, store):
@@ -258,8 +257,8 @@ def test_changed_contents_are_a_conflict(galaxy, client, store):
     assert store.state_bucket.read(observed["saved"]) == changed
     assert conflict["opened"] == observed["seen"]
     assert store.state["failures"] == {}  # reported as a conflict, not retried as a failure
-    report = store.write_failure_report()
-    assert "### Conflicts to inspect" in report.markdown
+    report = store.failure_report()
+    assert "### Open conflicts" in report.markdown
     assert f"| ns.coll | 1.0.0 | {original['sha256'][:12]} | {upstream[:12]} |" in report.markdown
     assert observed["saved"] not in report.markdown  # the state bucket key stays private
     assert report.summary.alerts.conflicts == [conflict]
@@ -281,7 +280,7 @@ def test_changed_contents_are_a_conflict(galaxy, client, store):
     assert latest["changes"] == "added plugins/modules/third.py; removed plugins/modules/thing.py"
     assert store.state_bucket.read(latest["saved"]) == again
     assert updated["opened"] == conflict["opened"]
-    report = store.write_failure_report()
+    report = store.failure_report()
     assert f"| ns.coll | 1.0.0 | {original['sha256'][:12]} | {latest['sha256'][:12]} | 2 |" in report.markdown
 
     # Back to a build already observed: compared again, but not repeated.
@@ -319,7 +318,7 @@ def test_conflict_comparison_failures(galaxy, client, store, monkeypatch):
     reconcile(client, store, "ns", "coll")
     assert {f["kind"] for f in store.state["failures"].values()} == {"sha256_mismatch"}
 
-    # Unreadable on Galaxy's side, or our artifact missing: still a conflict to inspect.
+    # Unreadable on Galaxy's side, or our artifact missing: still an open conflict.
     unreadable = b"not a tarball"
     galaxy.replace("ns", "coll", "1.0.0", unreadable)
     reconcile(client, store, "ns", "coll")

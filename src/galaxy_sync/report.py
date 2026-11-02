@@ -1,12 +1,10 @@
-"""The failure report: failures.json for tooling, Markdown for the tracking issue, and the public conflict records.
+"""The failure report: Markdown for the tracking issue, and the public conflict records.
 
-failures.json stays in the private state bucket with every detail. What's
-public is the Markdown: a report block of everything outstanding, which
-`sync --report` writes for the issue's description, and the alerts, which
-`sync --alerts` writes as one comment per conflict opened this run plus one
-for the failures that became persistent. `sync --acknowledged` lists the
-conflicts acknowledged this run, so the workflow can mark their comments
-resolved. Each collection's conflict record, published in the index bucket,
+The full detail stays in state.json, in the private state bucket. What's
+public is the Markdown: a report block of the outstanding failures and every
+open conflict, which `sync --report` writes for the issue's description, and
+the alert, which `sync --alerts` writes as one comment for the failures that
+became persistent. Each collection's conflict record, published in the index bucket,
 is the permanent history. None of these include what shouldn't be
 published: the state bucket key of a conflict's artifact, and URLs in
 `unexpected` messages, which can name the storage endpoint.
@@ -66,36 +64,6 @@ def _conflict_rows(conflicts: list[Conflict]) -> list[str]:
     return rows
 
 
-def conflict_marker(conflict: Conflict) -> str:
-    """The hidden line that finds a conflict's alert comment again once it's acknowledged."""
-    return f"<!-- galaxy-sync:conflict {conflict['collection']} {conflict['version']} {conflict['opened']} -->"
-
-
-def _conflict_comment(conflict: Conflict) -> str:
-    fqcn, vers = conflict["collection"], conflict["version"]
-    latest = conflict["observed"][-1]
-    changes = latest["changes"].replace("\n", " ")
-    if len(changes) > 2000:
-        changes = changes[:2000] + " ..."
-    return "\n".join(
-        [
-            conflict_marker(conflict),
-            f"**galaxy-sync: new conflict in {fqcn} {vers}**",
-            "",
-            "Galaxy now serves different contents for this version. The mirror keeps its original;",
-            "Galaxy's artifact is saved in the state bucket. Once it's inspected, acknowledge it with",
-            f"the Refresh workflow (`acknowledge: {fqcn}:{vers}` and a note) to stop it being reported.",
-            "",
-            "| Ours | Galaxy | Uploaded to Galaxy | Seen |",
-            "|---|---|---|---|",
-            f"| {conflict['ours']} | {latest['sha256']} | {latest['uploaded'] or 'unknown'} | {latest['seen']} |",
-            "",
-            f"Changes: {changes}",
-            "",
-        ]
-    )
-
-
 def _sorted_failures(failures: list[Failure]) -> list[Failure]:
     return sorted(failures, key=lambda e: (e["collection"], e["version"] or "", e["kind"]))
 
@@ -117,8 +85,6 @@ def conflict_record(fqcn: str, conflicts: list[Conflict]) -> str:
                 for o in c["observed"]
             ],
         }
-        if "acknowledged" in c:
-            entry["acknowledged"] = c["acknowledged"]
         if "resolved" in c:
             entry["resolved"] = c["resolved"]
         entries.append(entry)
@@ -129,13 +95,12 @@ def conflict_record(fqcn: str, conflicts: list[Conflict]) -> str:
 class Alerts:
     """What this run should tell a person about.
 
-    Conflicts opened, failures that just passed store.PERSISTENT, and the
-    conflicts acknowledged, whose comments can be marked resolved.
+    Conflicts opened, which are only in the report block and the run's
+    output, and failures that just passed store.PERSISTENT.
     """
 
     conflicts: list[Conflict] = field(default_factory=list)
     persistent: list[Failure] = field(default_factory=list)
-    acknowledged: list[Conflict] = field(default_factory=list)
 
     def headline(self) -> str:
         """One line for the run's output, or "" when there's nothing new."""
@@ -147,8 +112,8 @@ class Alerts:
         return f"galaxy-sync: {' and '.join(parts)}" if parts else ""
 
     def comments(self) -> list[str]:
-        """The notification comments: one per new conflict, then one for the persistent failures."""
-        comments = [_conflict_comment(c) for c in _sorted_conflicts(self.conflicts)]
+        """The notification comments: one for the persistent failures."""
+        comments: list[str] = []
         if self.persistent:
             headline = _n(len(self.persistent), "failure") + " outstanding for over a day"
             lines = [
@@ -163,14 +128,6 @@ class Alerts:
             comments.append("\n".join(lines) + "\n")
         return comments
 
-    def acknowledged_json(self) -> str:
-        """The conflicts acknowledged this run, as JSON lines of `marker` and `note`."""
-        return "".join(
-            json.dumps({"marker": conflict_marker(c), "note": c["acknowledged"]["note"]}) + "\n"
-            for c in _sorted_conflicts(self.acknowledged)
-            if "acknowledged" in c
-        )
-
 
 @dataclass(frozen=True)
 class Summary:
@@ -183,7 +140,6 @@ class Summary:
 
 @dataclass(frozen=True)
 class Report:
-    json: str  # failures.json
     markdown: str  # the report block for the tracking issue, between REPORT_START and REPORT_END
     summary: Summary
 
@@ -193,44 +149,32 @@ def render(
     conflicts: list[Conflict],
     new: set[str],
     resolved: set[str],
-    generated: str,
     alerts: Alerts,
 ) -> Report:
     """Render the report from the ledger, the open conflicts, and the keys that appeared or cleared this run."""
     outstanding = _sorted_failures(list(failures.values()))
     conflicts = _sorted_conflicts(conflicts)
-    to_inspect = [c for c in conflicts if "acknowledged" not in c]
-    summary = Summary(len(failures), len(new), len(resolved), len(to_inspect), alerts)
-
-    as_json = json.dumps(
-        {
-            "generated": generated,
-            "outstanding": outstanding,
-            "resolved_this_run": sorted(resolved),
-            "conflicts": conflicts,
-        },
-        indent=1,
-    )
+    summary = Summary(len(failures), len(new), len(resolved), len(conflicts), alerts)
 
     # No timestamp or attempt counts: the block only changes when what's
     # outstanding does, so the issue isn't edited every run.
     lines = [REPORT_START, "## galaxy-sync report", ""]
-    if not outstanding and not to_inspect:
-        lines.append("No outstanding failures or conflicts to inspect.")
+    if not outstanding and not conflicts:
+        lines.append("No outstanding failures or open conflicts.")
     else:
-        lines.append(f"{_n(len(outstanding), 'failure')} outstanding, {_n(len(to_inspect), 'conflict')} to inspect.")
+        lines.append(f"{_n(len(outstanding), 'failure')} outstanding, {_n(len(conflicts), 'open conflict')}.")
     if outstanding:
         lines += ["", *_failure_rows(outstanding, attempts=False)]
-    if to_inspect:
+    if conflicts:
         lines += [
             "",
-            "### Conflicts to inspect",
+            "### Open conflicts",
             "",
             "Galaxy now serves different contents for these versions. The mirror keeps its",
             "original; Galaxy's artifacts are saved in the state bucket. Changes are from the",
-            "latest build Galaxy served. Acknowledge each with the Refresh workflow once inspected.",
+            "latest build Galaxy served.",
             "",
-            *_conflict_rows(to_inspect),
+            *_conflict_rows(conflicts),
         ]
     lines.append(REPORT_END)
-    return Report(as_json + "\n", "\n".join(lines) + "\n", summary)
+    return Report("\n".join(lines) + "\n", summary)

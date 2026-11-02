@@ -405,8 +405,7 @@ never removed. A collection that never had one has no record (404).
    "observed": [
     {"sha256": "31526b65...", "uploaded": "2026-10-18T23:05:51Z", "seen": "2026-10-18T23:20:18Z", "changes": "added playbooks/a.yml; changed roles/b/meta/main.yml"},
     {"sha256": "8caedf6f...", "uploaded": "2026-10-18T23:42:26Z", "seen": "2026-10-19T00:06:49Z", "changes": "added playbooks/a.yml"}
-   ],
-   "acknowledged": {"at": "2026-10-19T09:00:00Z", "note": "The author republished 1.0.0 with new content"}
+   ]
   }
  ]
 }
@@ -419,11 +418,10 @@ never removed. A collection that never had one has no record (404).
 | `conflicts[].ours` | string | yes | The index's `sha256` for it |
 | `conflicts[].opened` | string | yes | When the mirror first saw the origin serve different contents |
 | `conflicts[].observed` | array | yes | Each differing artifact the origin served, oldest first: `sha256`, `uploaded` (the origin's upload time, or `null` if unknown), `seen` (when the mirror first compared it), and `changes` (the files added, removed and changed from ours, or why they couldn't be compared) |
-| `conflicts[].acknowledged` | object | no | The mirror's operators inspected it and keep the original: `at`, and a `note` saying why |
 | `conflicts[].resolved` | string | no | When the origin served the original's contents again |
 
 A version has at most one conflict without `resolved`. Conflicts never
-change the index: its line stays as it was, acknowledged or not.
+change the index: its line stays as it was.
 
 ## Index completeness
 

@@ -59,10 +59,9 @@ same work, so it doesn't matter which run picks it up. Each `sync`:
    Something found is saved in the queue before the cursor moves past it.
 2. **Takes requests.** `refresh` doesn't reconcile anything itself. It writes
    a request object under `requests/` in the state bucket, which the next
-   sync queues and deletes. A request names collections or namespaces,
-   asks for a sweep, a rebuild or a new artifact URL template, or
-   acknowledges conflicts. A namespace that can't be listed keeps its
-   request for the next run.
+   sync queues and deletes. A request names collections or namespaces, or
+   asks for a sweep, a rebuild or a new artifact URL template. A namespace
+   that can't be listed keeps its request for the next run.
 3. **Works what was requested,** ahead of everything else: the requested
    collections, then any rebuild ([below](#rebuilds)).
 4. **Checks ansible-core** once a day ([below](#ansiblebuiltin)).
@@ -199,17 +198,11 @@ time, when a reconcile first saw it, and the files added, removed and
 changed from ours. Its life:
 
 1. **Opened** by the first differing artifact. It's listed in the tracking
-   issue's description and posted as a comment of its own.
+   issue's description, sorted by collection, until it's resolved. No
+   comment is posted.
 2. **More artifacts** (an author republishing the same version) are added
-   to it without another comment. The description shows the latest.
-3. **Acknowledged** once a person has inspected it and decided the mirror's
-   original stands: `refresh --ack NS.NAME:VERSION --note TEXT`, or
-   `acknowledge.yml` with the conflicts and a note. The next sync records who
-   decided when, with the note. The conflict leaves the description, its
-   comment gets the note and is marked resolved (minimized), and later
-   artifacts are still recorded but never reported. `--strict` ignores it.
-   Acknowledging again replaces the note.
-4. **Resolved** if Galaxy serves our contents again. A later difference
+   to it. The description shows the latest.
+3. **Resolved** if Galaxy serves our contents again. A later difference
    opens a new conflict.
 
 Conflicts never change the index, and nothing is ever removed. Each collection's conflicts, in every state, are published as
@@ -282,16 +275,15 @@ with the version naming the check: `published`, `feed`, `listing`, `count`,
 `sweep`, `requests` or `builtin`. Each clears when that check next works.
 
 Conflicts aren't failures: they aren't retried, and they stay open until
-Galaxy serves our contents again. Every run writes `failures.json` with the
-outstanding failures and open conflicts, acknowledged or not.
+Galaxy serves our contents again. Both are kept in `state.json`.
 
 ### Notifications
 
-`failures.json` stays in the private state bucket. People read the report on
-a tracking issue instead:
+`state.json` stays in the private state bucket. People read the report on a
+tracking issue instead:
 
 - `sync --report FILE` writes the outstanding failures and the open
-  conflicts no one has acknowledged as a Markdown block, between `<!-- galaxy-sync:report -->` and
+  conflicts as a Markdown block, between `<!-- galaxy-sync:report -->` and
   `<!-- /galaxy-sync:report -->` markers. The scheduled workflow keeps the
   block at the top of the issue's description (`.github/scripts/issue_body.py`
   replaces the previous block, or puts the first one above whatever is
@@ -299,21 +291,15 @@ a tracking issue instead:
   The block has no timestamp or attempt counts, so it changes only when what
   is outstanding does. Editing the description doesn't notify anyone, which
   suits routine churn, and resolved failures just disappear from it.
-- `sync --alerts DIR` writes what a person should hear about, one file per
-  comment: each conflict opened, and the failures outstanding for over a
-  day (each failure once) together. The workflow posts each as a comment,
-  which emails the issue's subscribers. Transient failures that clear within
-  a day never notify. A conflict's comment starts with a hidden
-  `<!-- galaxy-sync:conflict NS.NAME VERSION OPENED -->` marker.
-- `sync --acknowledged FILE` lists the conflicts acknowledged this run, by
-  marker, with the note. The workflow finds each one's comment
-  (`.github/scripts/resolve_comments.py`), adds the note and minimizes it as
-  resolved. Comments posted before the markers existed have to be hidden by
-  hand.
+- `sync --alerts DIR` writes what a person should hear about as a comment
+  file: the failures outstanding for over a day (each failure once). The
+  workflow posts it as a comment, which emails the issue's subscribers.
+  Transient failures that clear within a day never notify. Conflicts are
+  only in the description, so a new one notifies no one.
 
 These and the conflict records leave out what shouldn't be public: the state bucket key of a
 conflict's saved artifact, and URLs in `unexpected` messages, which can name
-the storage endpoint. `failures.json` has them.
+the storage endpoint. `state.json` has them.
 
 A run can't report that runs have stopped. So each successful run also pings
 a heartbeat URL, and the heartbeat service alerts when the pings stop. Set it
@@ -330,7 +316,6 @@ The workflows are in `.github/workflows/`:
 |---|---|---|
 | `sync.yml` | dispatched every 10 minutes by the scheduler; runs once `GALAXY_SYNC_REF` is set | `sync --report --alerts`, then the tracking issue update, the notification and the heartbeat |
 | `refresh.yml` | manual, with targets and `revalidate`, or `rebuild` and `dl` | `refresh`, which only writes a request |
-| `acknowledge.yml` | manual, with conflicts and a note | `refresh --ack`, which only writes a request |
 
 GitHub's `schedule` trigger runs late or not at all too often to rely on, so
 `sync.yml` has none. A Cloudflare Worker with a cron trigger, in

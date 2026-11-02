@@ -31,7 +31,6 @@ uv run galaxy-sync COMMAND [OPTIONS] ...
 |---|---|
 | `sync [--budget MINUTES] [--dry-run]` | Find what changed on Galaxy and queue it, reconcile `refresh` requests first, carry on any rebuild, re-extract `ansible.builtin` when ansible-core has a new minor release on PyPI, sweep once a day, then reconcile the rest of the queue until the budget (default 45 minutes) runs out. The rest stays queued for the next run, so the initial import is built up over many runs. `--dry-run` only reports what changed |
 | `refresh [NS[.NAME]...] [--revalidate]` | Ask the next `sync` to reconcile these namespaces or collections ahead of everything else, or with no targets to sweep: compare every published version with the mirror. `--revalidate` also checks every mirrored version's artifact against the one Galaxy publishes now. Writes a request and returns; it doesn't contact Galaxy |
-| `refresh --ack NS.NAME:VERSION... --note TEXT` | Ask the next `sync` to acknowledge these versions' conflicts once a person has inspected them, so they're no longer reported. The note is published with the conflict ([conflicts](docs/sync.md#conflicts)) |
 | `refresh --rebuild` | Ask the next `sync` to regenerate every file derived from the index, without contacting Galaxy: the plugin index (`ansible.builtin` extracted again too), the conflict records and `collections.json`. A rebuild that runs out of time carries on in the next `sync` |
 | `refresh --dl TEMPLATE` | Ask the next `sync` to move the artifact URL template in `config.json`; later runs keep it. Can be combined with `--rebuild` |
 
@@ -42,13 +41,12 @@ uv run galaxy-sync COMMAND [OPTIONS] ...
 | `-v` | all | Debug logging |
 | `--galaxy-url URL` | `sync` | Galaxy server (default `https://galaxy.ansible.com`) |
 | `--pypi-url URL` | `sync` | PyPI, for ansible-core releases (default `https://pypi.org`) |
-| `--strict` | `sync` | Exit 1 while any failure or unacknowledged conflict is outstanding |
-| `--report FILE` | `sync` | Write the outstanding failures and unacknowledged conflicts as a Markdown block for the tracking issue |
-| `--alerts DIR` | `sync` | Write a Markdown comment per conflict opened this run, and one for the failures that became persistent, into `DIR` |
-| `--acknowledged FILE` | `sync` | Write the conflicts acknowledged this run, so the workflow can mark their comments resolved |
+| `--strict` | `sync` | Exit 1 while any failure or conflict is outstanding |
+| `--report FILE` | `sync` | Write the outstanding failures and open conflicts as a Markdown block for the tracking issue |
+| `--alerts DIR` | `sync` | Write a Markdown comment for the failures that became persistent this run into `DIR` |
 
-A run never stops on a failure: it records it in the failure report
-(`failures.json` in the state bucket) and carries on, and exits 0 unless
+A run never stops on a failure: it records it in the failure ledger
+(in `state.json` in the state bucket) and carries on, and exits 0 unless
 `--strict` is given.
 
 ## Scheduled and manual runs
@@ -62,11 +60,10 @@ The workflows are described in [scheduling](docs/sync.md#scheduling).
 | Manual | `refresh.yml` without targets | Sweeps on the next run, e.g. after `deletions_suspected`, instead of waiting for the daily one |
 | After changing how plugin lines are derived | `refresh.yml` with `rebuild` | Rewrites every derived file over the next syncs |
 | After moving the artifacts | `refresh.yml` with `dl` | Points `config.json` at the new location on the next sync |
-| Manual, after inspecting a conflict | `acknowledge.yml` with the conflicts and a note | Stops reporting the conflict, records the note publicly, and marks its alert comment resolved |
 
-The scheduled run keeps the outstanding failures and unacknowledged
-conflicts at the top of a tracking issue's description, and posts each new
-conflict, and failures outstanding for over a day, as comments there. A
+The scheduled run keeps the outstanding failures and open conflicts at the
+top of a tracking issue's description, and posts failures outstanding for
+over a day as a comment there. A
 heartbeat ping from every successful run catches the runs stopping.
 
 ## Documentation

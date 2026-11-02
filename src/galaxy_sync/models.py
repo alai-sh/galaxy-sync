@@ -206,11 +206,6 @@ class Observation(TypedDict):
     saved: str  # state bucket key of the artifact; never published
 
 
-class Acknowledgement(TypedDict):
-    at: str
-    note: str
-
-
 class Conflict(TypedDict):
     """Galaxy serves different contents for a mirrored version. Ours is kept.
 
@@ -223,7 +218,6 @@ class Conflict(TypedDict):
     ours: str  # sha256 in the index
     opened: str
     observed: list[Observation]  # oldest first
-    acknowledged: NotRequired[Acknowledgement]  # a person looked at it; no longer reported
     resolved: NotRequired[str]  # when Galaxy served our contents again
 
 
@@ -269,12 +263,10 @@ class SyncState(TypedDict):
 
 
 class Request(TypedDict):
-    """A `refresh` asking the next sync to reconcile collections, sweep, rebuild or acknowledge conflicts."""
+    """A `refresh` asking the next sync to reconcile collections, sweep or rebuild."""
 
     requested: str
-    targets: list[str]  # NS or NS.NAME; empty for a sweep, unless it acknowledges
+    targets: list[str]  # NS or NS.NAME; empty for a sweep
     revalidate: bool
-    acknowledge: NotRequired[list[str]]  # NS.NAME:VERSION conflicts to acknowledge, instead of targets
-    note: NotRequired[str]  # why, for the acknowledgements
     rebuild: NotRequired[bool]  # regenerate every file derived from the index, instead of targets
     dl: NotRequired[str]  # a new artifact URL template for config.json, instead of targets

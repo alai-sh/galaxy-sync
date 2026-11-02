@@ -31,8 +31,7 @@ artifact bucket
 
 state bucket
   state.json                   cursors, the queue, per-collection state, the failure ledger, conflicts
-  requests/<time>-<id>.json    `refresh` requests (reconcile, sweep, rebuild, dl or acknowledge) waiting for the next sync
-  failures.json                the failure report
+  requests/<time>-<id>.json    `refresh` requests (reconcile, sweep, rebuild or dl) waiting for the next sync
   builtin.jsonl                ansible.builtin's plugin lines, from ansible-core's sdist
   extract/<ns>/<name>.json.zst each collection's stored extractions, by artifact sha256
   conflicts/<aa>/<sha256>.tar.gz  Galaxy's artifact for each conflict
@@ -86,7 +85,7 @@ a run that stopped.
 | `pending.<ns.name>` | The queue: `source` (`requested`, `uploaded`, `listed` or `swept`), `queued`, `revalidate` if asked for, and what change detection saw, so a reconcile that changes nothing can say why it ran: `uploads` (versions the upload feed saw), `unseen` (mirrored versions the sweep didn't see) and `reasons` (e.g. `updated_at changed` from the listing, `gone: 1.1.0` from the sweep) |
 | `collections.<ns.name>` | Per collection: `updated` (when its index file last changed), `sha256` (of its index file, the key it's published under: the only record of which file is the collection's; a collection without one has no index file), `upstream_updated`, `upstream_deprecated` and `upstream_count` (Galaxy's values at the last reconcile), `unindexed` (versions Galaxy serves that its search index leaves out), and `versions.<v>` with `created_at` and the cached `upstream` comparison verdict |
 | `failures` | The failure ledger, keyed `<ns.name>@<version>#<kind>`: `collection`, `version`, `kind`, `message`, `first_seen`, `last_seen`, `attempts`, and `alerted` once it was notified as persistent |
-| `conflicts` | Versions where Galaxy serves different contents from the mirror ([conflicts](sync.md#conflicts)): `collection`, `version`, `ours`, `opened`, `observed` (each differing artifact: `sha256`, `uploaded`, `seen`, `changes` and `saved`, its key in this bucket), `acknowledged` (`at` and `note`) once a person has, and `resolved` once Galaxy serves our contents again. At most one is open per version, and none is ever removed |
+| `conflicts` | Versions where Galaxy serves different contents from the mirror ([conflicts](sync.md#conflicts)): `collection`, `version`, `ours`, `opened`, `observed` (each differing artifact: `sha256`, `uploaded`, `seen`, `changes` and `saved`, its key in this bucket), and `resolved` once Galaxy serves our contents again. At most one is open per version, and none is ever removed |
 
 The failure kinds are listed in [sync.md](sync.md#failures-and-conflicts).
 
