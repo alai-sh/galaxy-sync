@@ -60,55 +60,8 @@ def test_requests(tmp_path):
     assert [key for key, _ in store.requests()] == [second]
 
 
-def test_conflicts_saved_one_per_artifact_are_folded(tmp_path):
-    def legacy(upstream, seen, **extra):
-        return {
-            "collection": "ns.coll",
-            "version": "1.0.0",
-            "ours": "a" * 64,
-            "upstream": upstream,
-            "seen": seen,
-            "changes": f"changes in {upstream}",
-            "saved": f"conflicts/{upstream[:2]}/{upstream}.tar.gz",
-            **extra,
-        }
-
-    old = Store(Buckets.local(tmp_path))
-    old.state["conflicts"] = [
-        legacy("c" * 64, "2026-10-19T00:06:49Z"),
-        legacy("b" * 64, "2026-10-18T23:20:18Z"),
-        legacy("d" * 64, "2026-10-01T00:00:00Z", resolved="2026-10-02T00:00:00Z"),
-    ]
-    old.save_state()
-
-    store = Store(Buckets.local(tmp_path))
-    resolved, current = store.state["conflicts"]
-    assert resolved["resolved"] == "2026-10-02T00:00:00Z"
-    assert [o["sha256"] for o in resolved["observed"]] == ["d" * 64]
-    assert current == {
-        "collection": "ns.coll",
-        "version": "1.0.0",
-        "ours": "a" * 64,
-        "opened": "2026-10-18T23:20:18Z",
-        "observed": [
-            {
-                "sha256": sha,
-                "uploaded": None,
-                "seen": seen,
-                "changes": f"changes in {sha}",
-                "saved": f"conflicts/{sha[:2]}/{sha}.tar.gz",
-            }
-            for sha, seen in (("b" * 64, "2026-10-18T23:20:18Z"), ("c" * 64, "2026-10-19T00:06:49Z"))
-        ],
-    }
-
-    # Their public records are written, as the conflicts changed shape.
-    assert store.write_conflict_records() == 1
-    assert json.loads(store.index.read("conflicts/ns/coll.json") or b"")["conflicts"][1]["opened"] == current["opened"]
-
-    # Folded state stays as it is.
-    store.save_state()
-    assert Store(Buckets.local(tmp_path)).state["conflicts"] == [resolved, current]
+def _listed(store, name="coll"):
+    return json.loads(store.index.read("collections.json"))["namespaces"]["ns"][name]
 
 
 LINE = {
@@ -121,10 +74,6 @@ LINE = {
     "yanked": False,
     "published": "2026-01-01T00:00:00Z",
 }
-
-
-def _listed(store, name="coll"):
-    return json.loads(store.index.read("collections.json"))["namespaces"]["ns"][name]
 
 
 def test_collections_sha256(tmp_path):

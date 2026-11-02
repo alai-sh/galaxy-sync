@@ -125,64 +125,6 @@ def ordered_line(line: IndexLine) -> dict[str, object]:
     return out
 
 
-def _fold_conflicts(state: SyncState) -> bool:
-    """Fold conflicts saved with one Galaxy artifact each into one per version; True if any were.
-
-    Before conflicts collected observations, each differing artifact was its
-    own entry, with `upstream`, `seen`, `changes` and `saved`. Remove this
-    once the stored state has been converted.
-    """
-    if all("observed" in c for c in state["conflicts"]):
-        return False
-    folded: list[Conflict] = []
-    open_by_version: dict[tuple[str, str], Conflict] = {}
-    entries = cast(list[dict[str, str]], cast(object, state["conflicts"]))
-    for legacy in sorted(entries, key=lambda c: c.get("opened") or c["seen"]):
-        if "observed" in legacy:
-            current = cast(Conflict, cast(object, legacy))
-            folded.append(current)
-            if "resolved" not in current:
-                open_by_version[current["collection"], current["version"]] = current
-            continue
-        observation: Observation = {
-            "sha256": legacy["upstream"],
-            "uploaded": None,
-            "seen": legacy["seen"],
-            "changes": legacy["changes"],
-            "saved": legacy["saved"],
-        }
-        version = (legacy["collection"], legacy["version"])
-        if "resolved" not in legacy and (current := open_by_version.get(version)) is not None:
-            current["observed"].append(observation)
-            continue
-        conflict: Conflict = {
-            "collection": legacy["collection"],
-            "version": legacy["version"],
-            "ours": legacy["ours"],
-            "opened": legacy["seen"],
-            "observed": [observation],
-        }
-        if "resolved" in legacy:
-            conflict["resolved"] = legacy["resolved"]
-        else:
-            open_by_version[version] = conflict
-        folded.append(conflict)
-    state["conflicts"] = folded
-    return True
-
-
-def _drop_acknowledgements(state: SyncState) -> set[str]:
-    """Remove the `acknowledged` conflicts had, so they're reported again; the collections changed.
-
-    Remove this once the stored state has been converted.
-    """
-    changed: set[str] = set()
-    for c in state["conflicts"]:
-        if cast(dict[str, object], cast(object, c)).pop("acknowledged", None) is not None:
-            changed.add(c["collection"])
-    return changed
-
-
 class StateChanged(StorageError):
     """Another run saved state.json since this one read it."""
 
@@ -200,14 +142,12 @@ class Store:
         self._saved = self.state_bucket.read("state.json")
         if self._saved is not None:
             self.state.update(json.loads(self._saved))
-        folded = _fold_conflicts(self.state)
-        unacknowledged = _drop_acknowledgements(self.state)
         # Ledger keys that appeared or cleared during this run, for the report.
         self._new_failures: set[str] = set()
         self._resolved_failures: set[str] = set()
         self._new_conflicts: list[Conflict] = []
         # Collections whose public conflict record needs writing.
-        self._conflicts_changed: set[str] = (self.conflicted_collections() if folded else set()) | unacknowledged
+        self._conflicts_changed: set[str] = set()
         # Plugin lines written this run, so merging them needn't read them back.
         self._plugin_lines: dict[str, list[PluginLine]] = {}
         # Each collection's extractions object as read or last saved, to skip unchanged saves.
@@ -430,11 +370,6 @@ class Store:
     @staticmethod
     def conflict_record_key(namespace: str, name: str) -> str:
         return f"conflicts/{namespace}/{name}.json"
-
-    @property
-    def conflict_records_due(self) -> bool:
-        """Whether a conflict record needs writing, e.g. after a state migration."""
-        return bool(self._conflicts_changed)
 
     def write_conflict_records(self, fqcns: Collection[str] | None = None) -> int:
         """Write the public conflict record of each collection whose conflicts changed, or of `fqcns`.

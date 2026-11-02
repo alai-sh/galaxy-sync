@@ -681,7 +681,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     # budget has run out; the next run starts with it instead.
     swept = time.monotonic() < deadline and _sweep_due(store) and _sweep(client, store)
     _work(client, store, deadline, worked)
-    if res.unchanged and not (taken or rebuilt or extracted or swept or worked or store.conflict_records_due):
+    if res.unchanged and not (taken or rebuilt or extracted or swept or worked):
         store.save_state()  # the builtin check's time, and any failure recorded
         return _exit_code(store, args)  # nothing changed: skip rewriting the aggregate files
     if not res.unchanged or swept:

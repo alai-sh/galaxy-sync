@@ -736,31 +736,6 @@ def test_conflicts(galaxy, run, tmp_path, refresh):
     assert json.loads(record.read_text())["conflicts"] == [entry]
 
 
-def test_acknowledgements_are_dropped(galaxy, run, tmp_path):
-    for name in ("b", "a"):
-        galaxy.add_collection("ns", name, ["1.0.0"])
-    assert run("refresh", "ns.a", "ns.b") == 0
-    assert run("sync") == 0
-    for name in ("b", "a"):
-        galaxy.add_collection("ns", name, ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})
-    assert run("refresh", "--revalidate", "ns.a", "ns.b") == 0
-    assert run("sync") == 0
-    current = state(tmp_path)
-    acknowledged = next(c for c in current["conflicts"] if c["collection"] == "ns.b")
-    acknowledged["acknowledged"] = {"at": "2026-10-19T09:00:00Z", "note": "inspected"}
-    (tmp_path / "state" / "state.json").write_text(json.dumps(current))
-    record = tmp_path / "index-root" / "conflicts" / "ns" / "b.json"
-    record.write_text(json.dumps({"collection": "ns.b", "conflicts": [acknowledged]}))
-
-    report = tmp_path / "report.md"
-    assert run("sync", "--report", str(report)) == 0
-    assert all("acknowledged" not in c for c in state(tmp_path)["conflicts"])
-    assert "acknowledged" not in json.loads(record.read_text())["conflicts"][0]
-    text = report.read_text()
-    assert "2 open conflicts.\n" in text
-    assert text.index("\n| ns.a | 1.0.0 | ") < text.index("\n| ns.b | 1.0.0 | ")  # sorted by collection
-
-
 def test_state_is_saved_after_enough_work(galaxy, run, monkeypatch):
     for name in ("a", "b", "c"):
         galaxy.add_collection("ns", name, ["1.0.0"])
