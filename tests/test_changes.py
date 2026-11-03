@@ -250,6 +250,11 @@ def test_sweep(galaxy, client, store, tree):
         reconcile(client, store, tree, ns, name)
     assert sweep(client, store, tree).collections == []
 
+    # A count left from an older state is set again from the index.
+    store.collection_state("ns.c")["mirrored"] = 1
+    _ = sweep(client, store, tree)
+    assert store.collection_state("ns.c")["mirrored"] == 0
+
     # A yanked version back on Galaxy needs a reconcile to un-yank it.
     galaxy.add_collection("ns", "a", ["1.0.0", "1.1.0", "2.0.0"])
     assert sweep(client, store, tree).unmirrored == {"ns.a": ["1.1.0"]}
@@ -323,7 +328,7 @@ def test_sweep_finds_replaced_versions(galaxy, client, store, tree):
     galaxy.replace("ns", "a", "1.0.0", artifact("ns", "a", "1.0.0", mtime=1_800_000_000))
     res = sweep(client, store, tree)
     assert (res.replaced, res.collections) == ({"ns.a": ["1.0.0"]}, [("ns", "a")])
-    assert list(reconcile(client, store, tree, "ns", "a").repacked) == ["1.0.0"]
+    assert reconcile(client, store, tree, "ns", "a").conflicts == ["1.0.0"]
     assert sweep(client, store, tree).replaced == {}
 
     # Restoring the original brings back its old upload time: still a change.

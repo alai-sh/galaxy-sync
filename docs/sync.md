@@ -180,44 +180,39 @@ changed; and it's the API most likely to be locked down.
 
 ## Artifact checks
 
-The mirror never overwrites: a version's `sha256` never changes. If Galaxy
-ever serves a different sha256 for a version the mirror already holds,
-reconcile downloads it and compares its contents with ours (`artifacts.contents_digest`): each
-file's bytes and each link's target, with `MANIFEST.json` and `FILES.json`
-compared as parsed JSON. Timestamps, owners, modes and member order don't
-count.
+The mirror never overwrites, so a version's `sha256` never changes. When
+Galaxy serves a different sha256 for a version the mirror already holds,
+ours is kept and the index line doesn't change. Every such artifact is a
+conflict, even a rebuild of the same files. Reconcile downloads Galaxy's
+artifact once, saves it under `conflicts/` in the state bucket and records
+it in the version's conflict ([below](#conflicts)).
 
-- **Same contents** (a rebuild of unchanged sources): ours is kept and
-  nothing is flagged. Reported as `repacked`.
-- **Different contents:** ours is kept and the index line doesn't change.
-  Galaxy's artifact is saved under `conflicts/` in the state bucket, and it's
-  recorded in the version's conflict ([below](#conflicts)).
+The conflict also says how Galaxy's files differ from ours
+(`artifacts.contents_digest`). Each file's bytes and each link's target are
+compared, with `MANIFEST.json` and `FILES.json` compared as parsed JSON.
+Timestamps, owners, modes and member order don't count, so a rebuild of the
+same files says so.
 
-Each version's verdict is kept in `state.json` with Galaxy's sha256 and
-upload time, so the same artifact is downloaded and reported once. Reconcile
-gives those upload times to `galaxy-mirror` as `--checked`, so it doesn't
-check the version again until Galaxy's `created_at` changes. The sweep reads
-them too, so it doesn't queue the version again as re-uploaded. When Galaxy
-serves our artifact again, `galaxy-mirror` reports it as `unchanged`, and the
-verdict is dropped and any open conflict resolved.
-
-A version with an open conflict but no upload time, as one from before
-upload times were kept, is checked on every reconcile until Galaxy serves our
-artifact again or a new upload time is recorded.
+Reconcile gives the latest upload time of each open conflict's artifacts to
+`galaxy-mirror` as `--checked`, so it doesn't check the version again until
+Galaxy's `created_at` changes. The sweep reads them too, so it doesn't queue
+the version again as re-uploaded. A conflict whose artifacts have no upload
+time, as one from before upload times were kept, is checked on every
+reconcile until the next sighting fills it in.
 
 ### Conflicts
 
-A version has at most one open conflict, which collects every differing
-artifact Galaxy serves for it, oldest first: its sha256, Galaxy's upload
+A version has at most one open conflict, which collects every artifact
+Galaxy serves for it, oldest first. Each has its sha256, Galaxy's upload
 time, when a reconcile first saw it, and the files added, removed and
-changed from ours. Its life:
+changed from ours. A conflict goes through these steps.
 
-1. **Opened** by the first differing artifact. It's listed in the tracking
+1. **Opened** by the first artifact that isn't ours. It's listed in the tracking
    issue's description, sorted by collection, until it's resolved. No
    comment is posted.
 2. **More artifacts** (an author republishing the same version) are added
    to it. The description shows the latest.
-3. **Resolved** if Galaxy serves our contents again. A later difference
+3. **Resolved** if Galaxy serves our artifact again. A later difference
    opens a new conflict.
 
 Conflicts never change the index, and nothing is ever removed. Each collection's conflicts, in every state, are published as
@@ -266,7 +261,9 @@ alai-index command for a collection with nothing out of date.
 ## Failures and conflicts
 
 A failure never stops a run. It's recorded in the ledger in `state.json`,
-retried by every `sync`, and cleared once it succeeds. Each `sync` starts by
+retried by every `sync`, and cleared once it succeeds. An `extract_error` is
+the exception, as reconciling the collection again doesn't extract the
+version again. Each `sync` starts by
 listing the outstanding failures, so a run's log shows what it will retry.
 Recorded failures exit 0; `--strict` exits 1.
 
@@ -276,7 +273,7 @@ Recorded failures exit 0; `--strict` exits 1.
 | `galaxy_http_<code>` | Any other HTTP error |
 | `sha256_mismatch` | Downloaded bytes don't match Galaxy's sha256 |
 | `manifest_mismatch`, `bad_artifact` | The tarball's `MANIFEST.json` is wrong or unreadable |
-| `extract_error` | Extraction failed. The version is still mirrored, and the plugin index has none of its plugins until it's extracted again |
+| `extract_error` | Extraction failed. The version is still mirrored, and the plugin index has none of its plugins until it's extracted again. When the extractor is fixed, a `generate-plugins` request for the collection tries again, and so does a sync once alai-index's extraction number changes |
 | `alai_index` | alai-index refused a command, which leaves the tree as it was |
 | `artifact_missing` | A version's artifact isn't in the artifact bucket, so its plugins can't be extracted again |
 | `deletions_suspected` | Galaxy publishes fewer versions than the mirror last saw |
@@ -287,7 +284,7 @@ with the version naming the check: `published`, `feed`, `listing`, `count`,
 `sweep` or `requests`. Each clears when that check next works.
 
 Conflicts aren't failures: they aren't retried, and they stay open until
-Galaxy serves our contents again. Both are kept in `state.json`.
+Galaxy serves our artifact again. Both are kept in `state.json`.
 
 ### Notifications
 

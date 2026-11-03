@@ -149,14 +149,6 @@ class Failure(TypedDict):
     alerted: NotRequired[str]  # when a run first reported it as persistent
 
 
-class UpstreamVerdict(TypedDict):
-    """The last comparison of Galaxy's artifact with ours, when their sha256s differ."""
-
-    sha256: str  # Galaxy's artifact
-    same_contents: bool
-    uploaded: NotRequired[str | None]  # Galaxy's created_at for it, so the sweep doesn't see it as a new upload
-
-
 class CollectionState(TypedDict):
     upstream_updated: NotRequired[str]
     upstream_deprecated: NotRequired[bool]
@@ -164,8 +156,6 @@ class CollectionState(TypedDict):
     # Versions Galaxy serves that its search index (the upload feed and count) leaves out.
     unindexed: NotRequired[list[str]]
     mirrored: NotRequired[int]  # versions in the index that aren't yanked, at the last reconcile
-    # The last comparison of Galaxy's artifact with ours, by version, for versions where they differ.
-    verdicts: NotRequired[dict[str, UpstreamVerdict]]
 
 
 class Observation(TypedDict):
@@ -174,15 +164,15 @@ class Observation(TypedDict):
     sha256: str
     uploaded: str | None  # Galaxy's created_at for that upload
     seen: str  # when a reconcile first compared it
-    changes: str  # files added, removed and changed from ours, or why they couldn't be compared
+    changes: str  # files added, removed and changed from ours, that none did, or why they couldn't be compared
     saved: str  # state bucket key of the artifact; never published
 
 
 class Conflict(TypedDict):
-    """Galaxy serves different contents for a mirrored version. Ours is kept.
+    """Galaxy serves another artifact for a mirrored version, even one with the same files. Ours is kept.
 
     A version has at most one unresolved conflict, which collects every
-    differing artifact Galaxy serves until it's resolved.
+    artifact Galaxy serves for it until it's resolved.
     """
 
     collection: str
@@ -190,7 +180,7 @@ class Conflict(TypedDict):
     ours: str  # sha256 in the index
     opened: str
     observed: list[Observation]  # oldest first
-    resolved: NotRequired[str]  # when Galaxy served our contents again
+    resolved: NotRequired[str]  # when Galaxy served our artifact again
 
 
 class Pending(TypedDict):

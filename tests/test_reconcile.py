@@ -251,23 +251,23 @@ def test_a_collection_that_cant_be_listed_fails_whole(galaxy, client, store, tre
     assert e.value.kind == "galaxy_http_403"
 
 
-def test_repacked_artifact_keeps_ours_silently(galaxy, client, store, tree):
+def test_repacked_artifact_is_a_conflict(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     run(client, store, tree)
     (original,) = tree.lines("ns.coll")
 
-    # The same files rebuilt: new bytes and a new upload time.
+    # The same files rebuilt, with new bytes and a new upload time. Ours is kept and Galaxy's is recorded.
     galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", mtime=1_800_000_000))
     res = run(client, store, tree)
-    assert (list(res.repacked), res.conflicts) == (["1.0.0"], [])
-    assert tree.lines("ns.coll") == [original]  # same bytes, no flag
-    assert store.state["conflicts"] == []
+    assert res.conflicts == ["1.0.0"]
+    assert tree.lines("ns.coll") == [original]
+    (conflict,) = store.open_conflicts()
+    assert conflict["observed"][0]["changes"] == "none, the same files packed again"
     assert store.state["failures"] == {}
 
-    # Compared once: --revalidate reuses the verdict without downloading again.
+    # Downloaded once, even when revalidating.
     galaxy.requests.clear()
-    res = run(client, store, tree, revalidate=True)
-    assert list(res.repacked) == ["1.0.0"]
+    assert run(client, store, tree, revalidate=True).conflicts == []
     assert not any("/pulp/content/" in r for r in galaxy.requests)
 
 
@@ -301,7 +301,7 @@ def test_changed_contents_are_a_conflict(galaxy, client, store, tree):
 
     # Seen again: still one open conflict, and no new download.
     galaxy.requests.clear()
-    assert run(client, store, tree, revalidate=True).conflicts == ["1.0.0"]
+    assert run(client, store, tree, revalidate=True).conflicts == []
     assert len(store.state["conflicts"]) == 1
     assert not any("/pulp/content/" in r for r in galaxy.requests)
 
@@ -316,9 +316,9 @@ def test_changed_contents_are_a_conflict(galaxy, client, store, tree):
     assert store.state_bucket.read(latest["saved"]) == again
     assert updated["opened"] == conflict["opened"]
 
-    # Back to a build already observed: compared again, but not repeated.
+    # Back to a build already observed: not repeated.
     galaxy.replace("ns", "coll", "1.0.0", changed)
-    assert run(client, store, tree).conflicts == ["1.0.0"]
+    assert run(client, store, tree).conflicts == []
     assert [o["sha256"] for o in store.state["conflicts"][0]["observed"]] == [upstream, latest["sha256"]]
 
     # Galaxy serves our artifact again, with its old upload time, so galaxy-mirror has no reason to check it.
@@ -341,7 +341,7 @@ def test_conflict_comparison_failures(galaxy, client, store, tree, monkeypatch):
     run(client, store, tree)
     (failure,) = store.state["failures"].values()
     assert failure["kind"] == "galaxy_http_404"
-    assert failure["message"].startswith("download for comparison: ")
+    assert failure["message"].startswith("download for the conflict: ")
     galaxy.routes[f"/pulp/content/{filename}?sig=x"] = good
     assert run(client, store, tree).conflicts == ["1.0.0"]
 

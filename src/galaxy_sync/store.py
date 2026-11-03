@@ -36,6 +36,9 @@ SOURCES = ("requested", "uploaded", "listed", "swept")
 # counts one, and so does each collection reconciled.
 SAVE_EVERY = 100
 
+# Failure kinds reconciling a collection again doesn't clear.
+NOT_RETRIED = frozenset({"extract_error"})
+
 # A failure outstanding this long is reported once as needing a person.
 PERSISTENT = datetime.timedelta(days=1)
 
@@ -238,13 +241,15 @@ class Store:
         self.state_bucket.delete(key)
 
     def failed_collections(self) -> list[tuple[str, str]]:
-        names = {e["collection"] for e in self.state["failures"].values()} - {GLOBAL}
+        """Collections whose failures reconciling them again can clear. An extraction that failed isn't tried again
+        until alai-index's extraction changes, or a generate-plugins request asks for it."""
+        names = {e["collection"] for e in self.state["failures"].values() if e["kind"] not in NOT_RETRIED} - {GLOBAL}
         return sorted((ns, name) for ns, _, name in (n.partition(".") for n in names))
 
-    # When Galaxy serves different contents for a mirrored version, ours is
+    # When Galaxy serves another artifact for a mirrored version, ours is
     # kept and a conflict is opened for a person to inspect. It collects every
-    # differing artifact Galaxy serves after that, and is reported until it's
-    # resolved, once Galaxy serves our contents again. Nothing is ever removed: each collection's conflicts are
+    # artifact Galaxy serves after that, and is reported until it's
+    # resolved, once Galaxy serves our artifact again. Nothing is ever removed: each collection's conflicts are
     # published in full as conflicts/<ns>/<name>.json in the index bucket.
 
     @staticmethod
@@ -278,6 +283,26 @@ class Store:
         if all(o["sha256"] != observation["sha256"] for o in conflict["observed"]):
             conflict["observed"].append(observation)
         return conflict in self._new_conflicts
+
+    def checked(self, fqcn: str) -> dict[str, str]:
+        """The latest upload time of the artifacts Galaxy served for each version of a collection with an open
+        conflict, or "" when none is known. Galaxy normally serves the one it uploaded last."""
+        return {
+            c["version"]: max(o["uploaded"] or "" for o in c["observed"])
+            for c in self.open_conflicts()
+            if c["collection"] == fqcn
+        }
+
+    def known_artifact(self, fqcn: str, vers: str, sha256: str, uploaded: str | None) -> bool:
+        """Whether a version's open conflict has Galaxy's artifact already, adding its upload time if it was missing."""
+        if (conflict := self._open_conflict(fqcn, vers)) is None:
+            return False
+        if (seen := next((o for o in conflict["observed"] if o["sha256"] == sha256), None)) is None:
+            return False
+        if uploaded and seen["uploaded"] is None:
+            seen["uploaded"] = uploaded
+            self._conflicts_changed.add(fqcn)
+        return True
 
     def resolve_conflicts(self, fqcn: str, vers: str) -> bool:
         """Mark a version's open conflict resolved; True if there was one."""
@@ -376,8 +401,10 @@ class Store:
 def _drop_old_state(state: SyncState) -> None:
     """Drop what state.json held before alai-index kept the index, which alai-index's private state now holds.
 
-    A conflict comparison is kept, so it isn't downloaded again, and the
-    versions counted, until the collection's next reconcile counts them again.
+    The versions are counted until the sweep counts them again. A comparison
+    of Galaxy's artifact with ours is dropped, as every artifact Galaxy serves
+    for a version that isn't ours is a conflict. The sweep then finds each
+    version again, and its reconcile opens the conflict.
     A failure of the ansible-core check, which is gone, would never clear, so
     it's dropped. So is an extraction failure from galaxy-sync's own
     extractor, which alai-index's doesn't share.
@@ -392,11 +419,6 @@ def _drop_old_state(state: SyncState) -> None:
         del state["failures"][key]
     for cstate in state["collections"].values():
         old = cast(dict[str, object], cast(object, cstate))
-        _ = old.pop("sha256", None), old.pop("updated", None)
-        if "versions" not in old:
-            continue
-        versions = cast(dict[str, dict[str, object]], old.pop("versions") or {})
-        _ = old.setdefault("mirrored", len(versions))
-        verdicts = {v: s["upstream"] for v, s in versions.items() if "upstream" in s}
-        if verdicts:
-            old["verdicts"] = verdicts
+        _ = old.pop("sha256", None), old.pop("updated", None), old.pop("verdicts", None)
+        if "versions" in old:
+            _ = old.setdefault("mirrored", len(cast(dict[str, object], old.pop("versions") or {})))

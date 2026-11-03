@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from . import semver
 from .artifacts import contents_digest, describe_changes
 from .galaxy import GalaxyClient, GalaxyError
-from .models import IndexChange, IndexOutput, Observation, UpstreamVerdict
+from .models import IndexChange, IndexOutput, Observation
 from .store import Store
 from .times import now
 from .tree import Tree
@@ -56,10 +56,8 @@ class Result:
     added: list[str] = field(default_factory=list)
     yanked: list[str] = field(default_factory=list)
     unyanked: list[str] = field(default_factory=list)
-    conflicts: list[str] = field(default_factory=list)  # Galaxy serves different contents
-    # Different bytes, same contents: version -> (our, Galaxy's) sha256.
-    repacked: dict[str, tuple[str, str]] = field(default_factory=dict)
-    resolved: list[str] = field(default_factory=list)  # Galaxy serves our contents again
+    conflicts: list[str] = field(default_factory=list)  # Galaxy serves an artifact for them not seen before
+    resolved: list[str] = field(default_factory=list)  # Galaxy serves our artifact again
     reextracted: list[str] = field(default_factory=list)  # plugins extracted again, as their extraction was out of date
     deferred: list[str] = field(default_factory=list)  # left unmirrored because the deadline passed
     errors: list[str] = field(default_factory=list)
@@ -227,11 +225,7 @@ class _Reconcile:
                 case "conflict" if vers:
                     self._observe(vers, ours[vers], details["sha256"], details["url"], details.get("published"))
                 case "unchanged" if vers:
-                    # Checked against Galaxy, which serves our artifact again, so what was compared before is over.
-                    verdicts = self.cstate.get("verdicts", {})
-                    _ = verdicts.pop(vers, None)
-                    if not verdicts:
-                        _ = self.cstate.pop("verdicts", None)
+                    # Checked against Galaxy, which serves our artifact again.
                     if self.store.resolve_conflicts(self.fqcn, vers):
                         self.res.resolved.append(vers)
                     self.store.clear_failures(self.fqcn, vers, exclude=("extract_error",))
@@ -261,14 +255,9 @@ class _Reconcile:
         self.res.errors.append(f"{vers}: {kind}: {message}")
 
     def _checked(self) -> dict[str, str]:
-        """galaxy-mirror's --checked for this collection: Galaxy's upload time already compared for each version it
-        serves another artifact for. A version with an open conflict, or a comparison from before upload times were
-        kept, gets an empty time, so it's checked on every reconcile until Galaxy serves ours again."""
-        checked = {vers: verdict.get("uploaded") or "" for vers, verdict in self.cstate.get("verdicts", {}).items()}
-        for conflict in self.store.open_conflicts():
-            if conflict["collection"] == self.fqcn:
-                _ = checked.setdefault(conflict["version"], "")
-        return checked
+        """galaxy-mirror's --checked for this collection, from the open conflicts. A version without an upload time is
+        checked on every reconcile."""
+        return self.store.checked(self.fqcn)
 
     def _extract_again(self, outdated: list[dict[str, str]], ours: dict[str, str]) -> None:
         """Extract the plugins of versions alai-index listed as out of date, fetching their artifacts from the dl
@@ -289,67 +278,34 @@ class _Reconcile:
             self.tree.drop_artifacts()
 
     def _observe(self, vers: str, ours: str, theirs: str, url: str, published: str | None) -> None:
-        """Compare the artifact Galaxy serves for a version with ours, uploaded at `published`. Ours is never
-        overwritten.
-
-        A comparison is kept until Galaxy serves ours again, so the same
-        upload is only downloaded and reported once, unless revalidating.
+        """Add the artifact Galaxy serves for a version, uploaded at `published`, to the version's conflict. Ours is
+        never overwritten. Galaxy's artifact is downloaded and saved for inspection once, the first time it's seen.
         """
-        verdict = self.cstate.get("verdicts", {}).get(vers)
-        seen = verdict is not None and verdict["sha256"] == theirs and verdict.get("uploaded") == published
-        if theirs == ours:
-            same = True
-        elif verdict is not None and verdict["sha256"] == theirs:
-            same = verdict["same_contents"]  # already compared this artifact
-        else:
-            log.info("%s %s: Galaxy serves sha256 %s, ours is %s; comparing contents", self.fqcn, vers, theirs, ours)
-            try:
-                data = self.client.download(url)
-            except GalaxyError as e:
-                self._fail(vers, e.kind, f"download for comparison: {e}")
-                return
-            if (actual := hashlib.sha256(data).hexdigest()) != theirs:
-                self._fail(vers, "sha256_mismatch", f"downloaded {actual}, Galaxy says {theirs}")
-                return
-            same = self._compare(vers, ours, theirs, data, published)
-            log.info(
-                "%s %s: %s", self.fqcn, vers, "same contents, a repack" if same else "different contents, a conflict"
-            )
-
-        # Checked: earlier download, sha256 or conflict failures for this version are over.
-        self.store.clear_failures(self.fqcn, vers, exclude=("extract_error",))
-        if theirs != ours:
-            new: UpstreamVerdict = {"sha256": theirs, "same_contents": same, "uploaded": published}
-            self.cstate.setdefault("verdicts", {})[vers] = new
-        if same:
-            if self.store.resolve_conflicts(self.fqcn, vers):
-                self.res.resolved.append(vers)
-            elif theirs != ours and (not seen or self.revalidate):
-                self.res.repacked[vers] = (ours, theirs)
-        elif not seen or self.revalidate:
-            self.res.conflicts.append(vers)
-
-    def _compare(self, vers: str, ours: str, theirs: str, data: bytes, published: str | None) -> bool:
-        """Whether Galaxy's artifact has the same contents as ours.
-
-        An artifact with different contents, or one that can't be compared,
-        is saved for inspection and added to the version's conflict.
-        """
-        changes = self._changes(ours, data)
-        if changes is None:
-            return True
+        if self.store.known_artifact(self.fqcn, vers, theirs, published):
+            self.store.clear_failures(self.fqcn, vers, exclude=("extract_error",))
+            return
+        log.info("%s %s: Galaxy serves sha256 %s, ours is %s; a conflict", self.fqcn, vers, theirs, ours)
+        try:
+            data = self.client.download(url)
+        except GalaxyError as e:
+            self._fail(vers, e.kind, f"download for the conflict: {e}")
+            return
+        if (actual := hashlib.sha256(data).hexdigest()) != theirs:
+            self._fail(vers, "sha256_mismatch", f"downloaded {actual}, Galaxy says {theirs}")
+            return
         observation: Observation = {
             "sha256": theirs,
             "uploaded": published,
             "seen": now(),
-            "changes": changes,
+            "changes": self._changes(ours, data),
             "saved": self.store.save_upstream_artifact(theirs, data),
         }
         _ = self.store.record_conflict(self.fqcn, vers, ours, observation)
-        return False
+        self.store.clear_failures(self.fqcn, vers, exclude=("extract_error",))
+        self.res.conflicts.append(vers)
 
-    def _changes(self, sha256: str, theirs: bytes) -> str | None:
-        """How Galaxy's artifact differs from ours, or None if the contents are the same."""
+    def _changes(self, sha256: str, theirs: bytes) -> str:
+        """How the files of Galaxy's artifact differ from ours."""
         ours = self.tree.read_artifact(sha256)
         if ours is None:
             return f"the mirror's artifact {sha256} is missing"
@@ -361,7 +317,9 @@ class _Reconcile:
             ours_digest = contents_digest(ours)
         except (tarfile.TarError, ValueError) as e:
             return f"the mirror's artifact can't be read: {type(e).__name__}: {e}"
-        return None if ours_digest == theirs_digest else describe_changes(ours_digest, theirs_digest)
+        if ours_digest == theirs_digest:
+            return "none, the same files packed again"
+        return describe_changes(ours_digest, theirs_digest)
 
 
 def _all_artifacts(tree: Tree, fqcn: str) -> list[dict[str, str]]:

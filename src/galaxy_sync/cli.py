@@ -37,7 +37,7 @@ from .galaxy import BASE_URL, GalaxyClient, GalaxyError
 from .models import Job, Pending, Request
 from .reconcile import ReconcileFailed, Result, generate_indexes, generate_plugins, reconcile
 from .storage import Buckets, R2Config, StorageError
-from .store import ACTIONS, GLOBAL, RETIRED_GRACE, SOURCES, Store
+from .store import ACTIONS, GLOBAL, NOT_RETRIED, RETIRED_GRACE, SOURCES, Store
 from .times import now
 from .tree import AlaiIndexError, Tree
 
@@ -64,7 +64,6 @@ def _changes(res: Result) -> list[str]:
         ("yanked", res.yanked),
         ("unyanked", res.unyanked),
         ("CONFLICT", res.conflicts),
-        ("repacked", res.repacked),
         ("conflict resolved", res.resolved),
     ):
         if versions:
@@ -205,21 +204,6 @@ def _print_summary(store: Store, worked: dict[str, Result | str], elapsed: float
         )
 
 
-def _print_warnings(worked: dict[str, Result | str]) -> None:
-    """List the repacks: Galaxy serving different bytes with the same contents, which keeps ours."""
-    repacks = [
-        (fqcn, vers, shas)
-        for fqcn, res in worked.items()
-        if isinstance(res, Result)
-        for vers, shas in res.repacked.items()
-    ]
-    if not repacks:
-        return
-    print(f"warnings: {len(repacks)} repacks (Galaxy serves different bytes with the same contents; ours kept)")
-    for fqcn, vers, (ours, theirs) in repacks:
-        print(f"  {fqcn} {vers}: ours {ours}, Galaxy's {theirs}")
-
-
 # How many outstanding failures a run lists when it starts; the rest are in state.json.
 SHOW_FAILURES = 20
 
@@ -244,6 +228,7 @@ def _print_outstanding(store: Store, requests: list[tuple[str, Request]]) -> Non
     groups: dict[str, list[str]] = {
         "queued, retried in their place in the queue": [],
         "retried after the queue, if there's time left": [],
+        "extracted again by a generate-plugins request": [],
         "run-level": [],
     }
     width = max(len(e["collection"]) for e in failures)
@@ -256,6 +241,8 @@ def _print_outstanding(store: Store, requests: list[tuple[str, Request]]) -> Non
         if fqcn == GLOBAL:
             group = "run-level"
             row += f", {GLOBAL_RETRIES.get(e['version'] or '', 'retried every run')}"
+        elif e["kind"] in NOT_RETRIED:
+            group = "extracted again by a generate-plugins request"
         elif fqcn in pending or fqcn in targets or fqcn.partition(".")[0] in targets:
             group = "queued, retried in their place in the queue"
         else:
@@ -547,10 +534,6 @@ def _reconcile_one(
     if not (res.added or _changes(res)):
         for line in _explain(entry, res):
             print(f"{' ' * (len(label) - len(fqcn) + 2)}{line}")
-    for vers, (ours, theirs) in res.repacked.items():
-        print(
-            f"WARNING {fqcn} {vers}: Galaxy now serves sha256 {theirs} instead of ours ({ours}); same contents, so ours is kept"
-        )
     return res
 
 
@@ -636,7 +619,6 @@ def _finish(
         f"failures: {summary.outstanding} outstanding, {summary.new} new, {summary.resolved} resolved; "
         + f"{summary.conflicts} open conflicts (see state.json in the state bucket)"
     )
-    _print_warnings(worked)
     print(_sweep_status(store))
     print(f"{client.requests} Galaxy requests")
     if headline := summary.alerts.headline():

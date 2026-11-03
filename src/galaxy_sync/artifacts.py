@@ -1,4 +1,4 @@
-"""Comparing collection tarballs, to tell a repack from a real change.
+"""Comparing collection tarballs, to describe how a conflict's files differ from ours.
 
 The sync never extracts or runs collection code. These functions only read
 member bytes from a tarball held in memory. Reading a collection to index it

@@ -387,8 +387,8 @@ A version's `sha256` never changes, for any reason.
 ## Conflict records
 
 When the origin serves a different artifact for a version the index holds,
-and its contents differ from the one at `sha256` (a repack of the same files
-doesn't count), the index keeps the original. A mirror SHOULD then publish a
+the index keeps the original, even when only the packing of the same files
+differs. A mirror SHOULD then publish a
 conflict record for the collection at `conflicts/<namespace>/<name>.json`,
 so anyone can see why the index's artifact differs from the origin's. A record lists every
 conflict the collection has had, including settled ones, and entries are
@@ -416,9 +416,9 @@ never removed. A collection that never had one has no record (404).
 | `collection` | string | yes | `<namespace>.<name>` |
 | `conflicts[].version` | string | yes | The version |
 | `conflicts[].ours` | string | yes | The index's `sha256` for it |
-| `conflicts[].opened` | string | yes | When the mirror first saw the origin serve different contents |
-| `conflicts[].observed` | array | yes | Each differing artifact the origin served, oldest first: `sha256`, `uploaded` (the origin's upload time, or `null` if unknown), `seen` (when the mirror first compared it), and `changes` (the files added, removed and changed from ours, or why they couldn't be compared) |
-| `conflicts[].resolved` | string | no | When the origin served the original's contents again |
+| `conflicts[].opened` | string | yes | When the mirror first saw the origin serve a different artifact |
+| `conflicts[].observed` | array | yes | Each different artifact the origin served, oldest first: `sha256`, `uploaded` (the origin's upload time, or `null` if unknown), `seen` (when the mirror first compared it), and `changes` (the files added, removed and changed from ours, that none were, or why they couldn't be compared) |
+| `conflicts[].resolved` | string | no | When the origin served the original artifact again |
 
 A version has at most one conflict without `resolved`. Conflicts never
 change the index: its line stays as it was.

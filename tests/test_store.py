@@ -121,9 +121,9 @@ def test_state_from_before_alai_index_is_dropped(tmp_path):
     store.state_bucket.write("state.json", json.dumps(old).encode())
 
     state = Store(Buckets.local(tmp_path)).state
-    # A comparison is kept, so Galaxy's artifact isn't downloaded again, and so is the count of versions.
+    # The count of versions is kept, and the comparison is dropped, as the sweep finds the version again.
     assert state["collections"] == {
-        "ns.coll": {"upstream_count": 2, "mirrored": 2, "verdicts": {"1.0.0": verdict}},
+        "ns.coll": {"upstream_count": 2, "mirrored": 2},
         "ns.plain": {"upstream_count": 1, "mirrored": 0},
     }
     # The ansible-core check is gone, and galaxy-sync's extractor with it, so their failures would never clear.
@@ -136,3 +136,25 @@ def test_state_from_before_alai_index_is_dropped(tmp_path):
     assert "ns.coll@1.0.0#extract_error" in Store(Buckets.local(tmp_path)).state["failures"]
     assert "builtin" not in state
     assert "rebuild" not in state
+
+
+def test_failed_collections_skip_extraction_failures(tmp_path):
+    store = Store(Buckets.local(tmp_path))
+    store.record_failure("ns.extract", "1.0.0", "extract_error", "bad manifest")
+    store.record_failure("ns.both", "1.0.0", "extract_error", "bad manifest")
+    store.record_failure("ns.both", "1.1.0", "galaxy_unavailable", "503")
+    store.record_failure(store_mod.GLOBAL, "feed", "galaxy_unavailable", "503")
+    # Reconciling again can't clear an extraction failure, so only the other collection is retried.
+    assert store.failed_collections() == [("ns", "both")]
+
+
+def test_verdicts_are_dropped(tmp_path):
+    current = {
+        "collections": {"ns.coll": {"mirrored": 1, "verdicts": {"1.0.0": {"sha256": "b" * 64, "same_contents": True}}}},
+        "conflicts": [],
+        "failures": {},
+        "pending": {},
+    }
+    Store(Buckets.local(tmp_path)).state_bucket.write("state.json", json.dumps(current).encode())
+    # Every artifact Galaxy serves that isn't ours is a conflict, which the sweep finds again.
+    assert Store(Buckets.local(tmp_path)).state["collections"] == {"ns.coll": {"mirrored": 1}}

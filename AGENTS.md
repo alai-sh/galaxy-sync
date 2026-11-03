@@ -47,7 +47,7 @@ never a real bucket.
 | `tree.py` | The alai-index tree a run works on: fetching it from the buckets, running alai-index, and publishing what it wrote |
 | `changes.py` | Finding which collections to reconcile: `discover()` every run, the daily `sweep()`, `check_count()`, `resolve_targets()` |
 | `galaxy.py` | The Galaxy HTTP client, with retries. Contract endpoints unless a method's docstring says best effort |
-| `artifacts.py` | Comparing tarballs held in memory, to tell a repack from a real change |
+| `artifacts.py` | Comparing tarballs held in memory, to describe how a conflict's files differ from ours |
 | `store.py` | The sync's own state on top of the backends: the queue, requests, the failure ledger, conflicts and pruning |
 | `report.py` | Rendering the tracking issue's report block and alert comment, and the public conflict records |
 | `storage.py` | The `Backend` interface (one per bucket), `LocalBackend` and `R2Backend` |
@@ -63,9 +63,8 @@ gitignored.
   only by alai-index and `artifacts.py`, which reads member bytes from a
   tarball in memory and never extracts to disk.
 - **A version's `sha256` never changes.** When Galaxy serves different bytes
-  for a mirrored version, reconcile compares contents: a repack is kept
-  silently, a content change keeps ours and opens a conflict. Never an
-  overwrite.
+  for a mirrored version, ours is kept and a conflict is opened, even when
+  only the packing changed. Never an overwrite.
 - **Only reconcile changes the mirror, through alai-index, and only from contract endpoints.**
   Change detection only picks collections. Only a 404 from
   `GET /api/v3/collections/<ns>/<name>/`, or for one version from

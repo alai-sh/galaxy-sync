@@ -777,14 +777,13 @@ def test_run_output_explains_itself(galaxy, run, capsys):
         + "        the upload feed saw 1.0.0: already mirrored, so seen again in the feed's 1h overlap\n"
     ) in out
 
-    # New bytes with the same contents: a warning, and again at the end.
+    # New bytes with the same contents: a conflict.
     galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", mtime=1_800_000_000))
     assert run("sync") == 0
     out = capsys.readouterr().out
     assert "  upload feed: 1 collections with new uploads, 1 collections seen again in the 1h overlap\n" in out
-    assert "ns.coll: +0 repacked 1.0.0\nWARNING ns.coll 1.0.0: Galaxy now serves sha256 " in out
-    assert "warnings: 1 repacks (Galaxy serves different bytes with the same contents; ours kept)\n" in out
-    assert re.search(r"^  ns\.coll 1\.0\.0: ours [0-9a-f]{64}, Galaxy's [0-9a-f]{64}$", out, re.MULTILINE)
+    assert "ns.coll: +0 CONFLICT 1.0.0" in out
+    assert "galaxy-sync: 1 new conflict\n" in out
 
     # The plan lists each request; a deprecation is a change of its own.
     galaxy.add_collection("ns", "other", ["1.0.0"], deprecated=True)
