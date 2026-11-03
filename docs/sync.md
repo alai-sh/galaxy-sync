@@ -255,6 +255,11 @@ run that stops, carries on from there. A version whose artifact isn't in
 the artifact bucket is recorded as `artifact_missing`, and a collection
 alai-index refuses as `alai_index`, and the job carries on.
 
+A collection's artifacts are fetched and worked 50 at a time (`BATCH`), and
+each batch is deleted before the next is fetched. A collection with many
+large artifacts then still fits in the runner's temporary space, which the
+sync workflow puts in RAM (`/dev/shm`).
+
 A `generate-plugins` job with `--from-plugin-cache` costs two reads and one
 alai-index command for a collection with nothing out of date.
 

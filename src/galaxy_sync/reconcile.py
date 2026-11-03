@@ -13,7 +13,7 @@ import logging
 import re
 import tarfile
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from . import semver
@@ -32,6 +32,10 @@ NAME = re.compile(r"[a-z0-9_]+")
 # Versions galaxy-mirror downloads in one call, so a run notices its deadline
 # part way through a large collection.
 CHUNK = 10
+
+# Artifacts generate-plugins and generate-indexes fetch at once, so a collection
+# with many large artifacts still fits in the run's temporary space.
+BATCH = 50
 
 
 def check_name(namespace: str, name: str) -> None:
@@ -384,6 +388,18 @@ def _targets(tree: Tree, fqcn: str, versions: list[str], every: int) -> str:
     return f"@{path}"
 
 
+def _in_batches(store: Store, tree: Tree, fqcn: str, wanted: list[dict[str, str]], run: Callable[[str], None]) -> None:
+    """Fetch the artifacts wanted BATCH at a time, and call `run` with the alai-index targets of each batch fetched.
+    A batch's artifacts are deleted before the next is fetched."""
+    every = len(tree.lines(fqcn))
+    for start in range(0, len(wanted), BATCH):
+        try:
+            if fetched := _fetch(store, tree, fqcn, wanted[start : start + BATCH]):
+                run(_targets(tree, fqcn, fetched, every))
+        finally:
+            tree.drop_artifacts()
+
+
 def generate_plugins(store: Store, tree: Tree, fqcn: str, *, from_plugin_cache: bool = False) -> list[str]:
     """Extract a collection's plugins again from its artifacts, fetched from the dl bucket, and publish the result.
 
@@ -404,22 +420,14 @@ def generate_plugins(store: Store, tree: Tree, fqcn: str, *, from_plugin_cache: 
             else:
                 store.clear_failures(fqcn, vers, kinds=("extract_error",))
 
-    try:
-        if from_plugin_cache:
-            tree.fetch([fqcn])
-            out = tree.run("generate-plugins", fqcn, "--from-plugin-cache")
-            publish(out)
-            wanted = [entry for entry in out["outdated"] if entry["name"] == fqcn]
-        else:
-            wanted = _all_artifacts(tree, fqcn)
-        if fetched := _fetch(store, tree, fqcn, wanted):
-            if from_plugin_cache:
-                # Every out of date version whose artifact is now on disk is extracted again.
-                publish(tree.run("generate-plugins", fqcn, "--from-plugin-cache"))
-            else:
-                publish(tree.run("generate-plugins", _targets(tree, fqcn, fetched, len(wanted))))
-    finally:
-        tree.drop_artifacts()
+    if from_plugin_cache:
+        tree.fetch([fqcn])
+        out = tree.run("generate-plugins", fqcn, "--from-plugin-cache")
+        publish(out)
+        wanted = [entry for entry in out["outdated"] if entry["name"] == fqcn]
+    else:
+        wanted = _all_artifacts(tree, fqcn)
+    _in_batches(store, tree, fqcn, wanted, lambda targets: publish(tree.run("generate-plugins", targets)))
     return extracted
 
 
@@ -428,12 +436,12 @@ def generate_indexes(store: Store, tree: Tree, fqcn: str) -> list[str]:
 
     Returns the versions whose line changed.
     """
-    try:
-        fetched = _fetch(store, tree, fqcn, _all_artifacts(tree, fqcn))
-        if not fetched:
-            return []
-        out = tree.run("generate-indexes", _targets(tree, fqcn, fetched, len(tree.lines(fqcn))))
+    changed: list[str] = []
+
+    def run(targets: str) -> None:
+        out = tree.run("generate-indexes", targets)
         tree.publish(out)
-    finally:
-        tree.drop_artifacts()
-    return [change["version"] for change in out["versions"] if change["result"] == "changed" and change["version"]]
+        changed.extend(c["version"] for c in out["versions"] if c["result"] == "changed" and c["version"])
+
+    _in_batches(store, tree, fqcn, _all_artifacts(tree, fqcn), run)
+    return changed

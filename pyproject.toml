@@ -35,7 +35,7 @@ module-name = "galaxy_sync"
 [tool.uv.sources]
 # Not on PyPI yet, so pinned to a commit. Bump `rev` to pick up alai-index
 # changes, and switch to a version pin once it's published.
-alai-index = { git = "https://github.com/alai-sh/alai-index", rev = "5d6a42fd9dd1ba33f8b3a54f79f9c66a943ae32e" }
+alai-index = { git = "https://github.com/alai-sh/alai-index", rev = "4e945fff4e6e447b940b9662764aaf0d71164a40" }
 
 [tool.uv]
 # Rebuild/reinstall the project when source files change (or are deleted),

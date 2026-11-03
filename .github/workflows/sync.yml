@@ -28,6 +28,11 @@ jobs:
     permissions:
       contents: read
       issues: write
+    env:
+      # Each run's tree, its downloads and alai-index's unpacked artifacts go in RAM
+      # rather than on the runner's disk, which halves unpacking. At most a
+      # collection's artifacts and one unpacked artifact are there at once.
+      TMPDIR: /dev/shm
     steps:
     # The release to run, not main: see "Releases" in docs/sync.md. The job's
     # `if` skips the run until it's set.

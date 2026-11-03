@@ -47,7 +47,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "alai-index", git = "https://github.com/alai-sh/alai-index?rev=5d6a42fd9dd1ba33f8b3a54f79f9c66a943ae32e" },
+    { name = "alai-index", git = "https://github.com/alai-sh/alai-index?rev=4e945fff4e6e447b940b9662764aaf0d71164a40" },
     { name = "boto3", specifier = ">=1.43.114" },
 ]
 
@@ -66,7 +66,7 @@ dev = [
 [[package]]
 name = "alai-index"
 version = "0.1.0"
-source = { git = "https://github.com/alai-sh/alai-index?rev=5d6a42fd9dd1ba33f8b3a54f79f9c66a943ae32e#5d6a42fd9dd1ba33f8b3a54f79f9c66a943ae32e" }
+source = { git = "https://github.com/alai-sh/alai-index?rev=4e945fff4e6e447b940b9662764aaf0d71164a40#4e945fff4e6e447b940b9662764aaf0d71164a40" }
 dependencies = [
     { name = "alai-core" },
     { name = "argcomplete" },

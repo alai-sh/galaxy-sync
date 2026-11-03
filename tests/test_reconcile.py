@@ -501,6 +501,26 @@ def test_generate_plugins_without_every_artifact(galaxy, client, store, tree, tm
     assert [(f["version"], f["kind"]) for f in store.state["failures"].values()] == [("1.0.0", "artifact_missing")]
 
 
+def test_generate_plugins_in_batches(galaxy, client, store, tree, tmp_path, monkeypatch):
+    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0", "1.2.0"])
+    run(client, store, tree)
+    store, tree = later(store, tree, tmp_path)
+    monkeypatch.setattr(reconcile_mod, "BATCH", 2)
+    fetched = []
+    fetch_artifacts = tree.fetch_artifacts
+
+    def fetch(wanted):
+        assert not tree.dl.exists(), "the batch before wasn't deleted"
+        fetched.append([entry["version"] for entry in wanted])
+        return fetch_artifacts(wanted)
+
+    monkeypatch.setattr(tree, "fetch_artifacts", fetch)
+    assert reconcile_mod.generate_plugins(store, tree, "ns.coll") == ["1.0.0", "1.1.0", "1.2.0"]
+    assert reconcile_mod.generate_indexes(store, tree, "ns.coll") == []
+    assert fetched == [["1.0.0", "1.1.0"], ["1.2.0"]] * 2
+    assert not tree.dl.exists()
+
+
 def test_generate_indexes(galaxy, client, store, tree, tmp_path):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     run(client, store, tree)
