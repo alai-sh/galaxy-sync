@@ -118,10 +118,6 @@ those artifacts from the artifact bucket, extracts their plugins again, and
 publishes the result. `request generate-plugins --from-plugin-cache` does the
 same for every collection over as many runs as it takes.
 
-`scripts/migrate_to_alai_index.py` builds every collection's plugin cache up
-front from the published index, rather than as each collection is next
-reconciled.
-
 ## R2
 
 `--r2` is configured only through the environment, so credentials never end

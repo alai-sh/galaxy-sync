@@ -26,8 +26,3 @@ def test_build_metadata_tie_breaks_on_string():
 
 def test_invalid_versions_sort_lowest():
     assert sorted(["1.0.0", "banana"], key=semver.sort_key) == ["banana", "1.0.0"]
-
-
-def test_is_prerelease():
-    assert semver.is_prerelease("0.2.0-rc.1")
-    assert not semver.is_prerelease("33.0.484+git940b822")

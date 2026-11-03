@@ -100,8 +100,6 @@ ignore = [
 "tests/**" = ["S101", "RUF012"]
 # The CLI reports progress and results to the user with print.
 "src/galaxy_sync/cli.py" = ["T201"]
-# A one-off run by hand, which reports with print, fetches the live index and runs alai-index.
-"scripts/**" = ["T201", "S310", "S603"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["galaxy_sync"]

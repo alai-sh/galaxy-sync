@@ -24,8 +24,6 @@ from .models import (
     GalaxyRepoMetadata,
     GalaxySearchPage,
     GalaxySearchRow,
-    GalaxyVersion,
-    GalaxyVersionDetail,
 )
 
 log = logging.getLogger(__name__)
@@ -165,17 +163,6 @@ class GalaxyClient:
             return cast(GalaxyCollection, self.get_json(f"/api/v3/collections/{namespace}/{name}/"))
         except NotFound:
             return None
-
-    def versions(self, namespace: str, name: str) -> list[GalaxyVersion]:
-        url = f"/api/v3/collections/{namespace}/{name}/versions/?limit=100"
-        try:
-            return cast(list[GalaxyVersion], list(self._paged(url, f"{namespace}.{name} versions")))
-        except NotFound:
-            return []
-
-    def version_detail(self, namespace: str, name: str, version: str) -> GalaxyVersionDetail:
-        quoted = urllib.parse.quote(version, safe="")
-        return cast(GalaxyVersionDetail, self.get_json(f"/api/v3/collections/{namespace}/{name}/versions/{quoted}/"))
 
     # Best effort: callers must cope with these failing.
 

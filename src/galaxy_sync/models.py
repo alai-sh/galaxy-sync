@@ -11,15 +11,8 @@ from typing import NotRequired, TypedDict
 
 
 class GalaxyCollection(TypedDict):
-    created_at: str
     updated_at: str
     deprecated: NotRequired[bool]  # best effort, not part of the contract
-
-
-class GalaxyVersion(TypedDict):
-    version: str
-    created_at: NotRequired[str | None]
-    requires_ansible: NotRequired[str | None]
 
 
 class GalaxyLinks(TypedDict):
@@ -40,27 +33,7 @@ class GalaxyPage(TypedDict):
     links: NotRequired[GalaxyLinks | None]
 
 
-class GalaxyArtifact(TypedDict):
-    sha256: str
-
-
-class GalaxyVersionMetadata(TypedDict):
-    dependencies: NotRequired[dict[str, str] | None]
-
-
-class GalaxyVersionDetail(TypedDict):
-    download_url: str
-    artifact: GalaxyArtifact
-    metadata: GalaxyVersionMetadata
-    created_at: NotRequired[str | None]
-    requires_ansible: NotRequired[str | None]
-
-
 # Galaxy's best-effort endpoints.
-
-
-class GalaxyHighestVersion(TypedDict):
-    version: str
 
 
 class GalaxyListedCollection(TypedDict):
@@ -68,7 +41,6 @@ class GalaxyListedCollection(TypedDict):
     name: str
     updated_at: NotRequired[str]
     deprecated: NotRequired[bool]
-    highest_version: NotRequired[GalaxyHighestVersion | None]
 
 
 class GalaxyRepoMetadata(TypedDict):

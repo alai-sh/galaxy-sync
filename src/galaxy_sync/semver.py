@@ -30,8 +30,3 @@ def sort_key(version: str) -> SortKey:
     # A release sorts after any of its pre-releases.
     pre_key = (0, tuple(_identifier(p) for p in pre.split("."))) if pre else (1, ())
     return (1, (int(major), int(minor), int(patch)), pre_key, version)
-
-
-def is_prerelease(version: str) -> bool:
-    m = _SEMVER.match(version)
-    return bool(m and m.group(4))

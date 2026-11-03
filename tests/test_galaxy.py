@@ -77,19 +77,13 @@ def test_connection_errors_are_retried(client, monkeypatch):
     assert client.requests == 3
 
 
-def test_versions_follows_pages(galaxy, client):
+def test_paged_follows_pages(galaxy, client):
     galaxy.json(
-        "/api/v3/collections/ns/coll/versions/?limit=100",
-        {"data": [{"version": "1.0.0"}], "links": {"next": f"{galaxy.url}/page2"}},
+        "/api/v3/plugin/ansible/content/published/collections/index/?limit=100",
+        {"data": [{"namespace": "ns", "name": "a"}], "links": {"next": f"{galaxy.url}/page2"}},
     )
-    galaxy.json("/page2", {"results": [{"version": "2.0.0"}], "links": {"next": None}})
-    assert [v["version"] for v in client.versions("ns", "coll")] == ["1.0.0", "2.0.0"]
-    assert client.versions("ns", "missing") == []
-
-
-def test_version_detail_quotes_the_version(galaxy, client):
-    galaxy.json("/api/v3/collections/ns/coll/versions/1.0.0%2Bbuild/", {"version": "1.0.0+build"})
-    assert client.version_detail("ns", "coll", "1.0.0+build") == {"version": "1.0.0+build"}
+    galaxy.json("/page2", {"results": [{"namespace": "ns", "name": "b"}], "links": {"next": None}})
+    assert [c["name"] for c in client.list_collections()] == ["a", "b"]
 
 
 def test_error_kind():

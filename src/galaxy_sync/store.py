@@ -75,9 +75,6 @@ class Store:
         self._saved = self.state_bucket.read("state.json")
         if self._saved is not None:
             self.state.update(json.loads(self._saved))
-            # shortcut: drops the markers older migrations left, remove once a sync has saved state.json without them.
-            for key in set(self.state) - SyncState.__required_keys__ - SyncState.__optional_keys__:
-                del cast(dict[str, object], cast(object, self.state))[key]
         # Ledger keys that appeared or cleared during this run, for the report.
         self._new_failures: set[str] = set()
         self._resolved_failures: set[str] = set()

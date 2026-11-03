@@ -1,7 +1,6 @@
 """Store: the reconcile queue and guarding state.json."""
 
 import datetime
-import json
 
 import pytest
 
@@ -103,22 +102,3 @@ def test_failed_collections_skip_extraction_failures(tmp_path):
     store.record_failure(store_mod.GLOBAL, "feed", "galaxy_unavailable", "503")
     # Reconciling again can't clear an extraction failure, so only the other collection is retried.
     assert store.failed_collections() == [("ns", "both")]
-
-
-def test_keys_from_older_migrations_are_dropped(tmp_path):
-    old = {
-        "collections": {},
-        "conflicts": [],
-        "failures": {},
-        "pending": {},
-        "feed_cursor": "a",
-        "migration": {"done": True},
-    }
-    Store(Buckets.local(tmp_path)).state_bucket.write("state.json", json.dumps(old).encode())
-    assert Store(Buckets.local(tmp_path)).state == {
-        "collections": {},
-        "conflicts": [],
-        "failures": {},
-        "pending": {},
-        "feed_cursor": "a",
-    }
