@@ -1,16 +1,15 @@
-"""The failure report: Markdown for the tracking issue, and the public conflict records.
+"""The failure report: Markdown for the tracking issue.
 
-The full detail stays in state.json, in the private state bucket. What's
-public is the Markdown: a report block of the outstanding failures and every
-open conflict, which `sync --report` writes for the issue's description, and
-the alert, which `sync --alerts` writes as one comment for the failures that
-became persistent. Each collection's conflict record, published in the index bucket,
-is the permanent history. None of these include what shouldn't be
-published: the state bucket key of a conflict's artifact, and URLs in
-`unexpected` messages, which can name the storage endpoint.
+The full detail stays in state.json, in the private state bucket, which
+keeps every conflict, resolved ones included. What's public is the Markdown:
+a report block of the outstanding failures and every open conflict, which
+`sync --report` writes for the issue's description, and the alert, which
+`sync --alerts` writes as one comment for the failures that became
+persistent. Neither includes what shouldn't be published: the state bucket
+key of a conflict's artifact, and URLs in `unexpected` messages, which can
+name the storage endpoint.
 """
 
-import json
 import re
 from dataclasses import dataclass, field
 
@@ -139,25 +138,6 @@ def _sorted_failures(failures: list[Failure]) -> list[Failure]:
 
 def _sorted_conflicts(conflicts: list[Conflict]) -> list[Conflict]:
     return sorted(conflicts, key=lambda c: (c["collection"], c["version"], c["opened"]))
-
-
-def conflict_record(fqcn: str, conflicts: list[Conflict]) -> str:
-    """A collection's public conflict record: every conflict it has had, without the private keys."""
-    entries: list[dict[str, object]] = []
-    for c in sorted(conflicts, key=lambda c: c["opened"]):
-        entry: dict[str, object] = {
-            "version": c["version"],
-            "ours": c["ours"],
-            "opened": c["opened"],
-            "observed": [
-                {"sha256": o["sha256"], "uploaded": o["uploaded"], "seen": o["seen"], "changes": o["changes"]}
-                for o in c["observed"]
-            ],
-        }
-        if "resolved" in c:
-            entry["resolved"] = c["resolved"]
-        entries.append(entry)
-    return json.dumps({"collection": fqcn, "conflicts": entries}, indent=1, ensure_ascii=False) + "\n"
 
 
 @dataclass(frozen=True)

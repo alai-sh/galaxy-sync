@@ -15,7 +15,7 @@ from typing import cast
 
 from . import report
 from .models import CollectionState, Conflict, Failure, Observation, Request, SyncState
-from .storage import Backend, Buckets, PreconditionFailed, StorageError
+from .storage import Buckets, PreconditionFailed, StorageError
 from .times import now
 
 log = logging.getLogger(__name__)
@@ -53,15 +53,6 @@ RETIRED_GRACE = datetime.timedelta(days=7)
 PRUNE_EVERY = datetime.timedelta(days=1)
 
 
-def _write(backend: Backend, key: str, text: str) -> bool:
-    """Write `text`, returning False if the stored content is already the same."""
-    data = text.encode()
-    if backend.read(key) == data:
-        return False
-    backend.write(key, data)
-    return True
-
-
 class StateChanged(StorageError):
     """Another run saved state.json since this one read it."""
 
@@ -79,8 +70,6 @@ class Store:
         self._new_failures: set[str] = set()
         self._resolved_failures: set[str] = set()
         self._new_conflicts: list[Conflict] = []
-        # Collections whose public conflict record needs writing.
-        self._conflicts_changed: set[str] = set()
         self._unsaved_work = 0
         self.before_save: Callable[[], object] | None = None
         """Run before state.json is saved. The run publishes the index's aggregate files there, so state never says a
@@ -248,8 +237,8 @@ class Store:
     # When Galaxy serves another artifact for a mirrored version, ours is
     # kept and a conflict is opened for a person to inspect. It collects every
     # artifact Galaxy serves after that, and is reported until it's
-    # resolved, once Galaxy serves our artifact again. Nothing is ever removed: each collection's conflicts are
-    # published in full as conflicts/<ns>/<name>.json in the index bucket.
+    # resolved, once Galaxy serves our artifact again. Nothing is ever removed
+    # from state.json, so it's the history of every conflict.
 
     @staticmethod
     def conflict_key(sha256: str) -> str:
@@ -273,7 +262,6 @@ class Store:
 
         True if the conflict is new; only that is alerted.
         """
-        self._conflicts_changed.add(fqcn)
         conflict = self._open_conflict(fqcn, vers)
         if conflict is None:
             conflict = Conflict(collection=fqcn, version=vers, ours=ours, opened=observation["seen"], observed=[])
@@ -300,7 +288,6 @@ class Store:
             return False
         if uploaded and seen["uploaded"] is None:
             seen["uploaded"] = uploaded
-            self._conflicts_changed.add(fqcn)
         return True
 
     def resolve_conflicts(self, fqcn: str, vers: str) -> bool:
@@ -308,32 +295,7 @@ class Store:
         if (conflict := self._open_conflict(fqcn, vers)) is None:
             return False
         conflict["resolved"] = now()
-        self._conflicts_changed.add(fqcn)
         return True
-
-    @staticmethod
-    def conflict_record_key(namespace: str, name: str) -> str:
-        return f"conflicts/{namespace}/{name}.json"
-
-    def write_conflict_records(self, fqcns: Collection[str] | None = None) -> int:
-        """Write the public conflict record of each collection whose conflicts changed, or of `fqcns`.
-
-        Returns how many were written. Written after the index files, as they
-        name versions in them.
-        """
-        names = self._conflicts_changed if fqcns is None else fqcns
-        written = 0
-        for fqcn in sorted(names):
-            if conflicts := [c for c in self.state["conflicts"] if c["collection"] == fqcn]:
-                ns, _, name = fqcn.partition(".")
-                written += self._write_index_file(
-                    self.conflict_record_key(ns, name), report.conflict_record(fqcn, conflicts)
-                )
-        self._conflicts_changed.clear()
-        return written
-
-    def conflicted_collections(self) -> set[str]:
-        return {c["collection"] for c in self.state["conflicts"]}
 
     def failure_report(self) -> report.Report:
         """The report, with the Markdown for the tracking issue. Marks the failures alerted this run."""
@@ -353,10 +315,6 @@ class Store:
             self._resolved_failures - set(failures),
             alerts=report.Alerts(self._new_conflicts, persistent),
         )
-
-    def _write_index_file(self, key: str, text: str) -> bool:
-        """Write one index bucket file, returning False if it was already the same."""
-        return _write(self.index, key, text)
 
     def prune_due(self) -> bool:
         last = self.state.get("last_prune")

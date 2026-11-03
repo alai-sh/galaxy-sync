@@ -602,11 +602,7 @@ def _finish(
     plugins = tree.plugin_lines()
     pruned = None
     if store.prune_due():
-        # Once a day, every conflict record, in case one was lost, as they're otherwise only written when changed.
-        _ = store.write_conflict_records(store.conflicted_collections())
         pruned = store.prune_index_files({tree.index_file(fqcn) for fqcn in tree.listing})
-    else:
-        _ = store.write_conflict_records()
     failures = store.failure_report()
     summary = failures.summary
     store.save_state()

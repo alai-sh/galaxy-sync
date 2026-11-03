@@ -32,7 +32,6 @@ An index has two roots, which MAY be on different hosts:
   collections.json                       every collection, with last-updated times and sha256s (optional)
   index/<namespace>/<name>.jsonl         one line per collection version, found by name
     or index/<aa>/<sha256>.jsonl         or by sha256, as config.json's index template says
-  conflicts/<namespace>/<name>.json      mirrors: why versions differ from the origin
 
 <artifact root>                          e.g. https://dl.alai.sh/
   sha256/<aa>/<sha256>.tar.gz            collection tarballs, content-addressed
@@ -383,45 +382,6 @@ A version's `sha256` never changes, for any reason.
 - **Removed:** for takedowns (malware, leaked secrets, legal requests), the
   line is deleted and the artifact removed. Lock files that pin it will fail
   to install. That's intended.
-
-## Conflict records
-
-When the origin serves a different artifact for a version the index holds,
-the index keeps the original, even when only the packing of the same files
-differs. A mirror SHOULD then publish a
-conflict record for the collection at `conflicts/<namespace>/<name>.json`,
-so anyone can see why the index's artifact differs from the origin's. A record lists every
-conflict the collection has had, including settled ones, and entries are
-never removed. A collection that never had one has no record (404).
-
-```json
-{
- "collection": "ns.coll",
- "conflicts": [
-  {
-   "version": "1.0.0",
-   "ours": "1ec07d4f...",
-   "opened": "2026-10-18T23:20:18Z",
-   "observed": [
-    {"sha256": "31526b65...", "uploaded": "2026-10-18T23:05:51Z", "seen": "2026-10-18T23:20:18Z", "changes": "added playbooks/a.yml; changed roles/b/meta/main.yml"},
-    {"sha256": "8caedf6f...", "uploaded": "2026-10-18T23:42:26Z", "seen": "2026-10-19T00:06:49Z", "changes": "added playbooks/a.yml"}
-   ]
-  }
- ]
-}
-```
-
-| Field | Type | Required | Meaning |
-|---|---|---|---|
-| `collection` | string | yes | `<namespace>.<name>` |
-| `conflicts[].version` | string | yes | The version |
-| `conflicts[].ours` | string | yes | The index's `sha256` for it |
-| `conflicts[].opened` | string | yes | When the mirror first saw the origin serve a different artifact |
-| `conflicts[].observed` | array | yes | Each different artifact the origin served, oldest first: `sha256`, `uploaded` (the origin's upload time, or `null` if unknown), `seen` (when the mirror first compared it), and `changes` (the files added, removed and changed from ours, that none were, or why they couldn't be compared) |
-| `conflicts[].resolved` | string | no | When the origin served the original artifact again |
-
-A version has at most one conflict without `resolved`. Conflicts never
-change the index: its line stays as it was.
 
 ## Index completeness
 

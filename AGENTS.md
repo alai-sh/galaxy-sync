@@ -49,7 +49,7 @@ never a real bucket.
 | `galaxy.py` | The Galaxy HTTP client, with retries. Contract endpoints unless a method's docstring says best effort |
 | `artifacts.py` | Comparing tarballs held in memory, to describe how a conflict's files differ from ours |
 | `store.py` | The sync's own state on top of the backends: the queue, requests, the failure ledger, conflicts and pruning |
-| `report.py` | Rendering the tracking issue's report block and alert comment, and the public conflict records |
+| `report.py` | Rendering the tracking issue's report block and alert comment |
 | `storage.py` | The `Backend` interface (one per bucket), `LocalBackend` and `R2Backend` |
 | `models.py` | TypedDicts for Galaxy responses, index lines, alai-index's JSON output, and state |
 | `semver.py`, `times.py` | SemVer 2.0.0 precedence; RFC 3339 timestamps |

@@ -616,8 +616,6 @@ def test_conflicts(galaxy, run, tmp_path, ask):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     assert run("request", "mirror", "ns.coll") == 0
     assert run("sync") == 0
-    record = tmp_path / "index-root" / "conflicts" / "ns" / "coll.json"
-    assert not record.exists()
 
     galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})
     assert run("request", "mirror", "--revalidate", "ns.coll") == 0
@@ -628,43 +626,25 @@ def test_conflicts(galaxy, run, tmp_path, ask):
     assert "\n| ns.coll | 1.0.0 | " in text
     assert "conflicts/" not in text  # the state bucket key stays private
     (conflict,) = state(tmp_path)["conflicts"]
-    (observed,) = conflict["observed"]
-    public = json.loads(record.read_text())
-    assert public == {
-        "collection": "ns.coll",
-        "conflicts": [
-            {
-                "version": "1.0.0",
-                "ours": conflict["ours"],
-                "opened": conflict["opened"],
-                "observed": [{k: observed[k] for k in ("sha256", "uploaded", "seen", "changes")}],
-            }
-        ],
-    }
+    assert len(conflict["observed"]) == 1
+    # Nothing about conflicts is published in the index bucket.
+    assert not (tmp_path / "index-root" / "conflicts").exists()
 
     # Later builds are recorded, and it stays on the report.
     galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "[]"})})
     assert run("request", "mirror", "--revalidate", "ns.coll") == 0
     assert run("sync", "--strict", "--report", str(report)) == 1
     assert "\n| ns.coll | 1.0.0 | " in report.read_text()
-    (entry,) = json.loads(record.read_text())["conflicts"]
-    assert len(entry["observed"]) == 2
+    (conflict,) = state(tmp_path)["conflicts"]
+    assert len(conflict["observed"]) == 2
 
-    # Resolved once Galaxy serves our contents again: off the report, kept in the record.
+    # Resolved once Galaxy serves our artifact again, so it's off the report but kept in state.
     galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": artifact("ns", "coll", "1.0.0")})
     assert run("request", "mirror", "--revalidate", "ns.coll") == 0
     assert run("sync", "--strict", "--report", str(report)) == 0
     assert "No outstanding failures or open conflicts." in report.read_text()
-    (entry,) = json.loads(record.read_text())["conflicts"]
-    assert "resolved" in entry
-
-    # Every record is written again once a day, in case one was lost.
-    record.unlink()
-    current = state(tmp_path)
-    current["last_prune"] = "2026-01-01T00:00:00Z"
-    (tmp_path / "state" / "state.json").write_text(json.dumps(current))
-    assert ask("mirror", "ns.coll") == 0
-    assert json.loads(record.read_text())["conflicts"] == [entry]
+    (conflict,) = state(tmp_path)["conflicts"]
+    assert "resolved" in conflict
 
 
 def test_state_is_saved_after_enough_work(galaxy, run, monkeypatch):

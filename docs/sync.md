@@ -215,11 +215,10 @@ changed from ours. A conflict goes through these steps.
 3. **Resolved** if Galaxy serves our artifact again. A later difference
    opens a new conflict.
 
-Conflicts never change the index, and nothing is ever removed. Each collection's conflicts, in every state, are published as
-`conflicts/<ns>/<name>.json` in the index bucket
-([format](index-spec/README.md#conflict-records)), the public audit trail of
-why the mirror's artifact differs from Galaxy's. Galaxy's artifacts stay in
-the private state bucket.
+Conflicts never change the index. Nothing is ever removed from
+`state.json`, which keeps every conflict, resolved ones included. The
+tracking issue lists the open ones, and Galaxy's artifacts stay in the
+private state bucket.
 
 ## Requests
 
@@ -310,7 +309,7 @@ tracking issue instead:
   Transient failures that clear within a day never notify. Conflicts are
   only in the description, so a new one notifies no one.
 
-These and the conflict records leave out what shouldn't be public: the state bucket key of a
+These leave out what shouldn't be public: the state bucket key of a
 conflict's saved artifact, and URLs in `unexpected` messages, which can name
 the storage endpoint. `state.json` has them.
 

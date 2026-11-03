@@ -28,7 +28,6 @@ index bucket
   collections.json             every collection, when its index file last changed and its sha256
   plugins.jsonl                the plugin index
   index/<aa>/<sha256>.jsonl    each collection's index file, one line per version, by its sha256
-  conflicts/<ns>/<name>.json   every conflict a collection has had, for audit
 
 artifact bucket
   sha256/<aa>/<sha256>.tar.gz  the exact bytes Galaxy published
@@ -141,7 +140,7 @@ save it.
 ## Caching
 
 The index bucket's files that change (`config.json`, `collections.json`,
-`plugins.jsonl` and the conflict records) are cached for their `max-age`,
+and `plugins.jsonl`) are cached for their `max-age`,
 10 minutes, by Cloudflare and by browsers and other caches after it. Once
 Cloudflare's copy expires, the next request at that Cloudflare location
 waits while it fetches the file from R2 again, about 0.65 s from Brisbane.
