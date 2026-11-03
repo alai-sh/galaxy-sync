@@ -2,7 +2,9 @@
 
 Mirrors every collection on galaxy.ansible.com into the alai static index and
 artifact store, so the alai client can install collections without
-depending on Galaxy.
+depending on Galaxy. The index is built by
+[alai-index](https://github.com/alai-sh/alai-index), and galaxy-sync decides
+what to mirror and when, and publishes the result to the buckets.
 
 > [!WARNING]
 > This isn't designed for public use. It exists only to sync the alai index
@@ -29,10 +31,11 @@ uv run galaxy-sync COMMAND [OPTIONS] ...
 
 | Command | Purpose |
 |---|---|
-| `sync [--budget MINUTES] [--dry-run]` | Find what changed on Galaxy and queue it, reconcile `refresh` requests first, carry on any rebuild, re-extract `ansible.builtin` when ansible-core has a new minor release on PyPI, sweep once a day, then reconcile the rest of the queue until the budget (default 45 minutes) runs out. The rest stays queued for the next run, so the initial import is built up over many runs. `--dry-run` only reports what changed |
-| `refresh [NS[.NAME]...] [--revalidate]` | Ask the next `sync` to reconcile these namespaces or collections ahead of everything else, or with no targets to sweep: compare every published version with the mirror. `--revalidate` also checks every mirrored version's artifact against the one Galaxy publishes now. Writes a request and returns; it doesn't contact Galaxy |
-| `refresh --rebuild` | Ask the next `sync` to regenerate every file derived from the index, without contacting Galaxy: the plugin index (`ansible.builtin` extracted again too), the conflict records and `collections.json`. A rebuild that runs out of time carries on in the next `sync` |
-| `refresh --dl TEMPLATE` | Ask the next `sync` to move the artifact URL template in `config.json`; later runs keep it. Can be combined with `--rebuild` |
+| `sync [--budget MINUTES] [--dry-run]` | Find what changed on Galaxy and queue it, take requests and work them first, sweep once a day, then reconcile the rest of the queue until the budget (default 45 minutes) runs out. The rest stays queued for the next run, so the initial import is built up over many runs. `--dry-run` only reports what changed |
+| `request mirror NS[.NAME]... [--revalidate]` | Ask the next `sync` to reconcile these collections, or every collection in these namespaces, ahead of everything else. `--revalidate` also checks every mirrored version's artifact against the one Galaxy publishes now |
+| `request sweep` | Ask the next `sync` to sweep, comparing every version Galaxy publishes with the index, rather than waiting for the daily one |
+| `request generate-plugins [NS[.NAME]...] [--from-plugin-cache]` | Ask the next `sync` to extract plugins again from the artifacts, for every collection when there are no targets. `--from-plugin-cache` only extracts what's missing or out of date, as after an alai-index upgrade |
+| `request generate-indexes [NS[.NAME]...]` | Ask the next `sync` to make index lines again from the artifacts, for every collection when there are no targets, as after a fix to how alai-index reads artifacts |
 
 | Option | Commands | |
 |---|---|---|
@@ -40,7 +43,6 @@ uv run galaxy-sync COMMAND [OPTIONS] ...
 | `--r2` | all | Write to the R2 buckets, configured from the environment ([storage](docs/storage.md)) |
 | `-v` | all | Debug logging |
 | `--galaxy-url URL` | `sync` | Galaxy server (default `https://galaxy.ansible.com`) |
-| `--pypi-url URL` | `sync` | PyPI, for ansible-core releases (default `https://pypi.org`) |
 | `--strict` | `sync` | Exit 1 while any failure or conflict is outstanding |
 | `--report FILE` | `sync` | Write the outstanding failures and open conflicts as a Markdown block for the tracking issue |
 | `--alerts DIR` | `sync` | Write a Markdown comment for the failures that became persistent this run into `DIR` |
@@ -56,10 +58,10 @@ The workflows are described in [scheduling](docs/sync.md#scheduling).
 | Trigger | Workflow | Why |
 |---|---|---|
 | Every 10 minutes, dispatched by the scheduler in `scheduler/` | `sync.yml` | Picks up new versions, deletions and deprecations; sweeps once a day for what that can't see quickly; works through the initial import 45 minutes at a time |
-| Manual | `refresh.yml` with targets | Resyncs specific collections on the next run, ahead of any backlog: a release needed urgently, a collection that looks out of date, or a version that keeps failing |
-| Manual | `refresh.yml` without targets | Sweeps on the next run, e.g. after `deletions_suspected`, instead of waiting for the daily one |
-| After changing how plugin lines are derived | `refresh.yml` with `rebuild` | Rewrites every derived file over the next syncs |
-| After moving the artifacts | `refresh.yml` with `dl` | Points `config.json` at the new location on the next sync |
+| Manual | `request.yml` with `mirror` | Resyncs specific collections on the next run, ahead of any backlog: a release needed urgently, a collection that looks out of date, or a version that keeps failing |
+| Manual | `request.yml` with `sweep` | Sweeps on the next run, e.g. after `deletions_suspected`, instead of waiting for the daily one |
+| After an alai-index upgrade that changed plugin extraction | `request.yml` with `generate-plugins` and `from-plugin-cache` | Extracts every out of date version's plugins again over the next syncs, rather than as each collection is next synced |
+| After an alai-index fix to how artifacts are read | `request.yml` with `generate-indexes` | Makes the index lines again from the artifacts over the next syncs |
 
 The scheduled run keeps the outstanding failures and open conflicts at the
 top of a tracking issue's description, and posts failures outstanding for

@@ -2,10 +2,9 @@
 
     sync       every 10 minutes: queue what changed on Galaxy (and, once a
                day, everything that differs), then work the queue for up
-               to --budget minutes; re-extract ansible.builtin when
-               ansible-core has a new minor release
-    refresh    ask the next sync to reconcile NS[.NAME] first, to sweep, to
-               rebuild, or to move the artifact URLs
+               to --budget minutes
+    request    ask the next sync to mirror NS[.NAME] first, to sweep, or to
+               generate plugins or index lines again from the artifacts
 
 Recorded failures and conflicts don't fail a run; they're reported in
 state.json in the state bucket and, through --report and --alerts, on a
@@ -18,12 +17,11 @@ import datetime
 import io
 import logging
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
 
-from . import builtin
-from .builtin import BuiltinError
 from .changes import (
     FEED_OVERLAP,
     Collection,
@@ -36,11 +34,12 @@ from .changes import (
     sweep,
 )
 from .galaxy import BASE_URL, GalaxyClient, GalaxyError
-from .models import Pending, Request
-from .reconcile import Result, reconcile
+from .models import Job, Pending, Request
+from .reconcile import ReconcileFailed, Result, generate_indexes, generate_plugins, reconcile
 from .storage import Buckets, R2Config, StorageError
-from .store import GLOBAL, RETIRED_GRACE, SOURCES, Store
+from .store import ACTIONS, GLOBAL, RETIRED_GRACE, SOURCES, Store
 from .times import now
+from .tree import AlaiIndexError, Tree
 
 # How often `sync` runs the full sweep.
 SWEEP_EVERY = datetime.timedelta(days=1)
@@ -51,9 +50,7 @@ class UsageError(Exception):
 
 
 def _open_store(args: argparse.Namespace) -> Store:
-    if args.r2:
-        return Store(Buckets.r2(R2Config.from_env()))
-    return Store(Buckets.local(args.store))
+    return Store(Buckets.r2(R2Config.from_env()) if args.r2 else Buckets.local(args.store))
 
 
 def _exit_code(store: Store, args: argparse.Namespace) -> int:
@@ -69,10 +66,12 @@ def _changes(res: Result) -> list[str]:
         ("CONFLICT", res.conflicts),
         ("repacked", res.repacked),
         ("conflict resolved", res.resolved),
-        ("re-extracted", res.reextracted),
     ):
         if versions:
             parts.append(f"{label} {','.join(versions)}")
+    if res.reextracted:
+        # A whole collection can be extracted again, so only the count.
+        parts.append(f"re-extracted {len(res.reextracted)} versions")
     if res.deprecated is not None:
         parts.append("deprecated" if res.deprecated else "no longer deprecated")
     if res.deferred:
@@ -86,8 +85,7 @@ def _describe(res: Result) -> str:
     changes = _changes(res)
     if res.added or changes:
         return " ".join([f"+{len(res.added)}", *changes])
-    checked = f", rechecked {res.rechecked} versions: all match" if res.rechecked else ""
-    return f"+0, up to date ({res.mirrored}/{res.upstream} mirrored){checked}"
+    return f"+0, up to date ({res.mirrored}/{res.upstream} mirrored)"
 
 
 def _explain(entry: Pending | None, res: Result) -> list[str]:
@@ -200,7 +198,7 @@ def _print_summary(store: Store, worked: dict[str, Result | str], elapsed: float
     if published := store.state.get("published_count"):
         unindexed = sum(len(c.get("unindexed", [])) for c in store.state["collections"].values())
         published += unindexed
-        mirrored = sum(len(c["versions"]) for c in store.state["collections"].values())
+        mirrored = sum(c.get("mirrored", 0) for c in store.state["collections"].values())
         print(
             f"mirror: {mirrored} of {published} versions Galaxy publishes ({mirrored / published:.1%})"
             + (f", {unindexed} of them missing from its search index" if unindexed else "")
@@ -233,7 +231,6 @@ GLOBAL_RETRIES = {
     "requests": "retried with the requests",
     "sweep": "retried with the sweep",
     "count": "checked again after reconciling",
-    "builtin": "retried every run",
 }
 
 
@@ -282,20 +279,33 @@ def _print_outstanding(store: Store, requests: list[tuple[str, Request]]) -> Non
 
 
 def _is_sweep(request: Request) -> bool:
-    return not (request["targets"] or request.get("rebuild") or request.get("dl"))
+    return request.get("action") == "sweep"
+
+
+def _what(action: str, targets: list[str], *, revalidate: bool = False, from_plugin_cache: bool = False) -> str:
+    """What a request or job asks for."""
+    every = ", ".join(targets) or "every collection"
+    match action:
+        case "mirror":
+            return f"mirror {', '.join(targets)}" + (" (revalidating)" if revalidate else "")
+        case "sweep":
+            return "sweep"
+        case "generate-plugins":
+            return f"generate the plugins of {every}" + (" from the plugin cache" if from_plugin_cache else "")
+        case _:
+            return f"generate the index lines of {every}"
 
 
 def _asks(request: Request) -> list[str]:
-    """What a `refresh` request asks for, one line each."""
-    asks = ["rebuild"] if request.get("rebuild") else []
-    if dl := request.get("dl"):
-        asks.append(f"move the artifact URLs to {dl}")
-    if asks:
-        return asks
-    if not request["targets"]:
-        return ["sweep"]
-    flags = " (revalidating)" if request["revalidate"] else ""
-    return [f"reconcile {'' if '.' in t else 'namespace '}{t}{flags}" for t in request["targets"]]
+    """What a request asks for."""
+    return [
+        _what(
+            request.get("action", "?"),
+            request.get("targets", []),
+            revalidate=request.get("revalidate", False),
+            from_plugin_cache=request.get("from_plugin_cache", False),
+        )
+    ]
 
 
 def _sweep_status(store: Store, requested: bool = False) -> str:
@@ -318,11 +328,10 @@ def _print_plan(store: Store, requests: list[tuple[str, Request]], sweep_due: bo
         for key, request in requests:
             lines.append(f"    {key}, from {_when(request['requested'])}")
             lines.extend(f"      {ask}" for ask in _asks(request))
-    if rebuild := store.state.get("rebuild"):
-        after = f", continuing after {last}" if (last := rebuild.get("after")) else ""
-        lines.append(f"  rebuild: requested {_when(rebuild['requested'])}{after}")
-    if builtin.due(store):
-        lines.append("  builtin: check PyPI for a new ansible-core minor release")
+    for job in store.state.get("jobs", []):
+        after = f", continuing after {last}" if (last := job.get("after")) else ""
+        what = _what(job["action"], job["targets"], from_plugin_cache=job.get("from_plugin_cache", False))
+        lines.append(f"  job: {what}, requested {_when(job['requested'])}{after}")
     if sweep_due:
         lines.append("  sweep: queues everything that differs from Galaxy")
     pending = store.state["pending"]
@@ -370,21 +379,21 @@ def _print_discovery(res: Discovery, previous: str | None, initial: bool) -> Non
 
 
 def _queue_requests(client: GalaxyClient, store: Store, requests: list[tuple[str, Request]]) -> int:
-    """Queue every waiting `refresh` request and delete it; returns how many were taken."""
+    """Take every waiting request and delete it; returns how many were taken."""
     taken = 0
     failed = False
     for key, request in requests:
         what = f"request {key}"
-        if request.get("rebuild") or request.get("dl"):
-            if dl := request.get("dl"):
-                store.dl_url = dl
-                store.write_config()  # now, so the move doesn't wait for the end of the run
-                print(f"{what}: artifact URLs moved to {dl}")
-            if request.get("rebuild"):
-                store.state["rebuild"] = {"requested": request["requested"]}  # from the start, if one was running
-                _ = store.state.pop("builtin", None)  # extracted again too
-                print(f"{what}: rebuilding, starting this run")
-        elif not request["targets"]:
+        action = request.get("action")
+        if action in ("generate-plugins", "generate-indexes"):
+            job: Job = {"action": action, "requested": request["requested"], "targets": request["targets"]}
+            if request.get("from_plugin_cache"):
+                job["from_plugin_cache"] = True
+            store.state.setdefault("jobs", []).append(job)
+            print(f"{what}: {_asks(request)[0]}, starting this run")
+        elif action not in ("mirror", "sweep"):  # only a hand-written request, or one from before `request`
+            print(f"{what}: dropped: it asks for {action!r}, which isn't one of {', '.join(ACTIONS)}", file=sys.stderr)
+        elif action == "sweep":
             _ = store.state.pop("last_sweep", None)  # sweep this run
             print(f"{what}: sweeping this run")
         else:
@@ -395,13 +404,13 @@ def _queue_requests(client: GalaxyClient, store: Store, requests: list[tuple[str
                 print(f"{what}: kept for the next run, as Galaxy couldn't expand it: {e}", file=sys.stderr)
                 failed = True
                 continue
-            except ValueError as e:  # `refresh` checks names, so only a hand-written request
+            except ValueError as e:  # `request` checks names, so only a hand-written request
                 print(f"{what}: dropped: {e}", file=sys.stderr)
                 targets = []
             else:
                 print(f"{what}: queued {len(targets)} collections ahead of everything else")
             for ns, name in targets:
-                store.enqueue(f"{ns}.{name}", "requested", revalidate=request["revalidate"])
+                store.enqueue(f"{ns}.{name}", "requested", revalidate=request.get("revalidate", False))
         store.save_state()  # before deleting, so a crash can only take a request twice
         store.delete_request(key)
         taken += 1
@@ -410,61 +419,53 @@ def _queue_requests(client: GalaxyClient, store: Store, requests: list[tuple[str
     return taken
 
 
-def _rebuild(store: Store, deadline: float) -> bool:
-    """Work through a requested rebuild until `deadline`; False if none was requested.
+def _jobs(store: Store, tree: Tree, deadline: float) -> bool:
+    """Work through the requested jobs, in order, until `deadline`; False if there were none.
 
-    Progress is kept in state, so a rebuild that runs out of time, or a run
-    that stops, carries on from the last collection done.
+    A job works a collection at a time, in name order, and keeps its progress
+    in state, so one that runs out of time carries on in the next run.
     """
-    if (progress := store.state.get("rebuild")) is None:
+    jobs = store.state.get("jobs", [])
+    if not jobs:
         return False
-    after = tuple(progress["after"].split(".", 1)) if "after" in progress else None
-    targets = [c for c in store.index_collections() if after is None or c > after]
-    print(f"rebuild: {len(targets)} collections to go")
-    for i, (ns, name) in enumerate(targets):
-        if time.monotonic() >= deadline:
-            print(f"rebuild: out of time, {len(targets) - i} collections left for the next run")
-            return True
-        store.rebuild_collection(ns, name)
-        progress["after"] = f"{ns}.{name}"
-        store.add_work()
-        if store.save_due():
-            store.save_state()  # keep progress if the run stops
-    _ = store.write_conflict_records(store.conflicted_collections())
-    del store.state["rebuild"]
-    print(f"rebuild: done, requested {_when(progress['requested'])}")
-    return True
-
-
-def _builtin(client: GalaxyClient, store: Store) -> bool:
-    """Re-extract ansible.builtin if ansible-core has a new minor release; True if it changed."""
-    try:
-        res = builtin.check(client, store)
-    except GalaxyError as e:
-        store.record_failure(GLOBAL, "builtin", e.kind.replace("galaxy_", "pypi_", 1), str(e))
-        print(f"builtin: couldn't check PyPI; retried next run: {e}", file=sys.stderr)
-        return False
-    except BuiltinError as e:
-        store.record_failure(GLOBAL, "builtin", e.kind, str(e))
-        print(f"builtin: FAILED, retried next run: {e}", file=sys.stderr)
-        return False
-    store.clear_failures(GLOBAL, "builtin")
-    if res is None:
-        current = store.state.get("builtin", {}).get("version")
-        print(
-            f"builtin: ansible-core {current} is still the latest minor release"
-            if current
-            else "builtin: no release found"
-        )
-        return False
-    counts = collections.Counter(p.type for p in res.result.plugins)
-    dated = sum(1 for line in res.lines if "since" in line)
-    print(
-        f"builtin: extracted ansible-core {res.release.version}: {sum(counts.values())} entries {dict(counts)}, "
-        + f"{dated} with version_added, {len(res.lines) - len(res.result.plugins)} routing-only"
-    )
-    if unresolved := [i.path for i in res.result.issues if i.kind == "filter_test_unresolved"]:
-        print(f"  unresolved filter/test files: {unresolved}")
+    while jobs:
+        job = jobs[0]
+        targets = job["targets"]
+        names = sorted(f for f in tree.listing if not targets or f in targets or f.partition(".")[0] in targets)
+        todo = [fqcn for fqcn in names if (after := job.get("after")) is None or fqcn > after]
+        what = _what(job["action"], targets, from_plugin_cache=job.get("from_plugin_cache", False))
+        print(f"job: {what}, {len(todo)} collections to go")
+        if job["action"] == "generate-plugins" and not targets:
+            # Every collection's lines are merged in again, so a lost plugins.jsonl is started afresh.
+            tree.fetch_plugins(optional=True)
+        changed = 0
+        for i, fqcn in enumerate(todo):
+            if time.monotonic() >= deadline:
+                print(f"job: out of time, {len(todo) - i} collections left for the next run")
+                return True
+            label = f"job: [{i + 1:{len(str(len(todo)))}}/{len(todo)}] {fqcn}"
+            try:
+                if job["action"] == "generate-plugins":
+                    done = generate_plugins(store, tree, fqcn, from_plugin_cache=job.get("from_plugin_cache", False))
+                    print(f"{label}, {len(done)} versions extracted again")
+                else:
+                    done = generate_indexes(store, tree, fqcn)
+                    print(f"{label}, {len(done)} lines changed")
+                    for vers in done:
+                        print(f"  {fqcn} {vers}: line changed")
+            except AlaiIndexError as e:
+                store.record_failure(fqcn, None, "alai_index", str(e))
+                print(f"{label}: FAILED ({e})", file=sys.stderr)
+                done = []
+            changed += len(done)
+            job["after"] = fqcn
+            store.add_work()
+            if store.save_due():
+                store.save_state()  # keep progress if the run stops
+        noun = "versions extracted again" if job["action"] == "generate-plugins" else "lines changed"
+        print(f"job: done, {changed} {noun}, requested {_when(job['requested'])}")
+        _ = jobs.pop(0)
+    del store.state["jobs"]
     return True
 
 
@@ -473,10 +474,10 @@ def _sweep_due(store: Store) -> bool:
     return last is None or datetime.datetime.fromisoformat(now()) - datetime.datetime.fromisoformat(last) >= SWEEP_EVERY
 
 
-def _sweep(client: GalaxyClient, store: Store) -> bool:
+def _sweep(client: GalaxyClient, store: Store, tree: Tree) -> bool:
     """Queue every collection that differs from Galaxy; False if the feed couldn't be read."""
     try:
-        res = sweep(client, store)
+        res = sweep(client, store, tree)
     except GalaxyError as e:
         store.record_failure(GLOBAL, "sweep", e.kind, f"upload feed: {e}")
         print(f"the sweep couldn't read the upload feed; it runs again next time: {e}", file=sys.stderr)
@@ -505,7 +506,14 @@ def _sweep(client: GalaxyClient, store: Store) -> bool:
 
 
 def _reconcile_one(
-    client: GalaxyClient, store: Store, ns: str, name: str, label: str, entry: Pending | None, deadline: float
+    client: GalaxyClient,
+    store: Store,
+    tree: Tree,
+    ns: str,
+    name: str,
+    label: str,
+    entry: Pending | None,
+    deadline: float,
 ) -> Result | str:
     """Reconcile one collection, recording rather than raising anything that goes wrong.
 
@@ -516,16 +524,21 @@ def _reconcile_one(
         res = reconcile(
             client,
             store,
+            tree,
             ns,
             name,
             revalidate=bool(entry and entry.get("revalidate")),
             deadline=deadline,
             unseen=entry.get("unseen", []) if entry else [],
         )
-    except GalaxyError as e:  # e.g. listing its versions failed
+    except (GalaxyError, ReconcileFailed) as e:  # e.g. listing its versions failed
         store.record_failure(fqcn, None, e.kind, str(e))
         print(f"{label}: FAILED ({e})", file=sys.stderr)
         return e.kind
+    except AlaiIndexError as e:  # refused, so nothing was written
+        store.record_failure(fqcn, None, "alai_index", str(e))
+        print(f"{label}: FAILED ({e})", file=sys.stderr)
+        return "alai_index"
     except Exception as e:
         store.record_failure(fqcn, None, "unexpected", "".join(traceback.format_exception_only(e)).strip())
         print(f"{label}: FAILED unexpectedly ({type(e).__name__}: {e})", file=sys.stderr)
@@ -542,7 +555,13 @@ def _reconcile_one(
 
 
 def _work(
-    client: GalaxyClient, store: Store, deadline: float, done: dict[str, Result | str], *, requested: bool = False
+    client: GalaxyClient,
+    store: Store,
+    tree: Tree,
+    deadline: float,
+    done: dict[str, Result | str],
+    *,
+    requested: bool = False,
 ) -> None:
     """Reconcile queued collections, then ones with outstanding failures, until `deadline`.
 
@@ -572,7 +591,7 @@ def _work(
         fqcn = f"{ns}.{name}"
         entry = pending.get(fqcn)
         label = f"[{i + 1:{width}}/{len(targets)}] {fqcn}"
-        res = done[fqcn] = _reconcile_one(client, store, ns, name, label, entry, deadline)
+        res = done[fqcn] = _reconcile_one(client, store, tree, ns, name, label, entry, deadline)
         if isinstance(res, Result) and res.deferred:
             store.enqueue(fqcn, entry["source"] if entry else "listed")
         else:
@@ -589,22 +608,28 @@ def _report_count(client: GalaxyClient, store: Store) -> None:
 
 def _finish(
     store: Store,
+    tree: Tree,
     client: GalaxyClient,
     args: argparse.Namespace,
     worked: dict[str, Result | str],
     elapsed: float,
 ) -> None:
-    """Write the aggregate files, the failure report and the state, then the run's summary."""
-    store.write_config()
-    plugins = store.write_plugins()
-    _ = store.write_conflict_records()
-    store.write_collections()  # last, as it names the index files written before it
-    pruned = store.prune_index_files() if store.prune_due() else None
+    """Publish the aggregate files, then write the failure report and the state, then the run's summary."""
+    _ = tree.publish_aggregates()
+    plugins = tree.plugin_lines()
+    pruned = None
+    if store.prune_due():
+        # Once a day, every conflict record, in case one was lost, as they're otherwise only written when changed.
+        _ = store.write_conflict_records(store.conflicted_collections())
+        pruned = store.prune_index_files({tree.index_file(fqcn) for fqcn in tree.listing})
+    else:
+        _ = store.write_conflict_records()
     failures = store.failure_report()
     summary = failures.summary
     store.save_state()
     _print_summary(store, worked, elapsed)
-    print(f"plugin index: {plugins} lines")
+    if plugins is not None:
+        print(f"plugin index: {plugins} lines")
     if pruned:
         print(f"deleted {pruned} index files no listing has named for {RETIRED_GRACE.days} days")
     print(
@@ -672,46 +697,38 @@ def cmd_sync(args: argparse.Namespace) -> int:
     _print_plan(store, requests, asked or _sweep_due(store), args.budget)
     _print_outstanding(store, requests)
     taken = _queue_requests(client, store, requests)
-    # What a person asked for goes before the sweep, which can take most of the budget.
-    worked: dict[str, Result | str] = {}
-    _work(client, store, deadline, worked, requested=True)
-    rebuilt = _rebuild(store, deadline)
-    extracted = builtin.due(store) and _builtin(GalaxyClient(args.pypi_url), store)
-    # Once started, the sweep runs to the end, so it isn't started after the
-    # budget has run out; the next run starts with it instead.
-    swept = time.monotonic() < deadline and _sweep_due(store) and _sweep(client, store)
-    _work(client, store, deadline, worked)
-    if res.unchanged and not (taken or rebuilt or extracted or swept or worked):
-        store.save_state()  # the builtin check's time, and any failure recorded
-        return _exit_code(store, args)  # nothing changed: skip rewriting the aggregate files
-    if not res.unchanged or swept:
-        _report_count(client, store)
-    _finish(store, client, args, worked, time.monotonic() - started)
+    with tempfile.TemporaryDirectory(prefix="galaxy-sync-", ignore_cleanup_errors=True) as workdir:
+        tree = Tree(store.buckets, Path(workdir))
+        store.before_save = tree.publish_aggregates
+        # What a person asked for goes before the sweep, which can take most of the budget.
+        worked: dict[str, Result | str] = {}
+        _work(client, store, tree, deadline, worked, requested=True)
+        jobbed = _jobs(store, tree, deadline)
+        # Once started, the sweep runs to the end, so it isn't started after the
+        # budget has run out; the next run starts with it instead.
+        swept = time.monotonic() < deadline and _sweep_due(store) and _sweep(client, store, tree)
+        _work(client, store, tree, deadline, worked)
+        if res.unchanged and not (taken or jobbed or swept or worked):
+            store.save_state()  # any failure recorded
+            return _exit_code(store, args)  # nothing changed: skip rewriting the aggregate files
+        if not res.unchanged or swept:
+            _report_count(client, store)
+        _finish(store, tree, client, args, worked, time.monotonic() - started)
     return _exit_code(store, args)
 
 
-def cmd_refresh(args: argparse.Namespace) -> int:
-    """Ask the next sync to reconcile collections first, sweep, rebuild, or move the artifact URLs."""
-    if args.revalidate and not args.targets:
-        raise UsageError("--revalidate needs NS or NS.NAME targets")
-    if (args.rebuild or args.dl) and args.targets:
-        raise UsageError("--rebuild and --dl can't be combined with targets")
+def cmd_request(args: argparse.Namespace) -> int:
+    """Ask the next sync to do something, without contacting Galaxy."""
     try:
         for target in args.targets:
             check_target(target)
     except ValueError as e:
         raise UsageError(str(e)) from None
+    revalidate, from_plugin_cache = getattr(args, "revalidate", False), getattr(args, "from_plugin_cache", False)
     store = _open_store(args)
-    key = store.add_request(args.targets, args.revalidate, args.rebuild, args.dl)
-    if args.rebuild and args.dl:
-        what = f"a rebuild, moving the artifact URLs to {args.dl}"
-    elif args.rebuild:
-        what = "a rebuild"
-    elif args.dl:
-        what = f"moving the artifact URLs to {args.dl}"
-    else:
-        what = ", ".join(args.targets) if args.targets else "a full sweep"
-    print(f"queued {what} for the next sync ({key})")
+    key = store.add_request(args.action, args.targets, revalidate=revalidate, from_plugin_cache=from_plugin_cache)
+    what = _what(args.action, args.targets, revalidate=revalidate, from_plugin_cache=from_plugin_cache)
+    print(f"requested {what} from the next sync ({key})")
     return 0
 
 
@@ -759,34 +776,49 @@ def _parser() -> argparse.ArgumentParser:
         help="write the outstanding failures and conflicts here as a Markdown block for the tracking issue",
     )
     _ = p.add_argument("--galaxy-url", default=BASE_URL, help=f"Galaxy server (default: {BASE_URL})")
-    _ = p.add_argument(
-        "--pypi-url", default=builtin.PYPI_URL, help=f"PyPI, for ansible-core releases (default: {builtin.PYPI_URL})"
-    )
     _ = p.add_argument("--strict", action="store_true", help="exit 1 if any failure or conflict is outstanding")
     _ = p.add_argument("--dry-run", action="store_true", help="only report what changed; queue nothing")
     p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser(
-        "refresh",
-        parents=[storage],
-        help="ask the next sync to reconcile NS[.NAME] first, with no targets to run the sweep, "
-        + "or to rebuild or move the artifact URLs",
+        "request",
+        help="ask the next sync to do something, which it does before the rest of the queue",
+        description="Ask the next sync to do something. It writes a request to the state bucket, which the next sync "
+        + "takes, so it never contacts Galaxy.",
     )
-    _ = p.add_argument("targets", nargs="*", metavar="NS[.NAME]")
-    _ = p.add_argument(
+    actions = p.add_subparsers(dest="action", required=True)
+    a = actions.add_parser(
+        "mirror",
+        parents=[storage],
+        help="mirror these collections, or every collection in these namespaces, ahead of everything else",
+    )
+    _ = a.add_argument("targets", nargs="+", metavar="NS[.NAME]")
+    _ = a.add_argument(
         "--revalidate",
         action="store_true",
-        help="also check every mirrored artifact against the one Galaxy publishes now (needs targets)",
+        help="also check every mirrored artifact against the one Galaxy publishes now",
     )
-    _ = p.add_argument(
-        "--rebuild",
+    _ = actions.add_parser(
+        "sweep", parents=[storage], help="compare everything Galaxy publishes with the index now, not once a day"
+    )
+    a = actions.add_parser(
+        "generate-plugins",
+        parents=[storage],
+        help="extract plugins again from the artifacts and work plugins.jsonl out again, over as many syncs as it takes",
+    )
+    _ = a.add_argument("targets", nargs="*", metavar="NS[.NAME]", help="none for every collection")
+    _ = a.add_argument(
+        "--from-plugin-cache",
         action="store_true",
-        help="regenerate every file derived from the index, and extract ansible.builtin again",
+        help="only fetch the artifacts the plugin cache needs, those whose extraction is missing or out of date",
     )
-    _ = p.add_argument(
-        "--dl", metavar="TEMPLATE", default="", help="move the artifact URL template in config.json to TEMPLATE"
+    a = actions.add_parser(
+        "generate-indexes",
+        parents=[storage],
+        help="make index lines again from the artifacts, over as many syncs as it takes",
     )
-    p.set_defaults(func=cmd_refresh)
+    _ = a.add_argument("targets", nargs="*", metavar="NS[.NAME]", help="none for every collection")
+    p.set_defaults(func=cmd_request, targets=[])
 
     return parser
 
@@ -800,7 +832,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("galaxy_sync").setLevel(logging.DEBUG if args.verbose else logging.INFO)
     try:
         return args.func(args)
-    except (UsageError, StorageError) as e:
+    except (UsageError, StorageError, AlaiIndexError) as e:
         parser.exit(2, f"{parser.prog}: error: {e}\n")
 
 

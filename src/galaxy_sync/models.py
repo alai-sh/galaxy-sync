@@ -1,4 +1,4 @@
-"""Shapes of the JSON the sync reads from Galaxy and writes to the index.
+"""Shapes of the JSON the sync reads from Galaxy, the index and its own state.
 
 Galaxy responses only list the fields the sync uses. They aren't
 validated at runtime; a response missing a required field fails the
@@ -90,27 +90,7 @@ class GalaxySearchPage(TypedDict):
     meta: GalaxyCount
 
 
-# PyPI's JSON API, for ansible-core releases.
-
-
-class PyPIDigests(TypedDict):
-    sha256: str
-
-
-class PyPIFile(TypedDict):
-    """One file of a release in PyPI's JSON API (`/pypi/<project>/json`)."""
-
-    packagetype: str  # "sdist" or "bdist_wheel"
-    url: str
-    digests: PyPIDigests
-    yanked: NotRequired[bool]
-
-
-class PyPIProject(TypedDict):
-    releases: dict[str, list[PyPIFile]]
-
-
-# Index and plugin index lines (docs/index-spec/).
+# Index lines (docs/index-spec/), as alai-index writes them.
 
 
 class Dependency(TypedDict):
@@ -131,32 +111,28 @@ class IndexLine(TypedDict):
     published: str
 
 
-class PluginLine(TypedDict):
-    v: int
-    type: str
+# alai-index's JSON output (alai-index's README.md, "Results").
+
+
+class IndexChange(TypedDict):
     name: str
-    collection: str
-    since: NotRequired[str]
-    until: NotRequired[str]
-    short_description: NotRequired[str]
-    routing: NotRequired[dict[str, object]]
+    version: str | None  # None for the whole collection
+    result: str  # added, changed, conflict, deferred, failed, ...
+    details: dict[str, object] | None
 
 
-# Stored extraction results.
+# dl is relative to the artifacts' directory, so the dl bucket's keys, index is relative to the tree, in the order to
+# publish them, and plugin-cache is relative to the plugin cache.
+IndexFiles = TypedDict("IndexFiles", {"dl": list[str], "index": list[str], "plugin-cache": list[str]})
 
 
-class PluginEntry(TypedDict):
-    type: str
-    name: str
-    short_description: NotRequired[str]
-
-
-class ExtractionData(TypedDict):
-    """The part of an alai-plugin-extractor result the plugin index is built from."""
-
-    format: int  # plugins.EXTRACTION_FORMAT when it was written
-    plugins: list[PluginEntry]
-    routing: dict[str, dict[str, object]]  # "type:name" -> meta/runtime.yml entry
+class IndexOutput(TypedDict):
+    versions: list[IndexChange]
+    written: IndexFiles
+    deleted: IndexFiles
+    stale: list[str]
+    # Versions whose plugin extraction is missing or out of date: name, version, and dl, their artifact's key.
+    outdated: list[dict[str, str]]
 
 
 # state.json (docs/storage.md).
@@ -178,22 +154,18 @@ class UpstreamVerdict(TypedDict):
 
     sha256: str  # Galaxy's artifact
     same_contents: bool
-
-
-class VersionState(TypedDict):
-    created_at: str | None
-    upstream: NotRequired[UpstreamVerdict]
+    uploaded: NotRequired[str | None]  # Galaxy's created_at for it, so the sweep doesn't see it as a new upload
 
 
 class CollectionState(TypedDict):
-    versions: dict[str, VersionState]
-    updated: NotRequired[str]
-    sha256: NotRequired[str]  # of its index file, the key it's published under; none until it has one
     upstream_updated: NotRequired[str]
     upstream_deprecated: NotRequired[bool]
     upstream_count: NotRequired[int]  # versions Galaxy listed at the last reconcile
     # Versions Galaxy serves that its search index (the upload feed and count) leaves out.
     unindexed: NotRequired[list[str]]
+    mirrored: NotRequired[int]  # versions in the index that aren't yanked, at the last reconcile
+    # The last comparison of Galaxy's artifact with ours, by version, for versions where they differ.
+    verdicts: NotRequired[dict[str, UpstreamVerdict]]
 
 
 class Observation(TypedDict):
@@ -232,15 +204,14 @@ class Pending(TypedDict):
     unseen: NotRequired[list[str]]  # mirrored versions the sweep didn't see in the upload feed
 
 
-class BuiltinState(TypedDict):
-    checked: str  # when PyPI was last checked for a new ansible-core minor release
-    version: NotRequired[str]  # the ansible-core release builtin.jsonl was extracted from
-    format: NotRequired[int]  # its plugins.EXTRACTION_FORMAT
+class Job(TypedDict):
+    """A requested job worked a collection at a time, over as many syncs as it takes."""
 
-
-class RebuildState(TypedDict):
+    action: str  # generate-plugins or generate-indexes
     requested: str
-    after: NotRequired[str]  # the last collection rebuilt, in (namespace, name) order
+    targets: list[str]  # NS or NS.NAME, or empty for every collection
+    from_plugin_cache: NotRequired[bool]  # generate-plugins: fetch only the artifacts the plugin cache needs
+    after: NotRequired[str]  # the last collection done, in name order
 
 
 class SyncState(TypedDict):
@@ -252,9 +223,7 @@ class SyncState(TypedDict):
     repo_published: NotRequired[str]  # repo metadata `published` at the last discover
     last_sweep: NotRequired[str]  # when the last full sweep finished
     published_count: NotRequired[int]  # versions Galaxy published at the last count check
-    plugins_pending: NotRequired[list[str]]  # collections whose plugin lines aren't in plugins.jsonl yet
-    builtin: NotRequired[BuiltinState]
-    rebuild: NotRequired[RebuildState]  # a requested rebuild that isn't finished yet
+    jobs: NotRequired[list[Job]]  # requested jobs that aren't finished yet, worked in order
     retired_index_files: NotRequired[dict[str, str]]  # index bucket keys no listing names, and since when
     last_prune: NotRequired[str]  # when retired index files were last pruned
 
@@ -263,10 +232,10 @@ class SyncState(TypedDict):
 
 
 class Request(TypedDict):
-    """A `refresh` asking the next sync to reconcile collections, sweep or rebuild."""
+    """A `request` asking the next sync to do something, one of store.ACTIONS."""
 
     requested: str
-    targets: list[str]  # NS or NS.NAME; empty for a sweep
-    revalidate: bool
-    rebuild: NotRequired[bool]  # regenerate every file derived from the index, instead of targets
-    dl: NotRequired[str]  # a new artifact URL template for config.json, instead of targets
+    action: str
+    targets: list[str]  # NS or NS.NAME, or for generate-*, empty for every collection
+    revalidate: NotRequired[bool]  # mirror: check every mirrored artifact against Galaxy's
+    from_plugin_cache: NotRequired[bool]  # generate-plugins: fetch only the artifacts the plugin cache needs

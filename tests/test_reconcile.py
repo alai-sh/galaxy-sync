@@ -1,259 +1,295 @@
-"""reconcile(): mirroring, yanking, conflicts and failure handling for one collection."""
+"""reconcile(): mirroring through alai-index, yanking, conflicts and failure handling for one collection."""
 
 import hashlib
+import json
+import logging
+from compression import zstd
 
 import pytest
-from helpers import DETAIL, UNAVAILABLE, artifact, extraction
+from helpers import DETAIL, artifact
 
 from galaxy_sync import reconcile as reconcile_mod
-from galaxy_sync import store as store_mod
-from galaxy_sync.plugins import EXTRACTION_FORMAT
-from galaxy_sync.reconcile import reconcile
+from galaxy_sync.reconcile import ReconcileFailed, reconcile
 from galaxy_sync.report import Summary
 from galaxy_sync.store import Store
 from galaxy_sync.times import rfc3339
+from galaxy_sync.tree import Tree
+
+# A status alai-index doesn't retry, as its backoff can't be shortened from its command line.
+FORBIDDEN = (403, {"detail": "Forbidden"}, {})
 
 
-def reload(store):
-    """The store a later run would open."""
+def later(store, tree, tmp_path):
+    """The store and tree a later run would open, once this one published what it changed."""
+    _ = tree.publish_aggregates()
     store.save_state()
-    return Store(store.buckets, store.dl_url)
+    n = len(list(tmp_path.glob("later*")))
+    return Store(store.buckets), Tree(store.buckets, tmp_path / f"later{n}")
 
 
-def test_new_versions_are_mirrored(galaxy, client, store):
+def run(client, store, tree, name="coll", **kwargs):
+    return reconcile(client, store, tree, "ns", name, **kwargs)
+
+
+def test_new_versions_are_mirrored(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
 
-    res = reconcile(client, store, "ns", "coll")
+    res = run(client, store, tree)
     assert res.added == ["1.0.0", "1.1.0"]
     assert res.changed
-    first, _ = store.read_index("ns", "coll")
+    assert res.downloaded == sum(len(galaxy.blobs[("ns", "coll", v)]) for v in ("1.0.0", "1.1.0"))
+    first, _ = tree.lines("ns.coll")
     blob = galaxy.blobs[("ns", "coll", "1.0.0")]
+    # From the artifact, not from Galaxy's API.
     assert first == {
         "v": 1,
         "name": "ns.coll",
         "vers": "1.0.0",
-        "deps": [{"name": "other.coll", "req": ">=1.0.0"}],
+        "deps": [],
         "sha256": hashlib.sha256(blob).hexdigest(),
         "size": len(blob),
-        "requires_ansible": ">=2.16",
         "yanked": False,
         "published": rfc3339(galaxy.uploaded[("ns", "coll", "1.0.0")]),
     }
-    assert store.read_artifact(first["sha256"]) == blob
-    assert extraction(store, first["sha256"])["plugins"] == [
+    assert tree.read_artifact(first["sha256"]) == blob
+    # Published as it was written: the index file, and the private state compressed.
+    assert store.index.read(tree.index_file("ns.coll")) is not None
+    plugins = zstd.decompress(store.state_bucket.read("plugin-cache/ns/coll.jsonl.zst") or b"")
+    assert next(json.loads(line)["plugins"] for line in plugins.splitlines()) == [
         {"type": "module", "name": "thing", "short_description": "A thing"}
     ]
+    # plugins.jsonl and collections.json wait for the run to publish them.
+    assert "coll" not in (store.index.read("collections.json") or b"").decode()
+    assert tree.publish_aggregates()
+    assert "ns.coll" in (store.index.read("plugins.jsonl") or b"").decode()
+    assert store.collection_state("ns.coll") | {"upstream_updated": None} == {
+        "upstream_updated": None,
+        "upstream_deprecated": False,
+        "upstream_count": 2,
+        "mirrored": 2,
+    }
 
-    # A no-op re-run only lists the collection and its versions.
+    # A no-op re-run downloads nothing.
     galaxy.requests.clear()
-    res = reconcile(client, store, "ns", "coll")
+    res = run(client, store, tree)
     assert (res.added, res.changed) == ([], False)
-    assert galaxy.requests == ["/api/v3/collections/ns/coll/", "/api/v3/collections/ns/coll/versions/?limit=100"]
+    assert not any("/pulp/content/" in r for r in galaxy.requests)
 
 
-def test_failed_version_is_recorded_skipped_and_retried(galaxy, client, store):
+def test_alai_index_progress_is_logged(galaxy, client, store, tree, caplog):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    caplog.set_level(logging.INFO, logger="galaxy_sync")
+    run(client, store, tree)
+    progress = [r.getMessage() for r in caplog.records if r.getMessage().startswith("alai-index: ")]
+    assert "alai-index: downloading ns.coll 1.0.0, 1 of 1" in progress
+
+
+def test_a_later_run_carries_on_from_the_buckets(galaxy, client, store, tree, tmp_path):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    run(client, store, tree)
+    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
+
+    store, tree = later(store, tree, tmp_path)
+    assert run(client, store, tree).added == ["1.1.0"]
+    assert [line["vers"] for line in tree.lines("ns.coll")] == ["1.0.0", "1.1.0"]
+
+
+def test_failed_version_is_recorded_skipped_and_retried(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
     good = galaxy.routes[DETAIL.format("1.1.0")]
-    galaxy.routes[DETAIL.format("1.1.0")] = UNAVAILABLE
+    galaxy.routes[DETAIL.format("1.1.0")] = FORBIDDEN
 
-    res = reconcile(client, store, "ns", "coll")
+    res = run(client, store, tree)
     assert res.added == ["1.0.0"]
-    assert [line["vers"] for line in store.read_index("ns", "coll")] == ["1.0.0"]
+    assert res.upstream == 2  # still listed by Galaxy
+    assert [line["vers"] for line in tree.lines("ns.coll")] == ["1.0.0"]
     (failure,) = store.state["failures"].values()
-    assert (failure["version"], failure["kind"], failure["attempts"]) == ("1.1.0", "galaxy_unavailable", 1)
+    assert (failure["version"], failure["kind"], failure["attempts"]) == ("1.1.0", "galaxy_http_403", 1)
     assert store.failed_collections() == [("ns", "coll")]
 
     galaxy.routes[DETAIL.format("1.1.0")] = good
-    res = reconcile(client, store, "ns", "coll")
+    res = run(client, store, tree)
     assert res.added == ["1.1.0"]
     assert store.state["failures"] == {}
 
 
-def test_download_errors_are_recorded(galaxy, client, store):
+def test_download_errors_are_recorded(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     galaxy.routes.pop("/pulp/content/ns-coll-1.0.0.tar.gz?sig=x")
-    res = reconcile(client, store, "ns", "coll")
+    res = run(client, store, tree)
     assert res.added == []
     (failure,) = store.state["failures"].values()
     assert failure["kind"] == "galaxy_http_404"
-    assert failure["message"].startswith("download: ")
 
 
-def test_extraction_failure_still_mirrors_and_heals(galaxy, client, store, monkeypatch):
+def test_extraction_failure_is_recorded_but_still_mirrors(galaxy, client, store, tree, monkeypatch):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
-    real_extract = reconcile_mod.ext.extract_bytes
+    real = tree.run
 
-    def broken(data):
-        raise RuntimeError("parser bug")
+    def failing_extraction(command, *args):
+        out = real(command, *args)
+        for change in out["versions"]:
+            if change["result"] == "added":
+                change["details"] = {**(change["details"] or {}), "error": "ValueError: parser bug"}
+        return out
 
-    monkeypatch.setattr(reconcile_mod.ext, "extract_bytes", broken)
-    res = reconcile(client, store, "ns", "coll")
-    assert res.added == ["1.0.0"]  # the artifact is mirrored regardless
-    (line,) = store.read_index("ns", "coll")
-    assert store.read_artifact(line["sha256"]) is not None
-    assert extraction(store, line["sha256"]) is None
+    monkeypatch.setattr(tree, "run", failing_extraction)
+    res = run(client, store, tree)
+    assert res.added == ["1.0.0"]
     (failure,) = store.state["failures"].values()
-    assert failure["kind"] == "extract_error"
+    assert (failure["version"], failure["kind"], failure["message"]) == (
+        "1.0.0",
+        "extract_error",
+        "ValueError: parser bug",
+    )
 
-    monkeypatch.setattr(reconcile_mod.ext, "extract_bytes", real_extract)
-    res = reconcile(client, store, "ns", "coll")
-    assert res.reextracted == ["1.0.0"]
-    assert extraction(store, line["sha256"])["plugins"] == [
-        {"type": "module", "name": "thing", "short_description": "A thing"}
-    ]
-    assert store.state["failures"] == {}
+    # A later reconcile doesn't clear it, as only a new extractor heals one.
+    monkeypatch.undo()
+    run(client, store, tree)
+    assert [f["kind"] for f in store.state["failures"].values()] == ["extract_error"]
 
 
-def test_failure_report_counts(galaxy, client, store):
+def test_failure_report_counts(galaxy, client, store, tree, tmp_path):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     good = galaxy.routes[DETAIL.format("1.0.0")]
-    galaxy.routes[DETAIL.format("1.0.0")] = UNAVAILABLE
-    reconcile(client, store, "ns", "coll")
+    galaxy.routes[DETAIL.format("1.0.0")] = FORBIDDEN
+    run(client, store, tree)
     report = store.failure_report()
     assert report.summary == Summary(outstanding=1, new=1, resolved=0, conflicts=0)
-    assert "| ns.coll | 1.0.0 | galaxy_unavailable | 20" in report.markdown
-    assert [f["attempts"] for f in store.state["failures"].values()] == [1]
+    assert "| ns.coll | 1.0.0 | galaxy_http_403 | 20" in report.markdown
 
-    later = reload(store)
+    store, tree = later(store, tree, tmp_path)
     galaxy.routes[DETAIL.format("1.0.0")] = good
-    reconcile(client, later, "ns", "coll")
-    assert later.failure_report().summary == Summary(outstanding=0, new=0, resolved=1, conflicts=0)
+    run(client, store, tree)
+    assert store.failure_report().summary == Summary(outstanding=0, new=0, resolved=1, conflicts=0)
 
 
-def test_outdated_extractions_are_rerun(galaxy, client, store):
-    galaxy.add_collection("ns", "coll", ["1.0.0"])
-    reconcile(client, store, "ns", "coll")
-    (line,) = store.read_index("ns", "coll")
-    current = extraction(store, line["sha256"])
-    assert current["format"] == EXTRACTION_FORMAT
-
-    # Up to date: left alone.
-    assert reconcile(client, store, "ns", "coll").reextracted == []
-
-    # An older format, or from before results had one.
-    for stale in ({**current, "format": 0}, {"extractor": 2, "plugins": [], "routing": {}}):
-        store.save_extractions("ns", "coll", {line["sha256"]: stale})
-        assert reconcile(client, store, "ns", "coll").reextracted == ["1.0.0"]
-        assert extraction(store, line["sha256"]) == current
-
-
-def test_bad_and_mismatched_artifacts_are_not_mirrored(galaxy, client, store):
+def test_bad_and_mismatched_artifacts_are_not_mirrored(galaxy, client, store, tree):
     galaxy.add_collection(
         "ns",
         "coll",
         ["1.0.0", "2.0.0"],
         blobs={"1.0.0": b"not a tarball", "2.0.0": artifact("ns", "other", "2.0.0")},
     )
-    res = reconcile(client, store, "ns", "coll")
+    res = run(client, store, tree)
     assert res.added == []
     kinds = sorted(f["kind"] for f in store.state["failures"].values())
     assert kinds == ["bad_artifact", "manifest_mismatch"]
 
 
-def test_sha256_mismatch_is_not_mirrored(galaxy, client, store):
+def test_sha256_mismatch_is_not_mirrored(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     galaxy.routes[DETAIL.format("1.0.0")][1]["artifact"]["sha256"] = "0" * 64
-    assert reconcile(client, store, "ns", "coll").added == []
+    assert run(client, store, tree).added == []
     (failure,) = store.state["failures"].values()
     assert failure["kind"] == "sha256_mismatch"
-    assert not list(store.dl.list(""))
+    assert not list(store.buckets.dl.list(""))
 
 
-def test_deleted_versions_are_yanked_and_restored(galaxy, client, store):
+def test_deleted_versions_are_yanked_and_restored(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
-    reconcile(client, store, "ns", "coll")
+    run(client, store, tree)
 
     galaxy.add_collection("ns", "coll", ["1.0.0"])
-    assert reconcile(client, store, "ns", "coll").yanked == ["1.1.0"]
-    assert [line["yanked"] for line in store.read_index("ns", "coll")] == [False, True]
+    res = run(client, store, tree)
+    assert (res.yanked, res.upstream) == (["1.1.0"], 1)
+    assert [line["yanked"] for line in tree.lines("ns.coll")] == [False, True]
 
     # Back with the same bytes: un-yanked, not downloaded again.
     galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
     galaxy.requests.clear()
-    res = reconcile(client, store, "ns", "coll")
+    res = run(client, store, tree)
     assert (res.unyanked, res.added) == (["1.1.0"], [])
     assert not any("/pulp/content/" in r for r in galaxy.requests)
-    assert [line["yanked"] for line in store.read_index("ns", "coll")] == [False, False]
+    assert [line["yanked"] for line in tree.lines("ns.coll")] == [False, False]
 
 
-def test_a_version_missing_from_the_listing_is_checked_before_yanking(galaxy, client, store):
+def test_a_version_missing_from_the_listing_is_checked_before_yanking(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
-    reconcile(client, store, "ns", "coll")
+    run(client, store, tree)
     listing = "/api/v3/collections/ns/coll/versions/?limit=100"
     rows = galaxy.routes[listing][1]["data"]
 
     # Paging shifted 1.1.0 past us, but its own page is still there: kept.
     galaxy.json(listing, {"data": [r for r in rows if r["version"] == "1.0.0"], "links": {"next": None}})
-    assert reconcile(client, store, "ns", "coll").yanked == []
+    assert run(client, store, tree).yanked == []
 
     # Galaxy can't say: kept, and the check is retried.
-    galaxy.routes[DETAIL.format("1.1.0")] = UNAVAILABLE
-    res = reconcile(client, store, "ns", "coll")
+    galaxy.routes[DETAIL.format("1.1.0")] = FORBIDDEN
+    res = run(client, store, tree)
     assert (res.yanked, len(res.errors)) == ([], 1)
     assert [e["version"] for e in store.state["failures"].values()] == ["1.1.0"]
 
     # Deleted: its page is a 404.
     del galaxy.routes[DETAIL.format("1.1.0")]
-    assert reconcile(client, store, "ns", "coll").yanked == ["1.1.0"]
+    assert run(client, store, tree).yanked == ["1.1.0"]
     assert not store.state["failures"]
 
 
-def test_deleted_collection_is_yanked(galaxy, client, store):
+def test_deleted_collection_is_yanked(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
-    reconcile(client, store, "ns", "coll")
+    run(client, store, tree)
     store.record_failure("ns.coll", None, "galaxy_unavailable", "earlier")
 
     galaxy.remove_collection("ns", "coll")
-    res = reconcile(client, store, "ns", "coll")
-    assert res.yanked == ["1.0.0"]
-    assert store.read_index("ns", "coll")[0]["yanked"]
+    res = run(client, store, tree)
+    assert (res.yanked, res.upstream) == (["1.0.0"], 0)
+    assert tree.lines("ns.coll")[0]["yanked"]
     assert store.state["failures"] == {}
+    assert "upstream_updated" not in store.collection_state("ns.coll")
 
     # Never mirrored: nothing to write.
-    assert not reconcile(client, store, "ns", "never").changed
-    assert store.read_index("ns", "never") == []
+    assert not run(client, store, tree, "never").changed
+    assert "ns.never" not in tree.listing
 
 
-def test_repacked_artifact_keeps_ours_silently(galaxy, client, store):
+def test_a_collection_that_cant_be_listed_fails_whole(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
-    reconcile(client, store, "ns", "coll")
-    (original,) = store.read_index("ns", "coll")
+    galaxy.routes["/api/v3/collections/ns/coll/versions/?limit=100"] = FORBIDDEN
+    with pytest.raises(ReconcileFailed) as e:
+        run(client, store, tree)
+    assert e.value.kind == "galaxy_http_403"
+
+
+def test_repacked_artifact_keeps_ours_silently(galaxy, client, store, tree):
+    galaxy.add_collection("ns", "coll", ["1.0.0"])
+    run(client, store, tree)
+    (original,) = tree.lines("ns.coll")
 
     # The same files rebuilt: new bytes and a new upload time.
     galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", mtime=1_800_000_000))
-    res = reconcile(client, store, "ns", "coll")
+    res = run(client, store, tree)
     assert (list(res.repacked), res.conflicts) == (["1.0.0"], [])
-    (line,) = store.read_index("ns", "coll")
-    assert line == original  # same bytes, no flag
+    assert tree.lines("ns.coll") == [original]  # same bytes, no flag
     assert store.state["conflicts"] == []
     assert store.state["failures"] == {}
 
     # Compared once: --revalidate reuses the verdict without downloading again.
     galaxy.requests.clear()
-    res = reconcile(client, store, "ns", "coll", revalidate=True)
+    res = run(client, store, tree, revalidate=True)
     assert list(res.repacked) == ["1.0.0"]
     assert not any("/pulp/content/" in r for r in galaxy.requests)
 
 
-def test_changed_contents_are_a_conflict(galaxy, client, store):
+def test_changed_contents_are_a_conflict(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
-    reconcile(client, store, "ns", "coll")
-    (original,) = store.read_index("ns", "coll")
+    run(client, store, tree)
+    (original,) = tree.lines("ns.coll")
     first_upload = galaxy.uploaded[("ns", "coll", "1.0.0")]
     first_blob = galaxy.blobs[("ns", "coll", "1.0.0")]
 
     changed = artifact("ns", "coll", "1.0.0", modules=("other",))
     galaxy.replace("ns", "coll", "1.0.0", changed)
-    res = reconcile(client, store, "ns", "coll")
+    res = run(client, store, tree)
     assert res.conflicts == ["1.0.0"]
-    (line,) = store.read_index("ns", "coll")
-    assert line == original  # ours is kept, and the index doesn't change
+    assert tree.lines("ns.coll") == [original]  # ours is kept, and the index doesn't change
     (conflict,) = store.open_conflicts()
     upstream = hashlib.sha256(changed).hexdigest()
     (observed,) = conflict["observed"]
     assert observed["sha256"] == upstream
-    assert observed["uploaded"] == rfc3339(galaxy.uploaded[("ns", "coll", "1.0.0")])
-    assert observed["changes"] == "added plugins/modules/other.py; removed plugins/modules/thing.py"
+    assert observed["changes"] == (
+        "added plugins/modules/other.py; removed plugins/modules/thing.py; changed FILES.json, MANIFEST.json"
+    )
     assert store.state_bucket.read(observed["saved"]) == changed
     assert conflict["opened"] == observed["seen"]
     assert store.state["failures"] == {}  # reported as a conflict, not retried as a failure
@@ -265,201 +301,201 @@ def test_changed_contents_are_a_conflict(galaxy, client, store):
 
     # Seen again: still one open conflict, and no new download.
     galaxy.requests.clear()
-    assert reconcile(client, store, "ns", "coll", revalidate=True).conflicts == ["1.0.0"]
+    assert run(client, store, tree, revalidate=True).conflicts == ["1.0.0"]
     assert len(store.state["conflicts"]) == 1
     assert not any("/pulp/content/" in r for r in galaxy.requests)
 
     # Different bytes again before it's resolved: added to the open conflict.
     again = artifact("ns", "coll", "1.0.0", modules=("third",))
     galaxy.replace("ns", "coll", "1.0.0", again)
-    assert reconcile(client, store, "ns", "coll").conflicts == ["1.0.0"]
+    assert run(client, store, tree).conflicts == ["1.0.0"]
     (updated,) = store.state["conflicts"]
     first, latest = updated["observed"]
     assert first == observed
     assert latest["sha256"] == hashlib.sha256(again).hexdigest()
-    assert latest["changes"] == "added plugins/modules/third.py; removed plugins/modules/thing.py"
     assert store.state_bucket.read(latest["saved"]) == again
     assert updated["opened"] == conflict["opened"]
-    report = store.failure_report()
-    assert f"| ns.coll | 1.0.0 | {original['sha256'][:12]} | {latest['sha256'][:12]} | 2 |" in report.markdown
 
     # Back to a build already observed: compared again, but not repeated.
     galaxy.replace("ns", "coll", "1.0.0", changed)
-    assert reconcile(client, store, "ns", "coll").conflicts == ["1.0.0"]
+    assert run(client, store, tree).conflicts == ["1.0.0"]
     assert [o["sha256"] for o in store.state["conflicts"][0]["observed"]] == [upstream, latest["sha256"]]
 
-    # Galaxy serves our artifact again (re-uploading it brings back its old upload time).
+    # Galaxy serves our artifact again, with its old upload time, so galaxy-mirror has no reason to check it.
     galaxy.replace("ns", "coll", "1.0.0", first_blob, uploaded=first_upload)
-    res = reconcile(client, store, "ns", "coll")
+    res = run(client, store, tree)
     assert (res.resolved, res.conflicts) == (["1.0.0"], [])
     assert store.open_conflicts() == []
     assert "resolved" in store.state["conflicts"][0]
 
 
-def test_conflict_comparison_failures(galaxy, client, store, monkeypatch):
+def test_conflict_comparison_failures(galaxy, client, store, tree, monkeypatch):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
-    reconcile(client, store, "ns", "coll")
-    (original,) = store.read_index("ns", "coll")
+    run(client, store, tree)
+    (original,) = tree.lines("ns.coll")
     filename = "ns-coll-1.0.0.tar.gz"
 
     # A failed download is retried on the next run.
     galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", modules=("other",)))
     good = galaxy.routes.pop(f"/pulp/content/{filename}?sig=x")
-    reconcile(client, store, "ns", "coll")
+    run(client, store, tree)
     (failure,) = store.state["failures"].values()
     assert failure["kind"] == "galaxy_http_404"
     assert failure["message"].startswith("download for comparison: ")
     galaxy.routes[f"/pulp/content/{filename}?sig=x"] = good
-    assert reconcile(client, store, "ns", "coll").conflicts == ["1.0.0"]
+    assert run(client, store, tree).conflicts == ["1.0.0"]
 
     # Bytes that don't match Galaxy's sha256.
     galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", modules=("third",)))
     galaxy.routes[f"/pulp/content/{filename}?sig=x"] = (200, b"tampered", {})
-    reconcile(client, store, "ns", "coll")
+    run(client, store, tree)
     assert {f["kind"] for f in store.state["failures"].values()} == {"sha256_mismatch"}
 
     # Unreadable on Galaxy's side, or our artifact missing: still an open conflict.
-    unreadable = b"not a tarball"
-    galaxy.replace("ns", "coll", "1.0.0", unreadable)
-    reconcile(client, store, "ns", "coll")
+    galaxy.replace("ns", "coll", "1.0.0", b"not a tarball")
+    run(client, store, tree)
     assert store.open_conflicts()[-1]["observed"][-1]["changes"].startswith("Galaxy's artifact can't be read")
     galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", modules=("fourth",)))
-    monkeypatch.setattr(store, "read_artifact", lambda sha256: None)
-    reconcile(client, store, "ns", "coll")
+    monkeypatch.setattr(tree, "read_artifact", lambda sha256: None)
+    run(client, store, tree)
     assert (
         store.open_conflicts()[-1]["observed"][-1]["changes"]
         == f"the mirror's artifact {original['sha256']} is missing"
     )
-    monkeypatch.setattr(store, "read_artifact", lambda sha256: b"corrupt")
+    monkeypatch.setattr(tree, "read_artifact", lambda sha256: b"corrupt")
     galaxy.replace("ns", "coll", "1.0.0", artifact("ns", "coll", "1.0.0", modules=("fifth",)))
-    reconcile(client, store, "ns", "coll")
+    run(client, store, tree)
     assert store.open_conflicts()[-1]["observed"][-1]["changes"].startswith("the mirror's artifact can't be read")
 
 
-def test_old_conflict_failures_are_cleared(galaxy, client, store):
+def test_old_version_failures_are_cleared(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
-    reconcile(client, store, "ns", "coll")
-    store.record_failure("ns.coll", "1.0.0", "upstream_conflict", "from before conflicts were reported separately")
-    store.record_failure("ns.coll", "1.0.0", "extract_error", "heals on its own")
-    reconcile(client, store, "ns", "coll", revalidate=True)
+    run(client, store, tree)
+    store.record_failure("ns.coll", "1.0.0", "galaxy_unavailable", "checking it earlier")
+    store.record_failure("ns.coll", "1.0.0", "extract_error", "only heals with a new extractor")
+    run(client, store, tree, revalidate=True)
     assert [f["kind"] for f in store.state["failures"].values()] == ["extract_error"]
 
 
-def test_revalidate_with_unchanged_bytes(galaxy, client, store):
+def test_revalidate_with_unchanged_bytes(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
-    reconcile(client, store, "ns", "coll")
-    res = reconcile(client, store, "ns", "coll", revalidate=True)
+    run(client, store, tree)
+    res = run(client, store, tree, revalidate=True)
     assert (res.conflicts, res.added, res.changed) == ([], [], False)
 
 
-def test_deprecation_follows_galaxy(galaxy, client, store):
+def test_deprecation_follows_galaxy(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0"], deprecated=True)
-    reconcile(client, store, "ns", "coll")
-    assert store.read_index("ns", "coll")[0]["deprecated"] is True
+    assert run(client, store, tree).deprecated is True
+    assert tree.lines("ns.coll")[0]["deprecated"] is True
 
     galaxy.add_collection("ns", "coll", ["1.0.0"])
-    reconcile(client, store, "ns", "coll")
-    assert "deprecated" not in store.read_index("ns", "coll")[0]
+    assert run(client, store, tree).deprecated is False
+    assert "deprecated" not in tree.lines("ns.coll")[0]
 
 
-def test_failures_for_versions_gone_from_galaxy_are_cleared(galaxy, client, store):
+def test_failures_for_versions_gone_from_galaxy_are_cleared(galaxy, client, store, tree):
     galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
-    galaxy.routes[DETAIL.format("1.1.0")] = UNAVAILABLE
-    reconcile(client, store, "ns", "coll")
+    galaxy.routes[DETAIL.format("1.1.0")] = FORBIDDEN
+    run(client, store, tree)
     assert len(store.state["failures"]) == 1
 
     galaxy.add_collection("ns", "coll", ["1.0.0"])
-    reconcile(client, store, "ns", "coll")
+    run(client, store, tree)
     assert store.state["failures"] == {}
 
 
 @pytest.mark.parametrize("name", [("ns", "../x"), ("NS", "coll"), ("ns", "a/b"), ("", "coll")])
-def test_invalid_names_are_rejected(client, store, name):
+def test_invalid_names_are_rejected(client, store, tree, name):
     with pytest.raises(ValueError, match="invalid collection name"):
-        reconcile(client, store, *name)
+        reconcile(client, store, tree, *name)
 
 
-def test_deadline_defers_new_versions(galaxy, client, store, monkeypatch):
+def test_deadline_defers_new_versions(galaxy, client, store, tree, monkeypatch):
     galaxy.add_collection("ns", "coll", ["2.0.0", "1.0.0", "1.1.0"])
+    monkeypatch.setattr(reconcile_mod, "CHUNK", 1)
 
-    # Out of time before anything was mirrored: no empty index file.
-    res = reconcile(client, store, "ns", "coll", deadline=0)
-    assert res.deferred == ["2.0.0", "1.0.0", "1.1.0"]  # oldest upload first
-    assert not store.index_collections()
+    # Out of time after the first chunk: what's mirrored is published, oldest upload first.
+    res = run(client, store, tree, deadline=0)
+    assert (res.added, res.deferred) == (["2.0.0"], ["1.0.0", "1.1.0"])
+    assert [line["vers"] for line in tree.lines("ns.coll")] == ["2.0.0"]
+    assert res.upstream == 3
     assert "upstream_updated" not in store.collection_state("ns.coll")
 
-    # Out of time part way: what's mirrored is written, in publication order.
-    # Each mirror takes a minute; the deadline passes after the second.
-    clock = [0.0]
-    mirror = reconcile_mod._Reconcile._mirror
-
-    def slow_mirror(self, v):
-        clock[0] += 60
-        return mirror(self, v)
-
-    monkeypatch.setattr(reconcile_mod.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(reconcile_mod._Reconcile, "_mirror", slow_mirror)
-    res = reconcile(client, store, "ns", "coll", deadline=120)
-    monkeypatch.undo()
-    assert res.added == ["2.0.0", "1.0.0"]
-    assert res.deferred == ["1.1.0"]
-    assert [line["vers"] for line in store.read_index("ns", "coll")] == ["2.0.0", "1.0.0"]
-
-    res = reconcile(client, store, "ns", "coll")
-    assert (res.added, res.deferred) == (["1.1.0"], [])
-    assert [line["vers"] for line in store.read_index("ns", "coll")] == ["2.0.0", "1.0.0", "1.1.0"]
+    res = run(client, store, tree)
+    assert (res.added, res.deferred) == (["1.0.0", "1.1.0"], [])
+    assert [line["vers"] for line in tree.lines("ns.coll")] == ["2.0.0", "1.0.0", "1.1.0"]
     assert store.collection_state("ns.coll")["upstream_updated"]
 
 
-def test_extractions_are_read_once(galaxy, client, store, monkeypatch):
-    galaxy.add_collection("ns", "coll", ["1.0.0"])
-    assert reconcile(client, store, "ns", "coll").added == ["1.0.0"]
-    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
-
-    reads: list[str] = []
-    monkeypatch.setattr(store.state_bucket, "read", _recording(store.state_bucket.read, reads))
-    assert reconcile(client, store, "ns", "coll").added == ["1.1.0"]
-    assert reads.count("extract/ns/coll.json.zst") == 1  # every extraction in one read
-
-
-def _recording(read, reads):
-    def recorded(key):
-        reads.append(key)
-        return read(key)
-
-    return recorded
-
-
-def test_progress_is_saved_part_way(galaxy, client, store, monkeypatch):
+def test_a_run_that_stops_mirrors_again(galaxy, client, store, tree, tmp_path, monkeypatch):
     versions = ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]
     galaxy.add_collection("ns", "coll", versions)
-    monkeypatch.setattr(store_mod, "SAVE_EVERY", 2)
-    mirror = reconcile_mod._Reconcile._mirror
+    monkeypatch.setattr(reconcile_mod, "CHUNK", 2)
+    publish = tree.publish
+    calls = []
 
-    def stopping_mirror(self, v):
-        if v["version"] == "1.4.0":
+    def stopping(out):
+        calls.append(out)
+        if len(calls) == 2:
             raise KeyboardInterrupt  # the run stops
-        return mirror(self, v)
+        publish(out)
 
-    monkeypatch.setattr(reconcile_mod._Reconcile, "_mirror", stopping_mirror)
+    monkeypatch.setattr(tree, "publish", stopping)
     with pytest.raises(KeyboardInterrupt):
-        reconcile(client, store, "ns", "coll")
-    monkeypatch.setattr(reconcile_mod._Reconcile, "_mirror", mirror)
+        run(client, store, tree)
+    monkeypatch.undo()
 
-    # What the next run sees: four versions written, with their state.
-    later = Store(store.buckets, store.dl_url)
-    assert [line["vers"] for line in later.read_index("ns", "coll")] == versions[:4]
-    assert sorted(later.collection_state("ns.coll")["versions"]) == versions[:4]
-
-    res = reconcile(client, later, "ns", "coll")
-    assert res.added == ["1.4.0"]
-    assert [line["vers"] for line in later.read_index("ns", "coll")] == versions
+    # collections.json wasn't published, so the next run mirrors the collection again, from its first version.
+    store, tree = Store(store.buckets), Tree(store.buckets, tmp_path / "later")
+    assert run(client, store, tree).added == versions
+    assert [line["vers"] for line in tree.lines("ns.coll")] == versions
 
 
-def test_lost_version_state_is_recorded_again(galaxy, client, store):
+def test_out_of_date_plugins_are_extracted_again(galaxy, client, store, tree, tmp_path):
+    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
+    run(client, store, tree)
+    store, tree = later(store, tree, tmp_path)
+    store.state_bucket.delete("plugin-cache/ns/coll.jsonl.zst")
+
+    # From the artifacts in the dl bucket, as the collection is reconciled.
+    res = run(client, store, tree)
+    assert (res.added, res.reextracted) == ([], ["1.0.0", "1.1.0"])
+    assert store.state_bucket.read("plugin-cache/ns/coll.jsonl.zst") is not None
+    assert not (tree.dl).exists()
+
+    # One whose artifact is gone from the dl bucket is a failure.
+    store, tree = later(store, tree, tmp_path)
+    store.state_bucket.delete("plugin-cache/ns/coll.jsonl.zst")
+    (line, _) = tree.lines("ns.coll")
+    store.buckets.dl.delete(tree.artifact_key(line["sha256"]))
+    res = run(client, store, tree)
+    assert res.reextracted == ["1.1.0"]
+    assert [(f["version"], f["kind"]) for f in store.state["failures"].values()] == [("1.0.0", "artifact_missing")]
+
+
+def test_generate_plugins(galaxy, client, store, tree, tmp_path):
+    galaxy.add_collection("ns", "coll", ["1.0.0", "1.1.0"])
+    run(client, store, tree)
+    store, tree = later(store, tree, tmp_path)
+
+    # By default every version, whatever the cache says. From the cache, only what's out of date.
+    assert reconcile_mod.generate_plugins(store, tree, "ns.coll") == ["1.0.0", "1.1.0"]
+    assert reconcile_mod.generate_plugins(store, tree, "ns.coll", from_plugin_cache=True) == []
+    store.state_bucket.delete("plugin-cache/ns/coll.jsonl.zst")
+    store, tree = later(store, tree, tmp_path)
+    assert reconcile_mod.generate_plugins(store, tree, "ns.coll", from_plugin_cache=True) == ["1.0.0", "1.1.0"]
+    assert not tree.dl.exists()
+
+
+def test_generate_indexes(galaxy, client, store, tree, tmp_path):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
-    _ = reconcile(client, store, "ns", "coll")
-    created = store.collection_state("ns.coll")["versions"].pop("1.0.0")["created_at"]
-    res = reconcile(client, store, "ns", "coll")
-    assert not res.changed
-    assert store.collection_state("ns.coll")["versions"]["1.0.0"] == {"created_at": created}
+    run(client, store, tree)
+    store, tree = later(store, tree, tmp_path)
+
+    # Lines already as the artifacts give them don't change, but are read from the artifacts all the same.
+    assert reconcile_mod.generate_indexes(store, tree, "ns.coll") == []
+    (line,) = tree.lines("ns.coll")
+    store.buckets.dl.delete(tree.artifact_key(line["sha256"]))
+    assert reconcile_mod.generate_indexes(store, tree, "ns.coll") == []
+    assert [(f["version"], f["kind"]) for f in store.state["failures"].values()] == [("1.0.0", "artifact_missing")]

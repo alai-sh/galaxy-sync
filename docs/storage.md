@@ -7,14 +7,18 @@ bucket.
 
 | Bucket | Local directory | Served as | Cache |
 |---|---|---|---|
-| Index | `index-root/` | `index.alai.sh` | `public, max-age=600, stale-while-revalidate=86400` with ETags, but `public, max-age=31536000, immutable` for `index/` |
+| Index | `index-root/` | `index.alai.sh` | `public, max-age=600` with ETags, but `public, max-age=31536000, immutable` for `index/` |
 | Artifacts | `dl-root/` | `dl.alai.sh` | `public, max-age=31536000, immutable` |
 | State | `state/` | Private | |
 
+The index itself is built by [alai-index](https://github.com/alai-sh/alai-index),
+which works on files on disk. A run copies what it needs from the buckets
+and publishes what alai-index wrote ([below](#the-alai-index-tree)).
+
 `config.json` holds the artifact URL template, so the artifact bucket can
 move without changing clients. A new store starts with the `dl.alai.sh`
-one, and `refresh --dl TEMPLATE` moves it; every other run keeps whatever
-it holds, so editing `config.json` by hand works too.
+one. alai-index refuses to change `config.json` once the index has
+collections, as their files would be left where the old one put them.
 
 ## Layout
 
@@ -31,13 +35,14 @@ artifact bucket
 
 state bucket
   state.json                   cursors, the queue, per-collection state, the failure ledger, conflicts
-  requests/<time>-<id>.json    `refresh` requests (reconcile, sweep, rebuild or dl) waiting for the next sync
-  builtin.jsonl                ansible.builtin's plugin lines, from ansible-core's sdist
-  extract/<ns>/<name>.json.zst each collection's stored extractions, by artifact sha256
+  requests/<time>-<id>.json    `request`s (mirror, sweep, generate-plugins or generate-indexes) waiting for the next sync
+  plugin-cache/<ns>/<name>.jsonl.zst  alai-index's plugin cache, each collection's file zstd-compressed
   conflicts/<aa>/<sha256>.tar.gz  Galaxy's artifact for each conflict
 ```
 
 The formats clients read are specified in [index-spec/](index-spec/README.md).
+`ansible.builtin`'s plugins aren't in `plugins.jsonl`, as alai-cli has them
+itself.
 
 Every write is skipped when the stored content is already the same, so an
 unchanged run writes nothing.
@@ -47,19 +52,17 @@ unchanged run writes nothing.
 Each collection's index file is published once, by its sha256:
 `index/<aa>/<sha256>.jsonl` in the index bucket. Clients find it through the
 template `index/{sha256-prefix}/{sha256-checksum}.jsonl` in `config.json`
-and the collection's sha256 in `collections.json`; the sync finds it through
-the same sha256 in `state.json` (`collections.<ns.name>.sha256`), which is
-what `collections.json` is written from. A published file never changes, so
-it's cached for a year, like an artifact, and never purged.
+and the collection's sha256 in `collections.json`, and the sync finds it the
+same way. `collections.json` is the index's record of each collection's
+current index file. A published file never changes, so it's cached for a
+year, like an artifact, and never purged.
 
-When a file changes, the new one is published, then state points at it.
-Nothing is overwritten: a published file stays until pruned. A run that
-stops before saving state leaves it pointing at the file it was replacing,
-so `collections.json` never names one that isn't published, and the next
-run reconciles that collection again from there: what it had mirrored since
-state was last saved, at most 100 versions, is downloaded again. A second
-copy by name, in the state bucket, would avoid that, for a GET and PUT more
-on every change; a run stopping part way is rare enough not to.
+When a file changes, the new one is published straight away. Nothing is
+overwritten, and a published file stays until pruned. `collections.json` is
+published later, at the end of the run and before each save of `state.json`,
+after every file it names. A run that stops before then leaves the published
+`collections.json` naming the old file. The collection is still queued, so
+the next run reconciles it again from there.
 
 **Pruning.** Once a day, a run that writes `collections.json` lists the
 index bucket's `index/` and retires each file that listing doesn't name,
@@ -77,17 +80,47 @@ a run that stopped.
 | `feed_cursor` | `pulp_created` of the newest upload `sync` has seen |
 | `repo_published` | The repo metadata timestamp at the last `sync` |
 | `last_sweep` | When the last sweep finished; the next is due a day later |
-| `builtin` | The daily ansible-core check: `checked`, and the `version` and `format` (`EXTRACTION_FORMAT`) `builtin.jsonl` was extracted with |
-| `rebuild` | A requested rebuild that isn't finished: `requested`, and `after`, the last collection done |
+| `jobs` | Requested jobs that aren't done yet, in order: `action` (`generate-plugins` or `generate-indexes`), `requested`, `targets` (none for every collection), `from_plugin_cache`, and `after`, the last collection done |
 | `retired_index_files` | Index bucket keys under `index/` that no `collections.json` names, and when a prune first found each |
 | `last_prune` | When retired index files were last pruned; the next is due a day later |
-| `plugins_pending` | Collections reconciled since `plugins.jsonl` was last merged; normally empty between runs |
 | `pending.<ns.name>` | The queue: `source` (`requested`, `uploaded`, `listed` or `swept`), `queued`, `revalidate` if asked for, and what change detection saw, so a reconcile that changes nothing can say why it ran: `uploads` (versions the upload feed saw), `unseen` (mirrored versions the sweep didn't see) and `reasons` (e.g. `updated_at changed` from the listing, `gone: 1.1.0` from the sweep) |
-| `collections.<ns.name>` | Per collection: `updated` (when its index file last changed), `sha256` (of its index file, the key it's published under: the only record of which file is the collection's; a collection without one has no index file), `upstream_updated`, `upstream_deprecated` and `upstream_count` (Galaxy's values at the last reconcile), `unindexed` (versions Galaxy serves that its search index leaves out), and `versions.<v>` with `created_at` and the cached `upstream` comparison verdict |
+| `collections.<ns.name>` | Per collection, what change detection compares Galaxy with. `upstream_updated`, `upstream_deprecated` and `upstream_count` are Galaxy's values at the last reconcile, and `mirrored` is how many of its versions the index has that aren't yanked. `unindexed` lists versions Galaxy serves that its search index leaves out. `verdicts.<v>` is the last comparison of the artifact Galaxy serves for a version with ours, when they differ, with its `sha256`, `same_contents` and `uploaded` |
 | `failures` | The failure ledger, keyed `<ns.name>@<version>#<kind>`: `collection`, `version`, `kind`, `message`, `first_seen`, `last_seen`, `attempts`, and `alerted` once it was notified as persistent |
 | `conflicts` | Versions where Galaxy serves different contents from the mirror ([conflicts](sync.md#conflicts)): `collection`, `version`, `ours`, `opened`, `observed` (each differing artifact: `sha256`, `uploaded`, `seen`, `changes` and `saved`, its key in this bucket), and `resolved` once Galaxy serves our contents again. At most one is open per version, and none is ever removed |
 
 The failure kinds are listed in [sync.md](sync.md#failures-and-conflicts).
+
+## The alai-index tree
+
+Each `sync` works on an alai-index tree in a temporary directory. At the
+start of the run it holds `config.json` and `collections.json`. A
+collection's index file and plugin cache file are fetched into it when it's
+reconciled, and `plugins.jsonl` before the first change. alai-index's JSON
+output lists every file a command wrote, and they're published straight after
+it, apart from `plugins.jsonl` and `collections.json`.
+
+- **Artifacts** go to the artifact bucket first, at the path of their URL,
+  and are deleted from the tree, so a long run doesn't fill the disk.
+- **The plugin cache** goes to `plugin-cache/<ns>/<name>.jsonl.zst` in the
+  state bucket, zstd-compressed (`tree.ZSTD_LEVEL`). alai-index documents
+  where each collection's file is, but what's in it is alai-index's own, so
+  the sync only copies it. A file missing from the bucket is made again by
+  alai-index from the artifacts.
+- **Index files** go to the index bucket, in the order alai-index gives.
+- **`plugins.jsonl` and `collections.json`** go to the index bucket at the
+  end of the run, and before each save of `state.json`. So state never says a
+  collection is done while the published `collections.json` names its old
+  index file.
+
+An extraction that's missing or out of date, after an alai-index upgrade or
+a lost cache file, is listed in the output as `outdated`. Reconcile fetches
+those artifacts from the artifact bucket, extracts their plugins again, and
+publishes the result. `request generate-plugins --from-plugin-cache` does the
+same for every collection over as many runs as it takes.
+
+`scripts/migrate_to_alai_index.py` builds every collection's plugin cache up
+front from the published index, rather than as each collection is next
+reconciled.
 
 ## R2
 
@@ -114,11 +147,14 @@ save it.
 The index bucket's files that change (`config.json`, `collections.json`,
 `plugins.jsonl` and the conflict records) are cached for their `max-age`,
 10 minutes, by Cloudflare and by browsers and other caches after it. Once
-Cloudflare's copy expires, `stale-while-revalidate` has it answer the next
-request from that copy at once, `UPDATING`, while it fetches the file from
-R2 for the requests after, so no request waits for R2 unless Cloudflare has
-dropped its copy, or hasn't had one. Index files are named by their sha256,
-so they never change and are cached for a year.
+Cloudflare's copy expires, the next request at that Cloudflare location
+waits while it fetches the file from R2 again, about 0.65 s from Brisbane.
+There's no `stale-while-revalidate` (dropped 2026-11-03). It let Cloudflare
+answer at once from an expired copy, but at a location with few requests
+that copy could be hours old, and a client then saw an index that far
+behind. Waiting for R2 once every 10 minutes is worth always getting a copy
+at most one sync old. Index files are named by their sha256, so they never
+change and are cached for a year.
 
 Nothing is purged (2026-10-26). A change reaches clients up to 10 minutes
 after the sync that made it, and as `collections.json` names index files by
@@ -134,13 +170,8 @@ needed a Cloudflare API token in the sync's environment.
 a client's copy is at most about one sync behind; change
 `storage.INDEX_CACHE` with the schedule.
 
-There's no `s-maxage`. Cloudflare treats it as `proxy-revalidate` and so
-never serves an expired copy, which turns `stale-while-revalidate` off
-([Cloudflare's Cache-Control directives](https://developers.cloudflare.com/cache/concepts/cache-control/)):
-with `max-age=60, s-maxage=600, stale-while-revalidate=86400`, every
-request after Cloudflare's copy expired came back `REVALIDATED`, having
-waited for R2 (tested 2026-10-26). Enabling Always Online on the zone would
-turn it off too.
+There's no `s-maxage`, so Cloudflare and clients keep a copy for the same
+10 minutes.
 
 A file keeps the Cache-Control it was written with until it's written
 again, and the sync skips writes whose content is unchanged, so after
@@ -186,32 +217,21 @@ writes.
 Class B reads are what a run costs most of, so a run reads only what it
 works on:
 
-- **`plugins.jsonl`** is patched, not rebuilt. Reconcile works out each
-  collection's plugin lines from the extractions it already read, and
-  queues the collection in `plugins_pending`. The run ends by reading
-  `plugins.jsonl`, replacing those collections' lines, and
-  `ansible.builtin`'s with `builtin.jsonl`, and writing it back.
-  A collection left pending by a run that stopped before merging has its
-  lines worked out again from its index file and extractions. Only a
-  rebuild reads every collection's (~4.6k of each once the mirror is
-  full) to make them all again.
-- **Extractions are one object per collection**, Zstandard-compressed JSON
-  keyed by artifact sha256. Reconcile needs every version's extraction, to
-  re-extract outdated ones and to build the plugin lines, so it reads one
-  object rather than one per version, and writes it once if anything
-  changed. Versions repeat each other's plugins and routing, which
-  Zstandard's long window finds and gzip's 32 KB one doesn't:
-  community.general's 243 versions are 41 MB of JSON, 5.3 MB gzipped and
-  0.27 MB as stored.
-- **Unchanged writes are skipped** by reading each object first. Mirroring a
-  version takes two calls: `HEAD` and `PUT` for the artifact (the `HEAD`
-  skips re-uploading one left by a run that stopped before writing its
-  index file). A changed index file is one `PUT`, as it was by name; an
-  unchanged one is told by its sha256 in state, without a request.
+- **A collection's files are fetched only when it's reconciled.** That's
+  two objects, its plugin cache file and its index file. `plugins.jsonl` is
+  fetched once, before the first change. Only a job without targets
+  fetches every collection's files (~4.6k of each once the mirror is full).
+- **The plugin cache is one object per collection,** zstd-compressed.
+  Versions repeat each other's plugins and routing, which Zstandard's long
+  window finds and gzip's 32 KB one doesn't. community.general's 243
+  versions are 41 MB of JSON, 5.3 MB gzipped and 0.27 MB as stored.
+- **Only what alai-index wrote is published.** It doesn't rewrite a file
+  whose bytes wouldn't change, and an artifact already in the bucket isn't
+  uploaded again, which costs a `HEAD` each.
 - **Pruning lists the index bucket once a day**, one request per thousand
   index files, rather than on every run.
-- **A run with nothing to do** reads `config.json` and `state.json`, lists
-  `requests/`, and writes nothing.
+- **A run with nothing to do** reads `config.json`, `collections.json` and
+  `state.json`, lists `requests/`, and writes nothing.
 
 ## Trying the output locally
 
@@ -221,6 +241,6 @@ rest stays queued. The index lands in `out/index-root/` and the artifacts in
 `out/dl-root/`:
 
 ```bash
-uv run galaxy-sync refresh community.library_inventory_filtering_v1
+uv run galaxy-sync request mirror community.library_inventory_filtering_v1
 uv run galaxy-sync sync --budget 1
 ```

@@ -1,7 +1,7 @@
 """Finding which collections need a reconcile, from Galaxy's best-effort endpoints.
 
 `discover` is the frequent, incremental check behind `sync`; `sweep` is the
-full comparison behind `refresh`; `check_count` spots deletions neither can
+full comparison behind `request sweep`; `check_count` spots deletions neither can
 see. None of them change the index: they only pick collections for
 reconcile, which checks the contract endpoints before yanking anything.
 See docs/sync.md.
@@ -16,6 +16,7 @@ from .galaxy import GalaxyClient, GalaxyError
 from .reconcile import NAME, check_name
 from .store import GLOBAL, Store
 from .times import rfc3339
+from .tree import Tree
 
 log = logging.getLogger(__name__)
 
@@ -282,7 +283,7 @@ def _sorted(versions: set[str]) -> list[str]:
     return sorted(versions, key=semver.sort_key)
 
 
-def sweep(client: GalaxyClient, store: Store) -> Sweep:
+def sweep(client: GalaxyClient, store: Store, tree: Tree) -> Sweep:
     """Compare every published version on Galaxy with the index.
 
     Reads the whole upload feed (~530 pages) and finds versions deleted on
@@ -310,18 +311,17 @@ def sweep(client: GalaxyClient, store: Store) -> Sweep:
             published.setdefault(f"{cv['namespace']}.{cv['name']}", {})[cv["version"]] = rfc3339(cv["pulp_created"])
 
     mirrored: set[str] = set()
-    for ns, name in store.index_collections():
-        fqcn = f"{ns}.{name}"
+    log.info("reading every collection's index file")
+    for fqcn, lines in sorted(tree.published_lines().items()):
         mirrored.add(fqcn)
         upstream = published.get(fqcn, {})
-        have = {line["vers"] for line in store.read_index(ns, name) if not line["yanked"]}
+        have = {line["vers"] for line in lines if not line["yanked"]}
         cstate = store.collection_state(fqcn)
-        seen = cstate["versions"]
-        replaced = {
-            v
-            for v in have & upstream.keys()
-            if (state := seen.get(v)) and state["created_at"] and upstream[v] and state["created_at"] != upstream[v]
-        }
+        # Galaxy's upload time when it was mirrored, or of the artifact it serves instead.
+        verdicts = cstate.get("verdicts", {})
+        uploaded = {line["vers"]: line["published"] for line in lines}
+        uploaded |= {v: when for v, verdict in verdicts.items() if (when := verdict.get("uploaded"))}
+        replaced = {v for v in have & upstream.keys() if upstream[v] and uploaded[v] != upstream[v]}
         unlisted = have - upstream.keys()
         # Those back in the feed are indexed again.
         if unindexed := set(cstate.get("unindexed", [])) & unlisted:

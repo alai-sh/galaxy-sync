@@ -1,33 +1,38 @@
-name: Refresh
+name: Request
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: What to ask the next sync for
+        type: choice
+        options:
+          - mirror
+          - sweep
+          - generate-plugins
+          - generate-indexes
+        default: mirror
       targets:
-        description: Space-separated NS or NS.NAME to reconcile first; empty to run the sweep now
+        description: Space-separated NS or NS.NAME. Needed for mirror, none for sweep, and empty means every collection for generate-*
         type: string
         default: ""
       revalidate:
-        description: Also check every mirrored artifact against the one Galaxy publishes now (needs targets)
+        description: mirror only. Also check every mirrored artifact against the one Galaxy publishes now
         type: boolean
         default: false
-      rebuild:
-        description: Rebuild every file derived from the index instead, over as many syncs as it takes (leave targets empty)
+      from-plugin-cache:
+        description: generate-plugins only. Fetch only the artifacts whose plugin extraction is missing or out of date
         type: boolean
         default: false
-      dl:
-        description: Move the artifact URL template in config.json to this instead (leave targets empty)
-        type: string
-        default: ""
 
 permissions:
   contents: read
 
-# No shared concurrency group: a refresh only writes its own request object,
+# No shared concurrency group: a request only writes its own request object,
 # which the next sync takes, so it can run alongside one.
 
 jobs:
-  refresh:
-    name: refresh
+  request:
+    name: request
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: r2
@@ -57,18 +62,19 @@ jobs:
         if [ "$REVALIDATE" = "true" ]; then
           args+=(--revalidate)
         fi
-        if [ "$REBUILD" = "true" ]; then
-          args+=(--rebuild)
+        if [ "$FROM_PLUGIN_CACHE" = "true" ]; then
+          args+=(--from-plugin-cache)
         fi
-        if [ -n "$DL" ]; then
-          args+=(--dl "$DL")
+        # sweep takes no targets, and a bare -- is an error then.
+        if [ "${#targets[@]}" -gt 0 ]; then
+          args+=(-- "${targets[@]}")
         fi
-        uv run --locked galaxy-sync refresh --r2 -v "${args[@]}" -- "${targets[@]}"
+        uv run --locked galaxy-sync request "$ACTION" --r2 -v "${args[@]}"
       env:
+        ACTION: ${{ inputs.action }}
         TARGETS: ${{ inputs.targets }}
         REVALIDATE: ${{ inputs.revalidate }}
-        REBUILD: ${{ inputs.rebuild }}
-        DL: ${{ inputs.dl }}
+        FROM_PLUGIN_CACHE: ${{ inputs.from-plugin-cache }}
         R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
         R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

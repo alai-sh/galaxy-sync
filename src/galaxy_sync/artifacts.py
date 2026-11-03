@@ -1,9 +1,8 @@
-"""Reading collection tarballs.
+"""Comparing collection tarballs, to tell a repack from a real change.
 
 The sync never extracts or runs collection code. These functions only read
-member bytes from a tarball held in memory: `MANIFEST.json` to check what
-was downloaded, and a digest of the contents to tell a repack from a real
-change. Plugin extraction is alai-plugin-extractor's job (see plugins.py).
+member bytes from a tarball held in memory. Reading a collection to index it
+is alai-index's job.
 """
 
 import contextlib
@@ -12,10 +11,8 @@ import io
 import json
 import posixpath
 import tarfile
-from typing import IO, cast
+from typing import IO
 
-# Larger MANIFEST.json files are refused.
-_MAX_MANIFEST = 20 * 1024 * 1024
 # Decompressed bytes hashed per artifact before giving up, against tar bombs.
 _MAX_CONTENTS = 2 * 1024**3
 # Compared as parsed JSON, so formatting differences between builders don't count.
@@ -24,31 +21,6 @@ _JSON_FILES = ("MANIFEST.json", "FILES.json")
 
 def _member_name(member: tarfile.TarInfo) -> str:
     return posixpath.normpath(member.name).lstrip("/")
-
-
-def manifest_info(data: bytes) -> dict[str, object]:
-    """`collection_info` from a tarball's MANIFEST.json, or {} if it has none.
-
-    Raises tarfile.TarError or ValueError if the tarball or the JSON can't be
-    read. Extraction never blocks mirroring, so this is what checks that the
-    download is the collection version it claims to be.
-
-    A tarball can hold MANIFEST.json more than once (appended with `tar -r`).
-    The last one is read, as tar, ansible-galaxy and alai-plugin-extractor do.
-    """
-    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
-        found = None
-        for member in tar:
-            if member.isfile() and _member_name(member) == "MANIFEST.json":
-                found = member
-        if found is None:
-            return {}
-        if found.size > _MAX_MANIFEST:
-            raise ValueError(f"MANIFEST.json is {found.size} bytes")
-        f = tar.extractfile(found)
-        manifest: object = json.loads(f.read()) if f else None
-        info = cast(dict[str, object], manifest).get("collection_info") if isinstance(manifest, dict) else None
-        return cast(dict[str, object], info) if isinstance(info, dict) else {}
 
 
 def _sha256(f: IO[bytes]) -> str:

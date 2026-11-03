@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.15"
 authors = [{ name = "Jordan Borean", email = "jborean93@gmail.com" }]
 dependencies = [
-    "alai-plugin-extractor",
+    "alai-index",
     "boto3>=1.43.114",
 ]
 
@@ -33,9 +33,9 @@ dev = [
 module-name = "galaxy_sync"
 
 [tool.uv.sources]
-# Not on PyPI yet, so pinned to a commit. Bump `rev` to pick up extractor
+# Not on PyPI yet, so pinned to a commit. Bump `rev` to pick up alai-index
 # changes, and switch to a version pin once it's published.
-alai-plugin-extractor = { git = "https://github.com/alai-sh/alai-plugin-extractor", rev = "87a37d83f9122847fc03303a7888aa144b82189a" }
+alai-index = { git = "https://github.com/alai-sh/alai-index", rev = "5d6a42fd9dd1ba33f8b3a54f79f9c66a943ae32e" }
 
 [tool.uv]
 # Rebuild/reinstall the project when source files change (or are deleted),
@@ -100,6 +100,8 @@ ignore = [
 "tests/**" = ["S101", "RUF012"]
 # The CLI reports progress and results to the user with print.
 "src/galaxy_sync/cli.py" = ["T201"]
+# A one-off run by hand, which reports with print, fetches the live index and runs alai-index.
+"scripts/**" = ["T201", "S310", "S603"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["galaxy_sync"]

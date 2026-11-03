@@ -132,12 +132,11 @@ class Buckets:
 # The rest of the index bucket changes on every publish, and isn't purged: 10
 # minutes matches the sync's schedule, `*/10` in scheduler/wrangler.toml, so a
 # cached copy is at most about one sync behind; change both together.
-# stale-while-revalidate lets Cloudflare answer at once when its copy
-# expires, and fetch from R2 behind it. No s-maxage, which would stop that:
-# Cloudflare treats it as proxy-revalidate, so it never serves an expired
-# copy. See docs/storage.md, "Caching".
+# There's no stale-while-revalidate, so an expired copy is never served, at
+# the cost of the first request after expiry waiting for R2. See
+# docs/storage.md, "Caching".
 # The state bucket isn't public; no-store keeps it that way if it ever is.
-INDEX_CACHE = "public, max-age=600, stale-while-revalidate=86400"
+INDEX_CACHE = "public, max-age=600"
 IMMUTABLE = "public, max-age=31536000, immutable"
 PRIVATE = "private, no-store"
 # The index bucket's prefix for index files, which get IMMUTABLE.

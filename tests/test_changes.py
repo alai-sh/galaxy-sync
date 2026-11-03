@@ -22,7 +22,7 @@ def test_resolve_targets(galaxy, client):
         resolve_targets(client, ["Bad.name"])
 
 
-def test_discover_first_run_lists_everything(galaxy, client, store):
+def test_discover_first_run_lists_everything(galaxy, client, store, tree):
     galaxy.add_collection("ns", "a", ["1.0.0"])
     galaxy.add_collection("ns", "b", ["1.0.0"])
     res = discover(client, store)
@@ -31,17 +31,17 @@ def test_discover_first_run_lists_everything(galaxy, client, store):
     assert res.cursor == galaxy.uploaded[("ns", "b", "1.0.0")]
 
 
-def mirror(galaxy, client, store, *names):
+def mirror(galaxy, client, store, tree, *names):
     """Reconcile collections and record the feed cursor, as an applied discover does."""
     for name in names:
-        reconcile(client, store, "ns", name)
+        reconcile(client, store, tree, "ns", name)
     store.state["feed_cursor"] = max(galaxy.uploaded.values())
 
 
-def test_discover_feed_finds_releases_below_the_highest(galaxy, client, store):
+def test_discover_feed_finds_releases_below_the_highest(galaxy, client, store, tree):
     galaxy.add_collection("ns", "a", ["2.0.0"])
     galaxy.add_collection("ns", "b", ["1.0.0"])
-    mirror(galaxy, client, store, "a", "b")
+    mirror(galaxy, client, store, tree, "a", "b")
     res = discover(client, store)
     assert (res.collections, res.listed) == ([("ns", "b")], False)  # the cursor's own entry again
 
@@ -89,11 +89,11 @@ def test_discover_feed_stops_at_the_cursor(galaxy, client, store):
     assert (res.collections, res.cursor) == ([], "2026-04-01T00:00:00Z")
 
 
-def test_discover_listing_finds_what_the_feed_cannot(galaxy, client, store):
+def test_discover_listing_finds_what_the_feed_cannot(galaxy, client, store, tree):
     galaxy.add_collection("ns", "a", ["1.0.0"])
     galaxy.add_collection("ns", "b", ["1.0.0"])
     galaxy.add_collection("ns", "c", ["1.0.0", "2.0.0"])
-    gated(galaxy, client, store, "a", "b", "c")
+    gated(galaxy, client, store, tree, "a", "b", "c")
 
     # Deprecation, a deleted collection and a deleted highest version don't
     # reach the feed. The repo changed without an upload, so the listing runs.
@@ -105,14 +105,14 @@ def test_discover_listing_finds_what_the_feed_cannot(galaxy, client, store):
     assert (res.feed, res.listed, res.hinted) == (True, True, True)
 
     # Once the 404 has yanked it, a deleted collection isn't checked again.
-    reconcile(client, store, "ns", "b")
+    reconcile(client, store, tree, "ns", "b")
     del store.state["feed_cursor"]  # the first run always lists
     assert ("ns", "b") not in discover(client, store).collections
 
 
-def test_discover_falls_back_to_the_listing(galaxy, client, store):
+def test_discover_falls_back_to_the_listing(galaxy, client, store, tree):
     galaxy.add_collection("ns", "a", ["1.0.0"])
-    mirror(galaxy, client, store, "a")
+    mirror(galaxy, client, store, tree, "a")
     galaxy.add_collection("ns", "new", ["1.0.0"])
     galaxy.routes[FEED] = UNAVAILABLE
     res = discover(client, store)
@@ -131,15 +131,15 @@ def test_discover_falls_back_to_the_listing(galaxy, client, store):
     assert store.state["failures"] == {}
 
 
-def gated(galaxy, client, store, *names):
+def gated(galaxy, client, store, tree, *names):
     """Mirror, and record the repo metadata as an applied discover does."""
-    mirror(galaxy, client, store, *names)
+    mirror(galaxy, client, store, tree, *names)
     store.state["repo_published"] = client.repo_published()
 
 
-def test_discover_skips_an_unchanged_repo(galaxy, client, store):
+def test_discover_skips_an_unchanged_repo(galaxy, client, store, tree):
     galaxy.add_collection("ns", "a", ["1.0.0"])
-    gated(galaxy, client, store, "a")
+    gated(galaxy, client, store, tree, "a")
     galaxy.requests.clear()
     res = discover(client, store)
     assert (res.unchanged, res.ok, res.feed, res.listed, res.collections) == (True, True, False, False, [])
@@ -151,10 +151,10 @@ def test_discover_skips_an_unchanged_repo(galaxy, client, store):
     assert not discover(client, store).unchanged
 
 
-def test_discover_lists_when_the_repo_changed_without_an_upload(galaxy, client, store):
+def test_discover_lists_when_the_repo_changed_without_an_upload(galaxy, client, store, tree):
     galaxy.add_collection("ns", "a", ["1.0.0"])
     galaxy.add_collection("ns", "b", ["1.0.0"])
-    gated(galaxy, client, store, "a", "b")
+    gated(galaxy, client, store, tree, "a", "b")
 
     galaxy.add_collection("ns", "a", ["1.0.0"], deprecated=True)
     res = discover(client, store)
@@ -168,9 +168,9 @@ def test_discover_lists_when_the_repo_changed_without_an_upload(galaxy, client, 
     assert (res.hinted, res.listed) == (False, False)
 
 
-def test_discover_repo_metadata_failures(galaxy, client, store):
+def test_discover_repo_metadata_failures(galaxy, client, store, tree):
     galaxy.add_collection("ns", "a", ["1.0.0"])
-    gated(galaxy, client, store, "a")
+    gated(galaxy, client, store, tree, "a")
 
     # Without the metadata, look anyway.
     galaxy.routes[REPO_METADATA] = UNAVAILABLE
@@ -198,10 +198,10 @@ def test_discover_skips_invalid_names(galaxy, client, store):
     assert discover(client, store).collections == []
 
 
-def test_check_count(galaxy, client, store):
+def test_check_count(galaxy, client, store, tree):
     galaxy.add_collection("ns", "a", ["1.0.0", "1.1.0", "2.0.0"])
     galaxy.add_collection("ns", "gone", ["1.0.0"])
-    mirror(galaxy, client, store, "a", "gone")
+    mirror(galaxy, client, store, tree, "a", "gone")
     assert check_count(client, store) == 0
 
     # Deleting a version below the highest changes nothing tier 2 can see.
@@ -221,18 +221,18 @@ def test_check_count(galaxy, client, store):
     galaxy.add_collection("ns", "a", ["1.0.0", "2.0.0"])
     galaxy.remove_collection("ns", "gone")
     for name in ("a", "gone"):
-        reconcile(client, store, "ns", name)
+        reconcile(client, store, tree, "ns", name)
     assert check_count(client, store) == 0
     assert store.state["failures"] == {}
 
 
-def test_sweep(galaxy, client, store):
+def test_sweep(galaxy, client, store, tree):
     galaxy.add_collection("ns", "a", ["1.0.0", "1.1.0", "2.0.0"])
     galaxy.add_collection("ns", "b", ["1.0.0"])
     galaxy.add_collection("ns", "c", ["1.0.0"])
     for name in ("a", "b", "c"):
-        reconcile(client, store, "ns", name)
-    res = sweep(client, store)
+        reconcile(client, store, tree, "ns", name)
+    res = sweep(client, store, tree)
     assert (res.gone, res.unmirrored, res.published, res.collections) == ({}, {}, 5, [])
 
     # A deletion below the highest, a deleted collection, a missed upload and
@@ -241,63 +241,63 @@ def test_sweep(galaxy, client, store):
     galaxy.remove_collection("ns", "c")
     galaxy.add_collection("ns", "b", ["1.0.0", "1.1.0"])
     galaxy.add_collection("ns", "d", ["1.0.0"])
-    res = sweep(client, store)
+    res = sweep(client, store, tree)
     assert res.gone == {"ns.a": ["1.1.0"], "ns.c": ["1.0.0"]}
     assert res.unmirrored == {"ns.b": ["1.1.0"], "ns.d": ["1.0.0"]}
     assert res.collections == [("ns", "a"), ("ns", "b"), ("ns", "c"), ("ns", "d")]
 
     for ns, name in res.collections:
-        reconcile(client, store, ns, name)
-    assert sweep(client, store).collections == []
+        reconcile(client, store, tree, ns, name)
+    assert sweep(client, store, tree).collections == []
 
     # A yanked version back on Galaxy needs a reconcile to un-yank it.
     galaxy.add_collection("ns", "a", ["1.0.0", "1.1.0", "2.0.0"])
-    assert sweep(client, store).unmirrored == {"ns.a": ["1.1.0"]}
+    assert sweep(client, store, tree).unmirrored == {"ns.a": ["1.1.0"]}
 
 
-def test_sweep_unindexed_versions(galaxy, client, store):
+def test_sweep_unindexed_versions(galaxy, client, store, tree):
     galaxy.add_collection("ns", "a", ["1.0.0", "1.1.0", "2.0.0"])
-    reconcile(client, store, "ns", "a")
+    reconcile(client, store, tree, "ns", "a")
     cstate = store.collection_state("ns.a")
 
     # Galaxy's search index loses versions it still serves: the count and
     # the feed both look like deletions.
     galaxy.unindex(("ns", "a", "1.0.0"), ("ns", "a", "1.1.0"))
     assert check_count(client, store) == 2
-    res = sweep(client, store)
+    res = sweep(client, store, tree)
     assert (res.gone, res.unindexed) == ({"ns.a": ["1.0.0", "1.1.0"]}, {})
     assert res.unseen(("ns", "a")) == ["1.0.0", "1.1.0"]
 
     # Reconcile finds them served, so they stop being expected in the count
     # and the next sweep doesn't call them gone, but still queues them.
-    assert reconcile(client, store, "ns", "a", unseen=res.unseen(("ns", "a"))).yanked == []
+    assert reconcile(client, store, tree, "ns", "a", unseen=res.unseen(("ns", "a"))).yanked == []
     assert cstate["unindexed"] == ["1.0.0", "1.1.0"]
     assert check_count(client, store) == 0
     assert store.state["failures"] == {}
-    res = sweep(client, store)
+    res = sweep(client, store, tree)
     assert (res.gone, res.unindexed, res.collections) == ({}, {"ns.a": ["1.0.0", "1.1.0"]}, [("ns", "a")])
     assert res.reasons(("ns", "a")) == ["unindexed: 1.0.0, 1.1.0"]
 
     # A reconcile for another reason keeps them.
     galaxy.add_collection("ns", "a", ["1.0.0", "1.1.0", "2.0.0", "2.1.0"])
-    assert reconcile(client, store, "ns", "a").added == ["2.1.0"]
+    assert reconcile(client, store, tree, "ns", "a").added == ["2.1.0"]
     assert cstate["unindexed"] == ["1.0.0", "1.1.0"]
 
     # Deleting one still yanks it, once reconcile rechecks it.
     galaxy.add_collection("ns", "a", ["1.0.0", "2.0.0", "2.1.0"])
-    assert reconcile(client, store, "ns", "a", unseen=res.unseen(("ns", "a"))).yanked == ["1.1.0"]
+    assert reconcile(client, store, tree, "ns", "a", unseen=res.unseen(("ns", "a"))).yanked == ["1.1.0"]
     assert cstate["unindexed"] == ["1.0.0"]
     assert check_count(client, store) == 0
 
     # Back in the index, it's an ordinary version again.
     galaxy.unindex()
-    res = sweep(client, store)
+    res = sweep(client, store, tree)
     assert (res.gone, res.unindexed, res.collections) == ({}, {}, [])
     assert "unindexed" not in cstate
     assert check_count(client, store) == 0
 
 
-def test_sweep_needs_every_page(galaxy, client, store):
+def test_sweep_needs_every_page(galaxy, client, store, tree):
     galaxy.json(
         FEED,
         {
@@ -308,24 +308,24 @@ def test_sweep_needs_every_page(galaxy, client, store):
     )
     galaxy.routes["/p2"] = UNAVAILABLE
     with pytest.raises(GalaxyError):
-        sweep(client, store)
+        sweep(client, store, tree)
 
 
-def test_sweep_finds_replaced_versions(galaxy, client, store):
+def test_sweep_finds_replaced_versions(galaxy, client, store, tree):
     galaxy.add_collection("ns", "a", ["1.0.0", "2.0.0"])
-    reconcile(client, store, "ns", "a")
-    assert sweep(client, store).replaced == {}
+    reconcile(client, store, tree, "ns", "a")
+    assert sweep(client, store, tree).replaced == {}
 
     # Replacing a version below the highest doesn't change the collection's
     # updated_at, but its upload time no longer matches.
     original_upload = galaxy.uploaded[("ns", "a", "1.0.0")]
     original = galaxy.blobs[("ns", "a", "1.0.0")]
     galaxy.replace("ns", "a", "1.0.0", artifact("ns", "a", "1.0.0", mtime=1_800_000_000))
-    res = sweep(client, store)
+    res = sweep(client, store, tree)
     assert (res.replaced, res.collections) == ({"ns.a": ["1.0.0"]}, [("ns", "a")])
-    assert list(reconcile(client, store, "ns", "a").repacked) == ["1.0.0"]
-    assert sweep(client, store).replaced == {}
+    assert list(reconcile(client, store, tree, "ns", "a").repacked) == ["1.0.0"]
+    assert sweep(client, store, tree).replaced == {}
 
     # Restoring the original brings back its old upload time: still a change.
     galaxy.replace("ns", "a", "1.0.0", original, uploaded=original_upload)
-    assert sweep(client, store).replaced == {"ns.a": ["1.0.0"]}
+    assert sweep(client, store, tree).replaced == {"ns.a": ["1.0.0"]}

@@ -1,60 +1,36 @@
-"""The mirror's files and state, on top of one storage backend per bucket.
+"""The sync's own state and files, on top of one storage backend per bucket.
 
-    index bucket   config.json, collections.json, plugins.jsonl, index/<aa>/<sha256>.jsonl, conflicts/
-    dl bucket      sha256/<aa>/<sha256>.tar.gz
-    state bucket   state.json, builtin.jsonl, extract/, conflicts/, requests/
+    index bucket   conflicts/<ns>/<name>.json, and pruning index/
+    state bucket   state.json, conflicts/, requests/
 
-Each collection's index file is published by its sha256, and never changes;
-the sha256 in state.json says which is the collection's.
-
-See docs/storage.md. Writes go through `_write`, which skips objects whose
-content hasn't changed, except where the object is known to be new.
+The index itself is alai-index's, through tree.py. See docs/storage.md.
 """
 
 import datetime
-import hashlib
 import json
 import logging
 import secrets
-from collections.abc import Collection, Sequence
-from compression import zstd
+from collections.abc import Callable, Collection, Sequence
 from typing import cast
 
 from . import report
-from .models import (
-    CollectionState,
-    Conflict,
-    ExtractionData,
-    Failure,
-    IndexLine,
-    Observation,
-    PluginLine,
-    Request,
-    SyncState,
-)
-from .plugins import plugin_lines
+from .models import CollectionState, Conflict, Failure, Observation, Request, SyncState
 from .storage import Backend, Buckets, PreconditionFailed, StorageError
 from .times import now
 
 log = logging.getLogger(__name__)
 
-# The artifact URL template a new store starts with; `refresh --dl` changes it.
-DEFAULT_DL = "https://dl.alai.sh/sha256/{sha256-prefix}/{sha256-checksum}.tar.gz"
-
 # Ledger "collection" for failures of the Galaxy-wide checks (feed, listing,
 # repo metadata, count, sweep); their "version" names the check.
 GLOBAL = "*"
+
+# What a `request` can ask the next sync for.
+ACTIONS = ("mirror", "sweep", "generate-plugins", "generate-indexes")
 
 # Why a collection is queued, in the order the queue is worked: what a person
 # asked for, then new uploads, then the listing's and the sweep's findings
 # (which include the initial import's backlog).
 SOURCES = ("requested", "uploaded", "listed", "swept")
-
-# Zstandard level for each collection's extractions. Versions repeat each
-# other's plugins and routing, which Zstandard's long window finds: on
-# community.general's 243 versions, 41 MB of JSON becomes 0.27 MB in 0.04 s,
-# where gzip only gets it to 5.3 MB.
-EXTRACTIONS_LEVEL = 10
 
 # State is saved after this much work: each version mirrored or rechecked
 # counts one, and so does each collection reconciled.
@@ -63,41 +39,15 @@ SAVE_EVERY = 100
 # A failure outstanding this long is reported once as needing a person.
 PERSISTENT = datetime.timedelta(days=1)
 
-# Where clients find a published index file, from collections.json's sha256.
-INDEX_TEMPLATE = "index/{sha256-prefix}/{sha256-checksum}.jsonl"
-
 # A published index file no collections.json names is kept this long, for
 # clients and caches still holding an older listing, then deleted. Far longer
-# than any copy of collections.json lives (s-maxage plus
-# stale-while-revalidate, a day at most); docs/index-spec/README.md asks for
-# at least 7 days.
+# than any copy of collections.json lives (its max-age, 10 minutes);
+# docs/index-spec/README.md asks for at least 7 days.
 RETIRED_GRACE = datetime.timedelta(days=7)
 
 # How often retired index files are looked for, as listing the index bucket
 # costs a request per thousand files.
 PRUNE_EVERY = datetime.timedelta(days=1)
-
-# Field order for index lines, matching the spec.
-LINE_FIELDS = (
-    "v",
-    "name",
-    "vers",
-    "deps",
-    "sha256",
-    "size",
-    "requires_ansible",
-    "yanked",
-    "deprecated",
-    "published",
-)
-
-
-def _dump(obj: object) -> str:
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
-
-
-def _jsonl(items: Sequence[object]) -> str:
-    return "".join(_dump(item) + "\n" for item in items)
 
 
 def _write(backend: Backend, key: str, text: str) -> bool:
@@ -109,58 +59,30 @@ def _write(backend: Backend, key: str, text: str) -> bool:
     return True
 
 
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _read_jsonl(data: bytes | None) -> list[object]:
-    return [json.loads(line) for line in (data or b"").decode().splitlines() if line.strip()]
-
-
-def ordered_line(line: IndexLine) -> dict[str, object]:
-    """An index line with its fields in spec order, unknown ones last."""
-    fields: dict[str, object] = dict(line)
-    out = {k: fields[k] for k in LINE_FIELDS if k in fields}
-    out.update({k: v for k, v in fields.items() if k not in out})
-    return out
-
-
 class StateChanged(StorageError):
     """Another run saved state.json since this one read it."""
 
 
 class Store:
-    def __init__(self, buckets: Buckets, dl_url: str | None = None) -> None:
-        """Open a store. The artifact URL template is `dl_url`, else the one in
-        config.json, else DEFAULT_DL."""
+    def __init__(self, buckets: Buckets) -> None:
         self.buckets = buckets
         self.index = buckets.index
-        self.dl = buckets.dl
         self.state_bucket = buckets.state
-        self.dl_url = dl_url or self._configured_dl() or DEFAULT_DL
         self.state: SyncState = {"collections": {}, "conflicts": [], "failures": {}, "pending": {}}
         self._saved = self.state_bucket.read("state.json")
         if self._saved is not None:
             self.state.update(json.loads(self._saved))
+            _drop_old_state(self.state)
         # Ledger keys that appeared or cleared during this run, for the report.
         self._new_failures: set[str] = set()
         self._resolved_failures: set[str] = set()
         self._new_conflicts: list[Conflict] = []
         # Collections whose public conflict record needs writing.
         self._conflicts_changed: set[str] = set()
-        # Plugin lines written this run, so merging them needn't read them back.
-        self._plugin_lines: dict[str, list[PluginLine]] = {}
-        # Each collection's extractions object as read or last saved, to skip unchanged saves.
-        self._saved_extractions: dict[str, bytes] = {}
-        # Each index file's sha256 in the collections.json written this run, for pruning.
-        self._listed: set[str] | None = None
         self._unsaved_work = 0
-
-    def _configured_dl(self) -> str | None:
-        if (data := self.index.read("config.json")) is None:
-            return None
-        dl: object = json.loads(data).get("dl")
-        return dl if isinstance(dl, str) and dl else None
+        self.before_save: Callable[[], object] | None = None
+        """Run before state.json is saved. The run publishes the index's aggregate files there, so state never says a
+        collection is done while the published collections.json still names its old index file."""
 
     def save_state(self) -> None:
         """Save state.json, refusing if another run saved it since this one read it.
@@ -170,6 +92,8 @@ class Store:
         can't race.
         """
         self._unsaved_work = 0
+        if self.before_save is not None:
+            _ = self.before_save()
         data = (json.dumps(self.state, indent=1, sort_keys=True) + "\n").encode()
         if data == self._saved:
             return
@@ -191,7 +115,7 @@ class Store:
         return self._unsaved_work >= SAVE_EVERY
 
     def collection_state(self, fqcn: str) -> CollectionState:
-        return self.state["collections"].setdefault(fqcn, {"versions": {}})
+        return self.state["collections"].setdefault(fqcn, {})
 
     # Failures never stop a run. Each is recorded with enough detail to act on,
     # retried on every later run, and cleared once it succeeds.
@@ -287,23 +211,19 @@ class Store:
         )
         return [(ns, name) for ns, _, name in (fqcn.partition(".") for fqcn in order)]
 
-    # A `refresh` writes a request object instead of touching state.json, so
-    # it can run alongside a sync; the next sync queues it and deletes it.
+    # A `request` writes a request object instead of touching state.json, so
+    # it can run alongside a sync; the next sync takes it and deletes it.
 
     def add_request(
-        self,
-        targets: list[str],
-        revalidate: bool,
-        rebuild: bool = False,
-        dl: str = "",
+        self, action: str, targets: list[str], *, revalidate: bool = False, from_plugin_cache: bool = False
     ) -> str:
         requested = now()
         key = f"requests/{requested.replace(':', '')}-{secrets.token_hex(4)}.json"
-        request: Request = {"requested": requested, "targets": targets, "revalidate": revalidate}
-        if rebuild:
-            request["rebuild"] = True
-        if dl:
-            request["dl"] = dl
+        request: Request = {"requested": requested, "action": action, "targets": targets}
+        if revalidate:
+            request["revalidate"] = True
+        if from_plugin_cache:
+            request["from_plugin_cache"] = True
         self.state_bucket.write(key, (json.dumps(request) + "\n").encode())
         return key
 
@@ -410,127 +330,6 @@ class Store:
             alerts=report.Alerts(self._new_conflicts, persistent),
         )
 
-    @staticmethod
-    def artifact_key(sha256: str) -> str:
-        return f"sha256/{sha256[:2]}/{sha256}.tar.gz"
-
-    def write_artifact(self, sha256: str, data: bytes) -> None:
-        key = self.artifact_key(sha256)
-        if not self.dl.exists(key):  # content-addressed: same key means same bytes
-            self.dl.write(key, data)
-
-    def read_artifact(self, sha256: str) -> bytes | None:
-        return self.dl.read(self.artifact_key(sha256))
-
-    @staticmethod
-    def _extractions_key(namespace: str, name: str) -> str:
-        return f"extract/{namespace}/{name}.json.zst"
-
-    def load_extractions(self, namespace: str, name: str) -> dict[str, ExtractionData]:
-        """A collection's stored extractions, by artifact sha256: one object for the whole collection."""
-        data = self.state_bucket.read(self._extractions_key(namespace, name))
-        if data is None:
-            return {}
-        self._saved_extractions[f"{namespace}.{name}"] = data
-        return json.loads(zstd.decompress(data))
-
-    def save_extractions(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> None:
-        """Save a collection's extractions, unless they're what `load_extractions` read."""
-        fqcn = f"{namespace}.{name}"
-        if not extractions and fqcn not in self._saved_extractions:
-            return  # nothing extracted yet, e.g. every version failed
-        data = zstd.compress((_dump(dict(sorted(extractions.items()))) + "\n").encode(), EXTRACTIONS_LEVEL)
-        if data != self._saved_extractions.get(fqcn):
-            self.state_bucket.write(self._extractions_key(namespace, name), data)
-            self._saved_extractions[fqcn] = data
-
-    def save_builtin(self, lines: list[PluginLine]) -> None:
-        """Plugin lines for ansible.builtin, merged into every plugins.jsonl."""
-        _ = _write(self.state_bucket, "builtin.jsonl", _jsonl(lines))
-
-    def load_builtin(self) -> list[PluginLine]:
-        return cast(list[PluginLine], _read_jsonl(self.state_bucket.read("builtin.jsonl")))
-
-    @staticmethod
-    def index_key(sha256: str) -> str:
-        """An index file in the index bucket, by its sha256, as INDEX_TEMPLATE has clients find it."""
-        return f"index/{sha256[:2]}/{sha256}.jsonl"
-
-    def index_collections(self) -> list[tuple[str, str]]:
-        """(namespace, name) of every collection with an index file: those state has a sha256 for."""
-        return sorted(
-            (ns, name)
-            for ns, _, name in (fqcn.partition(".") for fqcn, cs in self.state["collections"].items() if "sha256" in cs)
-        )
-
-    def read_index(self, namespace: str, name: str) -> list[IndexLine]:
-        """A collection's index file, through the sha256 state has for it; none if it has none."""
-        fqcn = f"{namespace}.{name}"
-        cs = self.state["collections"].get(fqcn)
-        if cs is None or (sha256 := cs.get("sha256")) is None:
-            return []
-        if (data := self.index.read(self.index_key(sha256))) is None:
-            # Never treated as empty, which would mirror the whole collection again.
-            raise StorageError(f"{fqcn}'s index file {self.index_key(sha256)} is missing")
-        return cast(list[IndexLine], _read_jsonl(data))
-
-    def write_index(self, namespace: str, name: str, lines: list[IndexLine]) -> bool:
-        """Publish an index file by its sha256 and point state at it, returning False if it was already the same.
-
-        State is the only record of which file is a collection's, so a run
-        that stops before saving it leaves the file this one replaced in use,
-        and the next run reconciles again from there; the new file is left
-        for pruning.
-        """
-        data = "".join(_dump(ordered_line(line)) + "\n" for line in lines).encode()
-        sha256 = _sha256(data)
-        state = self.collection_state(f"{namespace}.{name}")
-        if state.get("sha256") == sha256:
-            return False
-        # Content-addressed, so the key is new unless an earlier file is coming back, which is the same bytes.
-        self.index.write(self.index_key(sha256), data)
-        state["sha256"] = sha256
-        state["updated"] = now()
-        return True
-
-    def rebuild_collection(self, namespace: str, name: str) -> None:
-        """Work out one collection's plugin lines again, for a rebuild.
-
-        The lines are merged by the next `write_plugins`, like a reconcile's.
-        """
-        lines = self.read_index(namespace, name)
-        extractions = self.load_extractions(namespace, name)
-        _ = self.set_collection_plugins(
-            namespace,
-            name,
-            {line["vers"]: extractions[line["sha256"]] for line in lines if line["sha256"] in extractions},
-        )
-
-    def write_config(self) -> None:
-        config = {
-            "formats": {"1": {"index": INDEX_TEMPLATE, "collections": "collections.json", "plugins": "plugins.jsonl"}},
-            "dl": self.dl_url,
-            "moved-to": None,
-        }
-        _ = self._write_index_file("config.json", json.dumps(config, indent=2) + "\n")
-
-    def write_collections(self) -> None:
-        """Write collections.json, after every other index bucket file.
-
-        Each collection's `sha256` comes from state, so writing it reads no
-        index files, and every file it names is published, as each is
-        published before state points at it (docs/index-spec/README.md,
-        "Publishing order").
-        """
-        namespaces: dict[str, dict[str, dict[str, str]]] = {}
-        for ns, name in self.index_collections():
-            state = self.collection_state(f"{ns}.{name}")
-            sha256 = state["sha256"]  # pyright: ignore[reportTypedDictNotRequiredAccess]  # index_collections has it
-            namespaces.setdefault(ns, {})[name] = {"updated": state.get("updated") or now(), "sha256": sha256}
-        text = json.dumps({"v": 1, "namespaces": namespaces}, indent=1) + "\n"
-        _ = self._write_index_file("collections.json", text)
-        self._listed = {entry["sha256"] for entries in namespaces.values() for entry in entries.values()}
-
     def _write_index_file(self, key: str, text: str) -> bool:
         """Write one index bucket file, returning False if it was already the same."""
         return _write(self.index, key, text)
@@ -542,18 +341,16 @@ class Store:
             or datetime.datetime.fromisoformat(now()) - datetime.datetime.fromisoformat(last) >= PRUNE_EVERY
         )
 
-    def prune_index_files(self) -> int:
-        """Delete published index files the collections.json written this run doesn't name and none has for
-        RETIRED_GRACE, returning how many.
+    def prune_index_files(self, listed: Collection[str]) -> int:
+        """Delete published index files `listed`, the keys collections.json names now, doesn't have and none has
+        for RETIRED_GRACE, returning how many.
 
         A file is retired from when a prune first finds it unnamed: one a
         collection replaced, one left by a run that stopped between
         publishing and saving state, and the old files by name in the index
         bucket. One named again is no longer retired.
         """
-        if self._listed is None:
-            return 0
-        live = {self.index_key(sha256) for sha256 in self._listed}
+        live = set(listed)
         retired = self.state.setdefault("retired_index_files", {})
         stamp = now()
         cutoff = datetime.datetime.fromisoformat(stamp) - RETIRED_GRACE
@@ -575,62 +372,31 @@ class Store:
             log.info("deleted %d retired index files", deleted)
         return deleted
 
-    def set_collection_plugins(self, namespace: str, name: str, extractions: dict[str, ExtractionData]) -> int:
-        """Work out one collection's plugin lines, from each version's extraction, for `write_plugins` to merge.
 
-        Returns how many there are. Every reconcile marks its collection for
-        merging, changed or not: a run that stopped before saving state
-        reconciles it again.
-        """
-        fqcn = f"{namespace}.{name}"
-        lines = self._plugin_lines[fqcn] = plugin_lines(fqcn, extractions)
-        pending = self.state.setdefault("plugins_pending", [])
-        if fqcn not in pending:
-            pending.append(fqcn)
-        return len(lines)
+def _drop_old_state(state: SyncState) -> None:
+    """Drop what state.json held before alai-index kept the index, which alai-index's private state now holds.
 
-    def _collection_plugins(self, fqcn: str) -> list[PluginLine]:
-        """A collection's plugin lines: from this run, or worked out from its index file and extractions."""
-        if (lines := self._plugin_lines.get(fqcn)) is not None:
-            return lines
-        namespace, _, name = fqcn.partition(".")
-        extractions = self.load_extractions(namespace, name)
-        return plugin_lines(
-            fqcn,
-            {
-                line["vers"]: extractions[line["sha256"]]
-                for line in self.read_index(namespace, name)
-                if line["sha256"] in extractions
-            },
-        )
-
-    def write_plugins(self) -> int:
-        """Merge ansible.builtin and the collections reconciled since the last merge into plugins.jsonl.
-
-        Returns its line count. Reads only plugins.jsonl, builtin.jsonl, and
-        for a collection reconciled by a run that stopped before merging, its
-        index file and extractions. A store without plugins.jsonl gets it
-        built from every collection's. ansible.builtin's lines are always
-        taken from builtin.jsonl.
-        """
-        if (merged := self.index.read("plugins.jsonl")) is None:
-            return self.merge_plugins()
-        replaced = set(self.state.get("plugins_pending", [])) | {"ansible.builtin"}
-        lines = self.load_builtin()
-        lines.extend(line for line in cast(list[PluginLine], _read_jsonl(merged)) if line["collection"] not in replaced)
-        for fqcn in replaced - {"ansible.builtin"}:
-            lines.extend(self._collection_plugins(fqcn))
-        return self._write_plugins(lines)
-
-    def merge_plugins(self) -> int:
-        """Build plugins.jsonl from ansible.builtin's and every collection's plugin lines."""
-        lines = self.load_builtin()
-        for ns, name in self.index_collections():
-            lines.extend(self._collection_plugins(f"{ns}.{name}"))
-        return self._write_plugins(lines)
-
-    def _write_plugins(self, lines: list[PluginLine]) -> int:
-        lines.sort(key=lambda line: (line["type"], line["name"], line["collection"]))
-        _ = self._write_index_file("plugins.jsonl", _jsonl(lines))
-        _ = self.state.pop("plugins_pending", None)
-        return len(lines)
+    A conflict comparison is kept, so it isn't downloaded again, and the
+    versions counted, until the collection's next reconcile counts them again.
+    A failure of the ansible-core check, which is gone, would never clear, so
+    it's dropped. So is an extraction failure from galaxy-sync's own
+    extractor, which alai-index's doesn't share.
+    """
+    # Only from before, as an extraction failure from alai-index is kept.
+    if "builtin" in state or any("versions" in c for c in state["collections"].values()):
+        for key in [k for k, f in state["failures"].items() if f["kind"] == "extract_error"]:
+            del state["failures"][key]
+    for key in ("builtin", "plugins_pending", "rebuild", "reextract"):
+        _ = cast(dict[str, object], cast(object, state)).pop(key, None)
+    for key in [k for k, f in state["failures"].items() if (f["collection"], f["version"]) == (GLOBAL, "builtin")]:
+        del state["failures"][key]
+    for cstate in state["collections"].values():
+        old = cast(dict[str, object], cast(object, cstate))
+        _ = old.pop("sha256", None), old.pop("updated", None)
+        if "versions" not in old:
+            continue
+        versions = cast(dict[str, dict[str, object]], old.pop("versions") or {})
+        _ = old.setdefault("mirrored", len(versions))
+        verdicts = {v: s["upstream"] for v, s in versions.items() if "upstream" in s}
+        if verdicts:
+            old["verdicts"] = verdicts

@@ -10,19 +10,21 @@ is in [galaxy-api.md](galaxy-api.md), and where the results go is in
 ## reconcile
 
 `reconcile(ns, name)` (`reconcile.py`) brings one collection's index file in
-line with Galaxy, using only the contract endpoints `ansible-galaxy` itself
-uses:
+line with Galaxy. The mirroring itself is done by
+[alai-index](https://github.com/alai-sh/alai-index)'s `galaxy-mirror`, which
+uses only the contract endpoints `ansible-galaxy` itself uses:
 
 1. **Collection:** a 404 yanks every version. Nothing else counts as a
    deletion, so a flaky or truncated listing can never remove anything.
 2. **Versions Galaxy lists that the index doesn't:** fetch the version
-   detail, download the artifact, check it against Galaxy's sha256 and its
-   own `MANIFEST.json`, store it by sha256, extract its plugins, and add an
-   index line.
+   detail, download the artifact, and check it against Galaxy's sha256 and
+   its own `MANIFEST.json`. Then store it by sha256, extract its plugins, and
+   add an index line made from the artifact's `MANIFEST.json` and
+   `meta/runtime.yml`. Only `published` comes from Galaxy.
 3. **Versions the index has:** the sha256 of the artifact Galaxy publishes
    now is compared with the mirrored artifact's, but only when the version
    is yanked, when `--revalidate` asks, or when Galaxy's `created_at`
-   changed (see [Artifact checks](#artifact-checks)).
+   differs from the line's `published` (see [Artifact checks](#artifact-checks)).
 4. **Versions the index has that Galaxy no longer lists:** yanked, once
    the version's own detail page returns 404. A delete while a long listing
    is paged can shift another version past the reader, so the listing alone
@@ -30,24 +32,29 @@ uses:
    Galaxy can't answer for is kept and retried as a failure.
 5. **Deprecation** is copied from the collection onto every line.
 
-Writes go artifacts, then index files, then aggregate files, so the index
-never points at an artifact that isn't there. Each index file is published
-by its sha256 before state points at it ([storage](storage.md#index-files)),
-so `collections.json` never names one that isn't published.
+Reconcile runs `galaxy-mirror` on a local copy of the files it reads, then
+publishes what it wrote ([storage](storage.md#the-alai-index-tree)). The
+artifacts go first, then the plugin cache, then the index file. So the index
+never points at an artifact that isn't there. `plugins.jsonl` and
+`collections.json` are published at the end of the run and before each save
+of `state.json`.
 
-Reconcile also re-extracts mirrored versions whose stored extraction is
-missing or older than `plugins.EXTRACTION_FORMAT`, so extractor fixes reach
-versions that were already mirrored.
+When alai-index lists a version's plugin extraction as out of date, reconcile
+fetches its artifact from the artifact bucket and extracts its plugins again.
+A collection's plugins catch up with an alai-index upgrade as it's synced.
 
-New versions are mirrored oldest upload first. Past the run's deadline,
-reconcile mirrors no more: it writes what it has and leaves the rest for the
-next run. So a collection with thousands of versions is imported across
-several runs, with its lines still in publication order.
+reconcile keeps what alai-index doesn't. That's the failure ledger, the
+collection's change-detection state and the conflicts. A version Galaxy
+serves another artifact for is reported by `galaxy-mirror` without being
+written, and reconcile compares its contents with ours
+([below](#artifact-checks)).
 
-Every 100 versions mirrored or rechecked, reconcile also saves progress part
-way through: the index file with the lines so far and the collection's
-plugin lines, then `state.json`. A run that stops part way through a long
-collection loses at most the last 100 versions, not the whole collection.
+New versions are mirrored oldest upload first, `CHUNK` (10) at a time. Each
+chunk is published before the next starts, so a run that stops part way
+through a long collection loses at most one chunk. Past the run's deadline,
+reconcile mirrors no more and leaves the rest for the next run. So a
+collection with thousands of versions is imported across several runs, with
+its lines still in publication order.
 
 ## The queue
 
@@ -57,36 +64,35 @@ same work, so it doesn't matter which run picks it up. Each `sync`:
 
 1. **Finds changes** (below) and queues them, then saves the feed cursor.
    Something found is saved in the queue before the cursor moves past it.
-2. **Takes requests.** `refresh` doesn't reconcile anything itself. It writes
-   a request object under `requests/` in the state bucket, which the next
-   sync queues and deletes. A request names collections or namespaces, or
-   asks for a sweep, a rebuild or a new artifact URL template. A namespace
-   that can't be listed keeps its request for the next run.
-3. **Works what was requested,** ahead of everything else: the requested
-   collections, then any rebuild ([below](#rebuilds)).
-4. **Checks ansible-core** once a day ([below](#ansiblebuiltin)).
-5. **Sweeps** once a day (below), queueing everything that differs. It comes
+2. **Takes requests.** `request` doesn't do anything itself. It writes a
+   request object under `requests/` in the state bucket, which the next sync
+   takes and deletes ([below](#requests)). A namespace that can't be listed
+   keeps its request for the next run.
+3. **Works what was requested,** ahead of everything else: the collections
+   to mirror, then the jobs in order ([below](#jobs)).
+4. **Sweeps** once a day (below), queueing everything that differs. It comes
    after the requested work, since it can take most of the budget,
    and isn't started once the budget has run out: it runs to the end once
    started, so the next run does it instead.
-6. **Works the rest of the queue** in order: new uploads, then what the
+5. **Works the rest of the queue** in order: new uploads, then what the
    listing and the sweep found, which includes the initial import's backlog.
    Collections with outstanding failures come last. A collection leaves the
    queue once reconciled; one that ran out of time part way stays queued.
-7. **Stops starting new work** once `--budget` minutes (default 45) have
+6. **Stops starting new work** once `--budget` minutes (default 45) have
    passed since the run started, sweep included. That applies to requested
    collections too, so a requested collection too big for one run carries on
-   in the next, still first in the queue. The run then writes the aggregate
-   files and the failure report.
+   in the next, still first in the queue. The run then publishes
+   `plugins.jsonl` and `collections.json`, and writes the failure report.
 
 `state.json` is saved after every 100 units of work (each version mirrored
-or rechecked counts one, and so does each collection reconciled), at the
-end of the run, and whenever something is queued. It isn't saved after
-every collection: once the mirror is full it's several MB. If a run stops
-between saves, the collections finished since stay queued and are
-reconciled again; their index files already have the new lines, so that
-costs two Galaxy requests each, and reconcile records any version state
-that was lost.
+counts one, and so does each collection reconciled), at the end of the run,
+and whenever something is queued. It isn't saved after every collection, as
+once the mirror is full it's several MB. If a run stops between saves, the
+collections finished since stay queued and are reconciled again. Their
+index files are published already, but the published `collections.json` may
+still name the old ones, as it's only published before each save. Reconciling
+them again costs a few Galaxy requests each, and downloads again what wasn't
+in the published `collections.json`.
 
 The initial import is just a sync with no saved state. Its listing queues
 every collection, and runs work through the backlog 45 minutes at a time,
@@ -124,7 +130,7 @@ The run reconciles nothing and saves no cursor, so the next run looks again.
 
 ### Daily: the sweep
 
-When the last sweep is over a day old, or a `refresh` without targets asked
+When the last sweep is over a day old, or `request sweep` asked
 for one, `changes.sweep` compares everything:
 
 1. Read the whole upload feed (about 533 pages, pages are capped at 100
@@ -187,8 +193,17 @@ count.
   Galaxy's artifact is saved under `conflicts/` in the state bucket, and it's
   recorded in the version's conflict ([below](#conflicts)).
 
-Each version's verdict is cached with Galaxy's sha256, so the same
-artifact is downloaded once.
+Each version's verdict is kept in `state.json` with Galaxy's sha256 and
+upload time, so the same artifact is downloaded and reported once. Reconcile
+gives those upload times to `galaxy-mirror` as `--checked`, so it doesn't
+check the version again until Galaxy's `created_at` changes. The sweep reads
+them too, so it doesn't queue the version again as re-uploaded. When Galaxy
+serves our artifact again, `galaxy-mirror` reports it as `unchanged`, and the
+verdict is dropped and any open conflict resolved.
+
+A version with an open conflict but no upload time, as one from before
+upload times were kept, is checked on every reconcile until Galaxy serves our
+artifact again or a new upload time is recorded.
 
 ### Conflicts
 
@@ -211,46 +226,37 @@ Conflicts never change the index, and nothing is ever removed. Each collection's
 why the mirror's artifact differs from Galaxy's. Galaxy's artifacts stay in
 the private state bucket.
 
-## Rebuilds
+## Requests
 
-`refresh --rebuild` asks for every file derived from the index to be
-regenerated, without contacting Galaxy: each collection's plugin lines from
-its index file and stored extractions, the public conflict records, and `ansible.builtin`, extracted again. It's
-for a change to how those are derived; a change to extraction itself bumps
-`plugins.EXTRACTION_FORMAT` instead, which reconcile handles.
+`galaxy-sync request ACTION` asks the next sync to do something, without
+contacting Galaxy. Each action is named after what it does to the index.
 
-The sync that takes the request starts it, and works collections in
-(namespace, name) order after the requested collections. Progress is kept
-in `state.json` (`rebuild.after`, the last collection done) and saved with
-the rest of the run's work, so a rebuild that runs out of budget, or a run
-that stops, carries on from there in the next sync. Each run merges the
-lines it worked out into `plugins.jsonl`, as for reconciled collections. A
-new `--rebuild` request starts over.
+| Action | Does |
+|---|---|
+| `mirror NS[.NAME]... [--revalidate]` | Reconciles those collections, or every collection in those namespaces, ahead of everything else. `--revalidate` also checks every mirrored artifact against Galaxy's |
+| `sweep` | Runs the sweep on this sync rather than once a day. It only finds and queues what differs, and the queue reconciles those |
+| `generate-plugins [NS[.NAME]...] [--from-plugin-cache]` | A [job](#jobs) that fetches each version's artifact from the artifact bucket and extracts its plugins again with alai-index's `generate-plugins`, for every collection when there are no targets. `--from-plugin-cache` fetches only the artifacts whose extraction is missing or out of date, as after an alai-index upgrade that changed extraction. A lost `plugins.jsonl` is made again |
+| `generate-indexes [NS[.NAME]...]` | A [job](#jobs) that fetches each version's artifact and makes its line again with alai-index's `generate-indexes`, for every collection when there are no targets. Each line that changes is listed in the run's output |
 
-It reads two objects per collection: the index file and the extractions.
-Index files never change because of a rebuild; only reconcile writes them.
+`mirror` and `sweep` differ in what they do. `mirror` reconciles the
+collections it names, at a few Galaxy requests each. `sweep` reads Galaxy's
+whole upload feed and listing, about 600 requests, to find the collections
+that need it, and only queues those.
 
-`refresh --dl TEMPLATE` moves the artifact URL template in `config.json`
-when the sync takes it, with or without a rebuild.
+The `request.yml` workflow makes one request for each dispatch.
 
-## ansible.builtin
+### Jobs
 
-ansible.builtin isn't on Galaxy, so its plugin lines come from
-ansible-core's sdist on PyPI (`builtin.py`). Once a day a sync asks PyPI
-for ansible-core's releases and takes the highest `X.Y.0` that has an sdist
-and isn't yanked. Pre-releases aren't counted, and neither are patch
-releases, which don't add plugins. When that's a different release from the
-one in `state.json` (`builtin.version`), or the stored lines'
-`EXTRACTION_FORMAT` is older, the sync downloads the sdist, checks it against
-PyPI's sha256, unpacks only the parts the extractor reads
-(`lib/ansible/{modules,plugins}/`, the routing file and `release.py`) into a
-temporary directory with tarfile's `data` filter, and replaces
-`builtin.jsonl`. The unpacking is temporary: it goes once
-alai-plugin-extractor can read ansible-core from a tarball, as it already
-does collections. Every merge of `plugins.jsonl` takes ansible.builtin's
-lines from there. A rebuild extracts it again whatever the release.
+A `generate-*` request becomes a job in `state.json` (`jobs`). Jobs are
+worked in the order they were requested, after the collections to mirror,
+a collection at a time in name order. Each job's progress is kept
+(`after`, the last collection done), so one that runs out of budget, or a
+run that stops, carries on from there. A version whose artifact isn't in
+the artifact bucket is recorded as `artifact_missing`, and a collection
+alai-index refuses as `alai_index`, and the job carries on.
 
-A failure is recorded as `*` / `builtin` and retried on the next run.
+A `generate-plugins` job with `--from-plugin-cache` costs two reads and one
+alai-index command for a collection with nothing out of date.
 
 ## Failures and conflicts
 
@@ -265,14 +271,15 @@ Recorded failures exit 0; `--strict` exits 1.
 | `galaxy_http_<code>` | Any other HTTP error |
 | `sha256_mismatch` | Downloaded bytes don't match Galaxy's sha256 |
 | `manifest_mismatch`, `bad_artifact` | The tarball's `MANIFEST.json` is wrong or unreadable |
-| `extract_error` | Extraction failed; the version is still mirrored and re-extracted on later reconciles |
+| `extract_error` | Extraction failed. The version is still mirrored, and the plugin index has none of its plugins until it's extracted again |
+| `alai_index` | alai-index refused a command, which leaves the tree as it was |
+| `artifact_missing` | A version's artifact isn't in the artifact bucket, so its plugins can't be extracted again |
 | `deletions_suspected` | Galaxy publishes fewer versions than the mirror last saw |
 | `unexpected` | Any other exception while reconciling a collection |
-| `pypi_unavailable`, `pypi_http_<code>` | PyPI couldn't be read for ansible-core ([ansible.builtin](#ansiblebuiltin)); `sha256_mismatch` and `extract_error` are recorded for its sdist too |
 
 Failures of the Galaxy-wide checks are recorded under the collection `*`,
 with the version naming the check: `published`, `feed`, `listing`, `count`,
-`sweep`, `requests` or `builtin`. Each clears when that check next works.
+`sweep` or `requests`. Each clears when that check next works.
 
 Conflicts aren't failures: they aren't retried, and they stay open until
 Galaxy serves our contents again. Both are kept in `state.json`.
@@ -315,7 +322,7 @@ The workflows are in `.github/workflows/`:
 | Workflow | Trigger | Runs |
 |---|---|---|
 | `sync.yml` | dispatched every 10 minutes by the scheduler; runs once `GALAXY_SYNC_REF` is set | `sync --report --alerts`, then the tracking issue update, the notification and the heartbeat |
-| `refresh.yml` | manual, with targets and `revalidate`, or `rebuild` and `dl` | `refresh`, which only writes a request |
+| `request.yml` | manual, with an action, targets, and `revalidate` or `from-plugin-cache` | `request`, which only writes a request |
 
 GitHub's `schedule` trigger runs late or not at all too often to rely on, so
 `sync.yml` has none. A Cloudflare Worker with a cron trigger, in
@@ -326,10 +333,10 @@ dispatch it by hand.
 
 Syncs share one concurrency group that never cancels a running job. Runs
 must not overlap: each reads `state.json` and writes it back whole, and
-reconcile rewrites index files the same way. GitHub keeps only the newest
+reconcile rewrites `collections.json` and the plugin cache the same way. GitHub keeps only the newest
 waiting run in a group and cancels the others. For syncs that loses nothing,
-because the work is in the queue. It's why `refresh` writes a request instead
-of queueing a job, rebuilds included.
+because the work is in the queue. It's why `request` writes a request object
+instead of starting a job itself.
 
 As a last guard, `save_state` refuses to save if `state.json` changed since
 the run read it, e.g. because of a run started by hand. On R2 that's a

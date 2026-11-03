@@ -1,13 +1,12 @@
 """Store: the reconcile queue and guarding state.json."""
 
 import datetime
-import hashlib
 import json
 
 import pytest
 
 from galaxy_sync import store as store_mod
-from galaxy_sync.storage import Buckets, StorageError
+from galaxy_sync.storage import Buckets
 from galaxy_sync.store import RETIRED_GRACE, StateChanged, Store
 
 
@@ -51,135 +50,89 @@ def test_state_changed_by_another_run(tmp_path):
 
 def test_requests(tmp_path):
     store = Store(Buckets.local(tmp_path))
-    first = store.add_request(["ns.coll"], True)
-    second = store.add_request([], False)
+    first = store.add_request("mirror", ["ns.coll"], revalidate=True)
+    second = store.add_request("generate-plugins", [], from_plugin_cache=True)
     taken = store.requests()
     assert [key for key, _ in taken] == sorted([first, second])
-    assert {tuple(r["targets"]): r["revalidate"] for _, r in taken} == {("ns.coll",): True, (): False}
+    assert sorted(({k: v for k, v in r.items() if k != "requested"} for _, r in taken), key=lambda r: r["action"]) == [
+        {"action": "generate-plugins", "targets": [], "from_plugin_cache": True},
+        {"action": "mirror", "targets": ["ns.coll"], "revalidate": True},
+    ]
     store.delete_request(first)
     assert [key for key, _ in store.requests()] == [second]
 
 
-def _listed(store, name="coll"):
-    return json.loads(store.index.read("collections.json"))["namespaces"]["ns"][name]
-
-
-LINE = {
-    "v": 1,
-    "name": "ns.coll",
-    "vers": "1.0.0",
-    "deps": [],
-    "sha256": "a" * 64,
-    "size": 1,
-    "yanked": False,
-    "published": "2026-01-01T00:00:00Z",
-}
-
-
-def test_collections_sha256(tmp_path):
-    store = Store(Buckets.local(tmp_path))
-    _ = store.write_index("ns", "coll", [LINE])
-    store.write_collections()
-    sha256 = _listed(store)["sha256"]
-    data = store.index.read(f"index/{sha256[:2]}/{sha256}.jsonl")
-    assert data is not None
-    assert hashlib.sha256(data).hexdigest() == sha256
-    # Nothing by name, in either bucket.
-    assert store.index.read("index/ns/coll.jsonl") is None
-    assert list(store.state_bucket.list("index/")) == []
-    assert store.read_index("ns", "coll") == [LINE]
-
-
-def test_read_index_missing_file(tmp_path):
-    store = Store(Buckets.local(tmp_path))
-    assert store.read_index("ns", "never") == []
-    _ = store.write_index("ns", "coll", [LINE])
-    for key in list(store.index.list("index/")):
-        store.index.delete(key)
-    # Never read as empty, which would mirror the whole collection again.
-    with pytest.raises(StorageError, match=r"ns\.coll's index file .* is missing"):
-        _ = store.read_index("ns", "coll")
-
-
-def _published(store, data):
-    sha256 = hashlib.sha256(data).hexdigest()
-    return store.index.read(f"index/{sha256[:2]}/{sha256}.jsonl")
-
-
-def test_index_file_published_once(tmp_path):
-    store = Store(Buckets.local(tmp_path))
-    assert store.write_index("ns", "coll", [LINE])
-    assert not store.write_index("ns", "coll", [LINE])
-    assert store.write_index("ns", "coll", [{**LINE, "yanked": True}])
-
-    # One file per content, each kept: the old one until pruning removes it.
-    assert len(list(store.index.list("index/"))) == 2
-    assert store.index_collections() == [("ns", "coll")]
-    assert store.read_index("ns", "coll") == [{**LINE, "yanked": True}]
-
-
-def test_unchanged_index_file_writes_nothing(tmp_path):
-    store = Store(Buckets.local(tmp_path))
-    _ = store.write_index("ns", "coll", [LINE])
-    written = []
-    store.index.write = lambda key, data: written.append(key)  # pyright: ignore[reportAttributeAccessIssue]
-    assert not store.write_index("ns", "coll", [LINE])
-    assert written == []
-
-
-def test_stopped_run_keeps_the_old_file(tmp_path):
-    store = Store(Buckets.local(tmp_path))
-    _ = store.write_index("ns", "coll", [LINE])
-    store.save_state()
-    _ = store.write_index("ns", "coll", [{**LINE, "yanked": True}])
-
-    # The run stops before saving state: the next one reads the file it replaced, and reconciles from there.
-    assert Store(Buckets.local(tmp_path)).read_index("ns", "coll") == [LINE]
-
-
 def test_prune(tmp_path, monkeypatch):
     store = Store(Buckets.local(tmp_path))
-    _ = store.write_index("ns", "coll", [LINE])
-    old = next(iter(store.index.list("index/")))
-    _ = store.write_index("ns", "coll", [{**LINE, "yanked": True}])
-    store.index.write("index/ns/coll.jsonl", b"an old file by name\n")
-    store.write_collections()
+    for key in ("index/aa/old.jsonl", "index/bb/current.jsonl", "index/ns/coll.jsonl"):
+        store.index.write(key, b"x\n")
     assert store.prune_due()
 
     start = datetime.datetime(2026, 10, 1, tzinfo=datetime.UTC)
     monkeypatch.setattr(store_mod, "now", lambda: start.isoformat())
-    assert store.prune_index_files() == 0
-    assert set(store.state["retired_index_files"]) == {old, "index/ns/coll.jsonl"}
+    assert store.prune_index_files({"index/bb/current.jsonl"}) == 0
+    assert set(store.state["retired_index_files"]) == {"index/aa/old.jsonl", "index/ns/coll.jsonl"}
     assert not store.prune_due()
 
     # Kept until no listing has named them for RETIRED_GRACE.
     monkeypatch.setattr(store_mod, "now", lambda: (start + RETIRED_GRACE - datetime.timedelta(minutes=1)).isoformat())
-    assert store.prune_index_files() == 0
+    assert store.prune_index_files({"index/bb/current.jsonl"}) == 0
     monkeypatch.setattr(store_mod, "now", lambda: (start + RETIRED_GRACE).isoformat())
-    assert store.prune_index_files() == 2
+    assert store.prune_index_files({"index/bb/current.jsonl"}) == 2
     assert "retired_index_files" not in store.state
-    [current] = store.index.list("index/")
-    assert current == store.index_key(_listed(store)["sha256"])
+    assert list(store.index.list("index/")) == ["index/bb/current.jsonl"]
 
 
 def test_prune_forgets_a_file_named_again(tmp_path):
     store = Store(Buckets.local(tmp_path))
-    _ = store.write_index("ns", "coll", [LINE])
-    first = next(iter(store.index.list("index/")))
-    _ = store.write_index("ns", "coll", [{**LINE, "yanked": True}])
-    store.write_collections()
-    _ = store.prune_index_files()
-    assert set(store.state["retired_index_files"]) == {first}
+    store.index.write("index/aa/first.jsonl", b"x\n")
+    store.index.write("index/bb/second.jsonl", b"y\n")
+    _ = store.prune_index_files({"index/bb/second.jsonl"})
+    assert set(store.state["retired_index_files"]) == {"index/aa/first.jsonl"}
 
     # Unyanked: the first file is named again, so it's no longer retired.
-    _ = store.write_index("ns", "coll", [LINE])
-    store.write_collections()
-    _ = store.prune_index_files()
-    assert first not in store.state.get("retired_index_files", {})
+    _ = store.prune_index_files({"index/aa/first.jsonl"})
+    assert "index/aa/first.jsonl" not in store.state.get("retired_index_files", {})
 
 
-def test_prune_needs_this_runs_listing(tmp_path):
+def test_state_from_before_alai_index_is_dropped(tmp_path):
+    verdict = {"sha256": "b" * 64, "same_contents": True}
+    old = {
+        "collections": {
+            "ns.coll": {
+                "versions": {"1.0.0": {"created_at": "2026-01-01T00:00:00Z", "upstream": verdict}, "1.1.0": {}},
+                "sha256": "a" * 64,
+                "updated": "2026-01-01T00:00:00Z",
+                "upstream_count": 2,
+            },
+            "ns.plain": {"versions": {}, "upstream_count": 1},
+        },
+        "conflicts": [],
+        "failures": {
+            "*@builtin#pypi_unavailable": {"collection": "*", "version": "builtin", "kind": "pypi_unavailable"},
+            "*@feed#galaxy_unavailable": {"collection": "*", "version": "feed", "kind": "galaxy_unavailable"},
+            "ns.coll@1.0.0#extract_error": {"collection": "ns.coll", "version": "1.0.0", "kind": "extract_error"},
+        },
+        "pending": {},
+        "builtin": {"checked": "2026-01-01T00:00:00Z"},
+        "rebuild": {"requested": "2026-01-01T00:00:00Z", "after": "ns.a"},
+    }
     store = Store(Buckets.local(tmp_path))
-    store.index.write("index/ns/coll.jsonl", b"x\n")
-    assert store.prune_index_files() == 0
-    assert "retired_index_files" not in store.state
+    store.state_bucket.write("state.json", json.dumps(old).encode())
+
+    state = Store(Buckets.local(tmp_path)).state
+    # A comparison is kept, so Galaxy's artifact isn't downloaded again, and so is the count of versions.
+    assert state["collections"] == {
+        "ns.coll": {"upstream_count": 2, "mirrored": 2, "verdicts": {"1.0.0": verdict}},
+        "ns.plain": {"upstream_count": 1, "mirrored": 0},
+    }
+    # The ansible-core check is gone, and galaxy-sync's extractor with it, so their failures would never clear.
+    assert list(state["failures"]) == ["*@feed#galaxy_unavailable"]
+
+    # Once converted, an extraction failure from alai-index is kept.
+    store = Store(Buckets.local(tmp_path))
+    store.record_failure("ns.coll", "1.0.0", "extract_error", "from alai-index")
+    store.save_state()
+    assert "ns.coll@1.0.0#extract_error" in Store(Buckets.local(tmp_path)).state["failures"]
+    assert "builtin" not in state
+    assert "rebuild" not in state

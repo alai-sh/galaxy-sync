@@ -1,45 +1,13 @@
-"""Reading collection tarballs: MANIFEST.json and the contents digest."""
+"""Comparing collection tarballs."""
 
 import hashlib
 import json
-import tarfile
 
 import pytest
 from helpers import tarball
 
 from galaxy_sync import artifacts
-from galaxy_sync.artifacts import contents_digest, describe_changes, manifest_info
-
-
-@pytest.mark.parametrize(
-    ("members", "expected"),
-    [
-        pytest.param({"./MANIFEST.json": b'{"collection_info": {"name": "c"}}'}, {"name": "c"}, id="dot-prefix"),
-        pytest.param({"MANIFEST.json": b"[1]"}, {}, id="not-an-object"),
-        pytest.param({"MANIFEST.json": b'{"collection_info": "c"}'}, {}, id="info-not-an-object"),
-        pytest.param({"plugins/x.py": b""}, {}, id="missing"),
-        pytest.param(
-            {
-                "MANIFEST.json": b'{"collection_info": {"version": "1.0.0"}}',
-                "./MANIFEST.json": b'{"collection_info": {"version": "1.0.1"}}',
-            },
-            {"version": "1.0.1"},
-            id="appended-twice",
-        ),
-    ],
-)
-def test_manifest_info(members, expected):
-    assert manifest_info(tarball(members)) == expected
-
-
-def test_manifest_info_unreadable(monkeypatch):
-    with pytest.raises(tarfile.TarError):
-        _ = manifest_info(b"not a tarball")
-    with pytest.raises(ValueError, match="Expecting"):
-        _ = manifest_info(tarball({"MANIFEST.json": b"{not json"}))
-    monkeypatch.setattr(artifacts, "_MAX_MANIFEST", 4)
-    with pytest.raises(ValueError, match=r"MANIFEST\.json is 5 bytes"):
-        _ = manifest_info(tarball({"MANIFEST.json": b"{}   "}))
+from galaxy_sync.artifacts import contents_digest, describe_changes
 
 
 def test_contents_digest(monkeypatch):
