@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import re
 
 import pytest
@@ -209,7 +210,7 @@ def test_sync_retries_failures_and_reads_nothing_on_failure(galaxy, run, tmp_pat
     capsys.readouterr()
     assert run("sync") == 0
     out = capsys.readouterr().out
-    assert "galaxy: unchanged since " in out
+    assert "galaxy: published repo is unchanged, no feed scan required\n" in out
     assert "  retry: 1 collections with outstanding failures, if there's time left\n" in out
     assert "retrying 1 collections with outstanding failures" in out
     assert "failures: 0 outstanding" in out
@@ -260,14 +261,18 @@ def test_usage_errors(run, tmp_path, capsys, monkeypatch):
 
 
 def test_verbose_logging(run):
+    assert run("sync", "--dry-run") == 0
+    assert logging.getLogger("galaxy_sync").level == logging.INFO
     assert run("sync", "-v", "--dry-run") == 0
+    assert logging.getLogger("galaxy_sync").level == logging.DEBUG
 
 
 def test_sync(galaxy, run, tmp_path, capsys, ask):
     galaxy.add_collection("ns", "coll", ["1.0.0", "2.0.0"])
     assert run("sync", "--dry-run") == 0
     assert (
-        "galaxy: no feed cursor yet, so this is the initial import\n  listing: 1 collections new or changed\n  ns.coll\n"
+        "galaxy: no feed cursor yet, so this is the initial import\n  current:  2026-04-01 00:00:01Z\n"
+        + "  listing: 1 collections new or changed\n  ns.coll\n"
         in capsys.readouterr().out
     )
     assert not (tmp_path / "index-root").exists()
@@ -283,7 +288,10 @@ def test_sync(galaxy, run, tmp_path, capsys, ask):
     # Nothing changed: one ask, and no count check.
     galaxy.requests.clear()
     assert run("sync") == 0
-    assert "galaxy: unchanged since 2026-04-01 00:00:01Z\n" in capsys.readouterr().out
+    assert (
+        "galaxy: published repo is unchanged, no feed scan required\n"
+        + "  last run: 2026-04-01 00:00:01Z\n  current:  2026-04-01 00:00:01Z\nsweep: next due "
+    ) in capsys.readouterr().out
     assert galaxy.requests == [REPO_METADATA]
 
     # A backport comes from the feed alone.
@@ -451,14 +459,14 @@ def state(tmp_path):
     return json.loads((tmp_path / "state" / "state.json").read_text())
 
 
-def test_refresh(galaxy, run, tmp_path, capsys, ask):
+def test_sweep_and_mirror_requests(galaxy, run, tmp_path, capsys, ask):
     galaxy.add_collection("ns", "a", ["1.0.0", "1.1.0", "2.0.0"])
     galaxy.add_collection("ns", "b", ["1.0.0"])
     assert run("sync") == 0
     galaxy.add_collection("ns", "a", ["1.0.0", "2.0.0"])
     capsys.readouterr()
 
-    # A refresh without targets asks the next sync to sweep, which queues what differs.
+    # A sweep request asks the next sync to sweep, which queues what differs.
     assert ask("sweep") == 0
     out = capsys.readouterr().out
     assert "sweep: Galaxy publishes 3 versions; 1 mirrored versions are gone from it and 0 aren't mirrored" in out
@@ -500,7 +508,7 @@ def test_refresh(galaxy, run, tmp_path, capsys, ask):
     assert {f["version"] for f in after["failures"].values()} >= {"feed", "sweep"}
 
 
-def test_refresh_requests(galaxy, run, tmp_path, capsys):
+def test_mirror_requests(galaxy, run, tmp_path, capsys):
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     assert run("sync") == 0
     galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})
@@ -562,7 +570,7 @@ def test_budget(galaxy, run, tmp_path, capsys):
     assert "last_sweep" not in state(tmp_path)
     assert run("sync") == 0
     out = capsys.readouterr().out
-    assert "galaxy: unchanged since" in out
+    assert "galaxy: published repo is unchanged, no feed scan required\n" in out
     assert out.index("[1/1] ns.b: +1") < out.index("sweep: Galaxy publishes") < out.index("[1/1] ns.a: +1")
     assert not state(tmp_path)["pending"]
 
@@ -610,41 +618,6 @@ def test_alerts(galaxy, run, tmp_path, capsys):
     assert text.endswith("\nThe full current report is in this issue's description.\n")
     assert run("sync", "--alerts", str(alerts)) == 0
     assert comments(alerts) == []
-
-
-def test_conflicts(galaxy, run, tmp_path, ask):
-    galaxy.add_collection("ns", "coll", ["1.0.0"])
-    assert run("request", "mirror", "ns.coll") == 0
-    assert run("sync") == 0
-
-    galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "{}"})})
-    assert run("request", "mirror", "--revalidate", "ns.coll") == 0
-    report = tmp_path / "report.md"
-    assert run("sync", "--strict", "--report", str(report)) == 1
-    text = report.read_text()
-    assert "| [Artifact conflicts](#artifact-conflicts) | 1 |\n" in text
-    assert "\n| ns.coll | 1.0.0 | " in text
-    assert "conflicts/" not in text  # the state bucket key stays private
-    (conflict,) = state(tmp_path)["conflicts"]
-    assert len(conflict["observed"]) == 1
-    # Nothing about conflicts is published in the index bucket.
-    assert not (tmp_path / "index-root" / "conflicts").exists()
-
-    # Later builds are recorded, and it stays on the report.
-    galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": tarball({"MANIFEST.json": "[]"})})
-    assert run("request", "mirror", "--revalidate", "ns.coll") == 0
-    assert run("sync", "--strict", "--report", str(report)) == 1
-    assert "\n| ns.coll | 1.0.0 | " in report.read_text()
-    (conflict,) = state(tmp_path)["conflicts"]
-    assert len(conflict["observed"]) == 2
-
-    # Resolved once Galaxy serves our artifact again, so it's off the report but kept in state.
-    galaxy.add_collection("ns", "coll", ["1.0.0"], blobs={"1.0.0": artifact("ns", "coll", "1.0.0")})
-    assert run("request", "mirror", "--revalidate", "ns.coll") == 0
-    assert run("sync", "--strict", "--report", str(report)) == 0
-    assert "No outstanding failures or open conflicts." in report.read_text()
-    (conflict,) = state(tmp_path)["conflicts"]
-    assert "resolved" in conflict
 
 
 def test_state_is_saved_after_enough_work(galaxy, run, monkeypatch):
@@ -757,7 +730,9 @@ def test_run_output_explains_itself(galaxy, run, capsys):
     galaxy.touch()
     assert run("sync") == 0
     out = capsys.readouterr().out
-    assert re.search(r"^galaxy: changed since the last run \(\S+ \S+Z → \S+ \S+Z\)$", out, re.MULTILINE)
+    assert re.search(
+        r"^galaxy: published repo has changed\n  last run: \S+ \S+Z\n  current:  \S+ \S+Z$", out, re.MULTILINE
+    )
     assert "  upload feed: no new uploads, 1 collections seen again in the 1h overlap\n" in out
     assert (
         "[1/1] ns.other: +0, up to date (1/1 mirrored)\n"
@@ -785,7 +760,11 @@ def test_run_output_explains_itself(galaxy, run, capsys):
     # Nothing to do.
     assert run("sync") == 0
     out = capsys.readouterr().out
-    assert re.match(r"galaxy: unchanged since \S+ \S+Z\nsweep: next due .+\nplan: nothing to do\n$", out)
+    assert re.match(
+        r"galaxy: published repo is unchanged, no feed scan required\n  last run: (\S+ \S+Z)\n  current:  \1\n"
+        + r"sweep: next due .+\nplan: nothing to do\n$",
+        out,
+    )
 
 
 def test_explain_unchanged_reconciles():

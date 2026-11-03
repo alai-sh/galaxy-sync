@@ -24,6 +24,7 @@ from .models import (
     GalaxyRepoMetadata,
     GalaxySearchPage,
     GalaxySearchRow,
+    GalaxyVersion,
 )
 
 log = logging.getLogger(__name__)
@@ -142,7 +143,7 @@ class GalaxyClient:
         pages = items = 0
         while next_url:
             page = cast(GalaxyPage, self.get_json(next_url))
-            data = page.get("data", page.get("results", []))
+            data = page.get("data", [])
             yield from data
             pages += 1
             items += len(data)
@@ -163,6 +164,11 @@ class GalaxyClient:
             return cast(GalaxyCollection, self.get_json(f"/api/v3/collections/{namespace}/{name}/"))
         except NotFound:
             return None
+
+    def version(self, namespace: str, name: str, version: str) -> GalaxyVersion:
+        """A version's page, with its artifact's sha256 and download URL. Raises NotFound if Galaxy no longer has it."""
+        path = f"/api/v3/collections/{namespace}/{name}/versions/{urllib.parse.quote(version, safe='')}/"
+        return cast(GalaxyVersion, self.get_json(path))
 
     # Best effort: callers must cope with these failing.
 

@@ -82,7 +82,7 @@ def test_paged_follows_pages(galaxy, client):
         "/api/v3/plugin/ansible/content/published/collections/index/?limit=100",
         {"data": [{"namespace": "ns", "name": "a"}], "links": {"next": f"{galaxy.url}/page2"}},
     )
-    galaxy.json("/page2", {"results": [{"namespace": "ns", "name": "b"}], "links": {"next": None}})
+    galaxy.json("/page2", {"data": [{"namespace": "ns", "name": "b"}], "links": {"next": None}})
     assert [c["name"] for c in client.list_collections()] == ["a", "b"]
 
 

@@ -1,6 +1,6 @@
 """The sync's own state and files, on top of one storage backend per bucket.
 
-    index bucket   conflicts/<ns>/<name>.json, and pruning index/
+    index bucket   pruning index/
     state bucket   state.json, conflicts/, requests/
 
 The index itself is alai-index's, through tree.py. See docs/storage.md.
@@ -36,8 +36,14 @@ SOURCES = ("requested", "uploaded", "listed", "swept")
 # counts one, and so does each collection reconciled.
 SAVE_EVERY = 100
 
-# Failure kinds reconciling a collection again doesn't clear.
-NOT_RETRIED = frozenset({"extract_error"})
+# Failure kinds a reconcile clears only by fixing them: the version extracted
+# again, or its artifact restored. A version checked without a failure keeps them.
+KEPT = ("extract_error", "artifact_missing", "artifact_lost")
+
+# Failure kinds reconciling a collection again doesn't fix, so it isn't retried
+# for them. An artifact_missing is retried, as reconcile restores it from Galaxy;
+# once Galaxy can't give it back it's an artifact_lost, which needs a person.
+NOT_RETRIED = frozenset({"extract_error", "artifact_lost"})
 
 # A failure outstanding this long is reported once as needing a person.
 PERSISTENT = datetime.timedelta(days=1)
@@ -230,7 +236,8 @@ class Store:
 
     def failed_collections(self) -> list[tuple[str, str]]:
         """Collections whose failures reconciling them again can clear. An extraction that failed isn't tried again
-        until alai-index's extraction changes, or a generate-plugins request asks for it."""
+        until alai-index's extraction changes, or a generate-plugins request asks for it, and an artifact Galaxy can't
+        give back only when the collection is reconciled for something else."""
         names = {e["collection"] for e in self.state["failures"].values() if e["kind"] not in NOT_RETRIED} - {GLOBAL}
         return sorted((ns, name) for ns, _, name in (n.partition(".") for n in names))
 

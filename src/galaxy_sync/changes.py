@@ -315,11 +315,11 @@ def sweep(client: GalaxyClient, store: Store, tree: Tree) -> Sweep:
     for fqcn, lines in sorted(tree.published_lines().items()):
         mirrored.add(fqcn)
         upstream = published.get(fqcn, {})
-        have = {line["vers"] for line in lines if not line["yanked"]}
+        have = {line.version.text for line in lines if not line.yanked}
         cstate = store.collection_state(fqcn)
         cstate["mirrored"] = len(have)
         # Galaxy's upload time when it was mirrored, or of the artifact it serves instead.
-        uploaded = {line["vers"]: line["published"] for line in lines}
+        uploaded = {line.version.text: line.published for line in lines}
         uploaded |= {v: when for v, when in store.checked(fqcn).items() if when}
         replaced = {v for v in have & upstream.keys() if upstream[v] and uploaded[v] != upstream[v]}
         unlisted = have - upstream.keys()

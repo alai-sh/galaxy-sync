@@ -1,4 +1,6 @@
-"""Shapes of the JSON the sync reads from Galaxy, the index and its own state.
+"""Shapes of the JSON the sync reads from Galaxy, alai-index and its own state.
+
+Index files are read with alai-core, which owns the index format.
 
 Galaxy responses only list the fields the sync uses. They aren't
 validated at runtime; a response missing a required field fails the
@@ -15,6 +17,15 @@ class GalaxyCollection(TypedDict):
     deprecated: NotRequired[bool]  # best effort, not part of the contract
 
 
+class GalaxyArtifact(TypedDict):
+    sha256: str
+
+
+class GalaxyVersion(TypedDict):
+    download_url: str
+    artifact: GalaxyArtifact
+
+
 class GalaxyLinks(TypedDict):
     next: NotRequired[str | None]
 
@@ -26,9 +37,7 @@ class GalaxyCount(TypedDict):
 class GalaxyPage(TypedDict):
     """One page of any paginated listing; the items' shape depends on the endpoint."""
 
-    # Galaxy returns `data`; older servers used `results`.
     data: NotRequired[list[object]]
-    results: NotRequired[list[object]]
     meta: NotRequired[GalaxyCount]
     links: NotRequired[GalaxyLinks | None]
 
@@ -60,27 +69,6 @@ class GalaxySearchRow(TypedDict):
 
 class GalaxySearchPage(TypedDict):
     meta: GalaxyCount
-
-
-# Index lines (docs/index-spec/), as alai-index writes them.
-
-
-class Dependency(TypedDict):
-    name: str
-    req: str
-
-
-class IndexLine(TypedDict):
-    v: int
-    name: str
-    vers: str
-    deps: list[Dependency]
-    sha256: str
-    size: int
-    requires_ansible: NotRequired[str]
-    yanked: bool
-    deprecated: NotRequired[bool]
-    published: str
 
 
 # alai-index's JSON output (alai-index's README.md, "Results").

@@ -36,6 +36,7 @@ from .changes import (
 from .galaxy import BASE_URL, GalaxyClient, GalaxyError
 from .models import Job, Pending, Request
 from .reconcile import ReconcileFailed, Result, generate_indexes, generate_plugins, reconcile
+from .report import sorted_failures
 from .storage import Buckets, R2Config, StorageError
 from .store import ACTIONS, GLOBAL, NOT_RETRIED, RETIRED_GRACE, SOURCES, Store
 from .times import now
@@ -65,6 +66,7 @@ def _changes(res: Result) -> list[str]:
         ("unyanked", res.unyanked),
         ("CONFLICT", res.conflicts),
         ("conflict resolved", res.resolved),
+        ("restored artifact", res.restored),
     ):
         if versions:
             parts.append(f"{label} {','.join(versions)}")
@@ -187,13 +189,7 @@ def _print_summary(store: Store, worked: dict[str, Result | str], elapsed: float
             else:
                 print(f"  {fqcn:{width}}  {'FAILED':9}  {res}")
 
-    pending = store.state["pending"]
-    sources = collections.Counter(entry["source"] for entry in pending.values())
-    print(
-        f"queue: {len(pending)} collections left ("
-        + ", ".join(f"{sources[source]} {source}" for source in SOURCES)
-        + ")"
-    )
+    print(f"queue: {_queue(store.state['pending'], 'collections left')}")
     if published := store.state.get("published_count"):
         unindexed = sum(len(c.get("unindexed", [])) for c in store.state["collections"].values())
         published += unindexed
@@ -218,9 +214,15 @@ GLOBAL_RETRIES = {
 }
 
 
+def _queue(pending: dict[str, Pending], noun: str = "collections") -> str:
+    """How many collections are queued, by source."""
+    sources = collections.Counter(entry["source"] for entry in pending.values())
+    return f"{len(pending)} {noun} (" + ", ".join(f"{sources[source]} {source}" for source in SOURCES) + ")"
+
+
 def _print_outstanding(store: Store, requests: list[tuple[str, Request]]) -> None:
     """List the failures earlier runs left, by when this run retries them."""
-    failures = sorted(store.state["failures"].values(), key=lambda e: (e["collection"], e["version"] or "", e["kind"]))
+    failures = sorted_failures(list(store.state["failures"].values()))
     if not failures:
         return
     pending = store.state["pending"]
@@ -228,7 +230,7 @@ def _print_outstanding(store: Store, requests: list[tuple[str, Request]]) -> Non
     groups: dict[str, list[str]] = {
         "queued, retried in their place in the queue": [],
         "retried after the queue, if there's time left": [],
-        "extracted again by a generate-plugins request": [],
+        "not retried on their own: a generate-plugins request or a person fixes them": [],
         "run-level": [],
     }
     width = max(len(e["collection"]) for e in failures)
@@ -242,7 +244,7 @@ def _print_outstanding(store: Store, requests: list[tuple[str, Request]]) -> Non
             group = "run-level"
             row += f", {GLOBAL_RETRIES.get(e['version'] or '', 'retried every run')}"
         elif e["kind"] in NOT_RETRIED:
-            group = "extracted again by a generate-plugins request"
+            group = "not retried on their own: a generate-plugins request or a person fixes them"
         elif fqcn in pending or fqcn in targets or fqcn.partition(".")[0] in targets:
             group = "queued, retried in their place in the queue"
         else:
@@ -265,10 +267,6 @@ def _print_outstanding(store: Store, requests: list[tuple[str, Request]]) -> Non
         print(f"  and {len(failures) - SHOW_FAILURES} more; see state.json in the state bucket")
 
 
-def _is_sweep(request: Request) -> bool:
-    return request.get("action") == "sweep"
-
-
 def _what(action: str, targets: list[str], *, revalidate: bool = False, from_plugin_cache: bool = False) -> str:
     """What a request or job asks for."""
     every = ", ".join(targets) or "every collection"
@@ -283,16 +281,14 @@ def _what(action: str, targets: list[str], *, revalidate: bool = False, from_plu
             return f"generate the index lines of {every}"
 
 
-def _asks(request: Request) -> list[str]:
+def _asks(request: Request) -> str:
     """What a request asks for."""
-    return [
-        _what(
-            request.get("action", "?"),
-            request.get("targets", []),
-            revalidate=request.get("revalidate", False),
-            from_plugin_cache=request.get("from_plugin_cache", False),
-        )
-    ]
+    return _what(
+        request.get("action", "?"),
+        request.get("targets", []),
+        revalidate=request.get("revalidate", False),
+        from_plugin_cache=request.get("from_plugin_cache", False),
+    )
 
 
 def _sweep_status(store: Store, requested: bool = False) -> str:
@@ -314,7 +310,7 @@ def _print_plan(store: Store, requests: list[tuple[str, Request]], sweep_due: bo
         lines.append(f"  requests: {len(requests)} waiting")
         for key, request in requests:
             lines.append(f"    {key}, from {_when(request['requested'])}")
-            lines.extend(f"      {ask}" for ask in _asks(request))
+            lines.append(f"      {_asks(request)}")
     for job in store.state.get("jobs", []):
         after = f", continuing after {last}" if (last := job.get("after")) else ""
         what = _what(job["action"], job["targets"], from_plugin_cache=job.get("from_plugin_cache", False))
@@ -323,12 +319,7 @@ def _print_plan(store: Store, requests: list[tuple[str, Request]], sweep_due: bo
         lines.append("  sweep: queues everything that differs from Galaxy")
     pending = store.state["pending"]
     if pending:
-        sources = collections.Counter(entry["source"] for entry in pending.values())
-        lines.append(
-            f"  queue: {len(pending)} collections ("
-            + ", ".join(f"{sources[source]} {source}" for source in SOURCES)
-            + ")"
-        )
+        lines.append(f"  queue: {_queue(pending)}")
         lines.append(f"    {few([f'{ns}.{name}' for ns, name in store.queued()], 5)}")
     if retry := [c for c in store.failed_collections() if f"{c[0]}.{c[1]}" not in pending]:
         lines.append(f"  retry: {len(retry)} collections with outstanding failures, if there's time left")
@@ -342,15 +333,21 @@ def _print_plan(store: Store, requests: list[tuple[str, Request]], sweep_due: bo
 
 def _print_discovery(res: Discovery, previous: str | None, initial: bool) -> None:
     """Whether Galaxy changed since the last run, and what finding changes turned up."""
-    if res.unchanged and res.published:
-        print(f"galaxy: unchanged since {_when(res.published)}")
-        return
-    if initial:
+    if res.unchanged:
+        print("galaxy: published repo is unchanged, no feed scan required")
+    elif initial:
         print("galaxy: no feed cursor yet, so this is the initial import")
     elif previous and res.published:
-        print(f"galaxy: changed since the last run ({_when(previous)} → {_when(res.published)})")
+        print("galaxy: published repo has changed")
     else:
         print("galaxy: checking for changes since the last run")
+    # One under the other, so they're easy to compare.
+    if previous:
+        print(f"  last run: {_when(previous)}")
+    if res.published:
+        print(f"  current:  {_when(res.published)}")
+    if res.unchanged:
+        return
     if not res.feed:
         print("  upload feed: couldn't be read")
     elif not initial:
@@ -377,7 +374,7 @@ def _queue_requests(client: GalaxyClient, store: Store, requests: list[tuple[str
             if request.get("from_plugin_cache"):
                 job["from_plugin_cache"] = True
             store.state.setdefault("jobs", []).append(job)
-            print(f"{what}: {_asks(request)[0]}, starting this run")
+            print(f"{what}: {_asks(request)}, starting this run")
         elif action not in ("mirror", "sweep"):  # only a hand-written request, or one from before `request`
             print(f"{what}: dropped: it asks for {action!r}, which isn't one of {', '.join(ACTIONS)}", file=sys.stderr)
         elif action == "sweep":
@@ -615,7 +612,6 @@ def _finish(
         f"failures: {summary.outstanding} outstanding, {summary.new} new, {summary.resolved} resolved; "
         + f"{summary.conflicts} open conflicts (see state.json in the state bucket)"
     )
-    print(_sweep_status(store))
     print(f"{client.requests} Galaxy requests")
     if headline := summary.alerts.headline():
         print(headline)
@@ -670,7 +666,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     store.save_state()
 
     requests = store.requests()
-    asked = any(_is_sweep(r) for _, r in requests)
+    asked = any(r.get("action") == "sweep" for _, r in requests)
     print(_sweep_status(store, asked))
     _print_plan(store, requests, asked or _sweep_due(store), args.budget)
     _print_outstanding(store, requests)

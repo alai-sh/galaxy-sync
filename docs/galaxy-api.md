@@ -17,7 +17,7 @@ guaranteed, and the only ones `reconcile` uses.
 |---|---|
 | `GET /api/v3/collections/<ns>/<name>/` | `created_at`, `updated_at`, `deprecated` (best effort). A 404 means the collection is deleted |
 | `GET /api/v3/collections/<ns>/<name>/versions/?limit=100` | `data[]` (or `results[]`) `.version`, `.created_at`, `.requires_ansible`; follow `links.next`. A missing collection returns an empty list, never a 404 |
-| `GET /api/v3/collections/<ns>/<name>/versions/<ver>/` | `artifact.sha256`, `download_url`, `metadata.dependencies`, `created_at`. A 404 means the version is deleted |
+| `GET /api/v3/collections/<ns>/<name>/versions/<ver>/` | `artifact.sha256`, `download_url`, `metadata.dependencies`, `created_at`. A 404 means the version is deleted. galaxy-sync reads it itself only to download a missing artifact again |
 | `GET <download_url>` | 302 to a signed, time-limited URL; the bare content URL is 403 |
 
 `artifact.size`, `manifest`, `files` and `deprecated` aren't in the contract:
@@ -35,7 +35,7 @@ Used only to decide which collections to reconcile. Base
 | `content/published/collections/` | `sync` | `{"published": ...}`, the creation time of the repo's newest version. Moves on any change. pulp_ansible's own sync uses it to skip unchanged remotes. ~1 s |
 | `search/collection-versions/?repository_name=published&order_by=-pulp_created&limit=100` | `sync` and its sweep | The upload feed: every published version, newest upload first, with `pulp_created`, `dependencies` and `requires_ansible`; `meta.count` is the published version count. Pages are capped at 100 rows, ~3.5-5 s each at any offset |
 | `content/published/collections/index/?limit=100` | `sync` and its sweep | The listing: every collection with `updated_at`, `highest_version` and `deprecated`. ~46 pages, not strictly ordered, so read it to the end |
-| `content/published/collections/index/?limit=100&namespace=<ns>` | `sync`, taking a `refresh <ns>` request | One namespace's collections |
+| `content/published/collections/index/?limit=100&namespace=<ns>` | `sync`, taking a `mirror <ns>` request | One namespace's collections |
 
 The feed is a sorted snapshot of what's published now, not an event log:
 each version appears once, at the time its published artifact was

@@ -29,6 +29,7 @@ name = "alai-galaxy-sync"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
+    { name = "alai-core" },
     { name = "alai-index" },
     { name = "boto3" },
 ]
@@ -47,6 +48,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "alai-core" },
     { name = "alai-index", git = "https://github.com/alai-sh/alai-index?rev=4e945fff4e6e447b940b9662764aaf0d71164a40" },
     { name = "boto3", specifier = ">=1.43.114" },
 ]

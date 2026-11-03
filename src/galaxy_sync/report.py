@@ -71,8 +71,10 @@ SECTIONS: list[tuple[str, tuple[str, ...], str]] = [
     ("Invalid version details", ("bad_detail",), "Galaxy's page for the version has no download URL or sha256."),
     (
         "Missing artifacts",
-        ("artifact_missing",),
-        "The version's artifact isn't in the artifact bucket, so its plugins can't be extracted again.",
+        ("artifact_missing", "artifact_lost"),
+        "The version's artifact isn't in the artifact bucket, so it can't be installed. An artifact_missing is "
+        + "downloaded from Galaxy again on the next run. An artifact_lost is one Galaxy deleted or serves other bytes "
+        + "for, so a person has to put it back.",
     ),
     (
         "alai-index refusals",
@@ -132,7 +134,7 @@ def _conflict_rows(conflicts: list[Conflict]) -> list[str]:
     return rows
 
 
-def _sorted_failures(failures: list[Failure]) -> list[Failure]:
+def sorted_failures(failures: list[Failure]) -> list[Failure]:
     return sorted(failures, key=lambda e: (e["collection"], e["version"] or "", e["kind"]))
 
 
@@ -170,7 +172,7 @@ class Alerts:
                 "",
                 "Each failure is reported once:",
                 "",
-                *_failure_rows(_sorted_failures(self.persistent), attempts=True),
+                *_failure_rows(sorted_failures(self.persistent), attempts=True),
                 "",
                 "The full current report is in this issue's description.",
             ]
@@ -201,7 +203,7 @@ def render(
     alerts: Alerts,
 ) -> Report:
     """Render the report from the ledger, the open conflicts, and the keys that appeared or cleared this run."""
-    outstanding = _sorted_failures(list(failures.values()))
+    outstanding = sorted_failures(list(failures.values()))
     conflicts = _sorted_conflicts(conflicts)
     summary = Summary(len(failures), len(new), len(resolved), len(conflicts), alerts)
 

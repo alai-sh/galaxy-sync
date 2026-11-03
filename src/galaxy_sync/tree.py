@@ -27,7 +27,9 @@ from compression import zstd
 from pathlib import Path
 from typing import cast
 
-from .models import IndexFiles, IndexLine, IndexOutput
+from alai_core.index import CollectionIndex, Collections, CollectionVersion, Config
+
+from .models import IndexFiles, IndexOutput
 from .storage import Buckets, StorageError
 
 log = logging.getLogger(__name__)
@@ -60,12 +62,19 @@ class AlaiIndexError(Exception):
     """alai-index refused a command, which leaves the tree as it was."""
 
 
-def _fill(template: str, sha256: str) -> str:
-    return template.replace("{sha256-prefix}", sha256[:2]).replace("{sha256-checksum}", sha256)
-
-
 def _no_files() -> IndexFiles:
     return {"dl": [], "index": [], "plugin-cache": []}
+
+
+def _parse(fqcn: str, data: bytes) -> tuple[CollectionVersion, ...]:
+    """A collection's index lines, all of them: one that can't be read is never left out, which would make the
+    version look unmirrored or deleted."""
+    index = CollectionIndex.parse(data, fqcn)
+    if index.invalid or index.newer:
+        problems = [f"line {n}: {why}" for n, why in index.invalid]
+        problems += [f"{index.newer} lines in a newer format"] if index.newer else []
+        raise StorageError(f"{fqcn}'s index file can't be read: {'; '.join(problems)}")
+    return index.lines
 
 
 class Tree:
@@ -103,14 +112,17 @@ class Tree:
                     "the index bucket has config.json but no collections.json, its record of collections"
                 )
             self._save(self.root / "collections.json", listing)
+        self.config = Config.parse((self.root / "config.json").read_bytes())
         self._read_listing()
-        self.dl_template = cast(str, json.loads((self.root / "config.json").read_bytes())["dl"])
 
     def _read_listing(self) -> None:
-        namespaces = json.loads((self.root / "collections.json").read_bytes())["namespaces"]
-        self.listing = {
-            f"{ns}.{name}": entry["sha256"] for ns, names in namespaces.items() for name, entry in names.items()
-        }
+        listing = Collections.parse((self.root / "collections.json").read_bytes())
+        self.listing = {}
+        for fqcn in listing:
+            if (entry := listing.get(fqcn)) is None or entry.sha256 is None:
+                # Never left out, which would mirror the whole collection again.
+                raise StorageError(f"collections.json has no index file for {fqcn}")
+            self.listing[fqcn] = entry.sha256
 
     @staticmethod
     def _save(path: Path, data: bytes) -> None:
@@ -125,14 +137,15 @@ class Tree:
 
     def index_file(self, fqcn: str) -> str:
         """A collection's current index file, as a key in the index bucket."""
-        return _fill(INDEX_TEMPLATE, self.listing[fqcn])
+        return self.config.index_path(name=fqcn, sha256=self.listing[fqcn])
 
-    def artifact_key(self, sha256: str) -> str:
-        """An artifact's key in the dl bucket, the path of its URL."""
-        return urllib.parse.urlsplit(_fill(self.dl_template, sha256)).path.lstrip("/")
+    def artifact_key(self, line: CollectionVersion) -> str:
+        """A version's artifact's key in the dl bucket, the path of its URL."""
+        url = self.config.artifact_path(name=line.name, version=line.version, sha256=line.sha256)
+        return urllib.parse.unquote(urllib.parse.urlsplit(url).path.lstrip("/"))
 
-    def read_artifact(self, sha256: str) -> bytes | None:
-        return self.buckets.dl.read(self.artifact_key(sha256))
+    def read_artifact(self, line: CollectionVersion) -> bytes | None:
+        return self.buckets.dl.read(self.artifact_key(line))
 
     def fetch(self, fqcns: Iterable[str]) -> None:
         """Fetch what alai-index reads of these collections, those the index has and this run hasn't fetched yet: each
@@ -198,22 +211,21 @@ class Tree:
             return None
         return sum(1 for line in path.read_bytes().splitlines() if line.strip())
 
-    def lines(self, fqcn: str) -> list[IndexLine]:
+    def lines(self, fqcn: str) -> tuple[CollectionVersion, ...]:
         """A collection's index lines, fetching its files if they aren't yet, or none if the index doesn't have it."""
         if fqcn not in self.listing:
-            return []
+            return ()
         self.fetch([fqcn])
-        data = (self.root / self.index_file(fqcn)).read_bytes()
-        return [cast(IndexLine, json.loads(raw)) for raw in data.splitlines() if raw.strip()]
+        return _parse(fqcn, (self.root / self.index_file(fqcn)).read_bytes())
 
-    def published_lines(self) -> dict[str, list[IndexLine]]:
+    def published_lines(self) -> dict[str, tuple[CollectionVersion, ...]]:
         """Every collection's index lines, read from the index bucket rather than fetched into the tree."""
 
-        def get(fqcn: str) -> list[IndexLine]:
+        def get(fqcn: str) -> tuple[CollectionVersion, ...]:
             if (data := self.buckets.index.read(key := self.index_file(fqcn))) is None:
                 # Never taken as empty, which would make every version look deleted.
                 raise StorageError(f"{fqcn}'s index file {key} is missing")
-            return [cast(IndexLine, json.loads(raw)) for raw in data.splitlines() if raw.strip()]
+            return _parse(fqcn, data)
 
         with concurrent.futures.ThreadPoolExecutor(FETCHERS) as pool:
             return dict(zip(self.listing, pool.map(get, self.listing), strict=True))

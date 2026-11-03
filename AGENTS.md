@@ -9,7 +9,10 @@ The index itself, index lines, plugin extraction, `plugins.jsonl` and
 `collections.json`, is built by
 [alai-index](https://github.com/alai-sh/alai-index). galaxy-sync runs its
 command line and never imports it, as its modules are private. Everything
-it needs comes from alai-index's JSON output. It isn't on PyPI yet, so
+it needs comes from alai-index's JSON output. Index files and versions are
+read with [alai-core](https://github.com/alai-sh/alai-core), the format
+library alai-index uses, never parsed by hand; its version is the one
+alai-index needs. alai-index isn't on PyPI yet, so
 `pyproject.toml` pins it as a git source at a commit. To pick up alai-index
 changes, bump `rev` and run `uv lock`. To develop against a local checkout
 without changing the pin, use `uv pip install -e ../alai-index` (the next
@@ -51,8 +54,8 @@ never a real bucket.
 | `store.py` | The sync's own state on top of the backends: the queue, requests, the failure ledger, conflicts and pruning |
 | `report.py` | Rendering the tracking issue's report block and alert comment |
 | `storage.py` | The `Backend` interface (one per bucket), `LocalBackend` and `R2Backend` |
-| `models.py` | TypedDicts for Galaxy responses, index lines, alai-index's JSON output, and state |
-| `semver.py`, `times.py` | SemVer 2.0.0 precedence; RFC 3339 timestamps |
+| `models.py` | TypedDicts for Galaxy responses, alai-index's JSON output, and state |
+| `semver.py`, `times.py` | Sorting versions with alai-core's SemVer precedence; RFC 3339 timestamps |
 
 `docs/index-spec/` specifies the index format; `out/` is local run output,
 gitignored.
@@ -69,7 +72,9 @@ gitignored.
   Change detection only picks collections. Only a 404 from
   `GET /api/v3/collections/<ns>/<name>/`, or for one version from
   `.../versions/<ver>/`, counts as a deletion, so a flaky, truncated or
-  shifting feed or listing can't yank anything.
+  shifting feed or listing can't yank anything. The one write outside
+  alai-index is reconcile putting back an artifact missing from the dl
+  bucket, and only Galaxy's bytes whose sha256 is the index line's.
 - **Request the CLI-shaped `/api/v3/collections/...` paths**, not the
   `plugin/ansible/content/published/...` paths they redirect to.
 - **Runs never overlap, and work lives in the queue.** Every run reads

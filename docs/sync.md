@@ -247,10 +247,14 @@ a collection at a time in name order. Each job's progress is kept
 (`after`, the last collection done), so one that runs out of budget, or a
 run that stops, carries on from there. A version whose artifact isn't in
 the artifact bucket is recorded as `artifact_missing`, and a collection
-alai-index refuses as `alai_index`, and the job carries on.
+alai-index refuses as `alai_index`, and the job carries on. The next
+reconcile of the collection downloads a missing artifact from Galaxy again,
+if Galaxy still serves the bytes the index line's sha256 names, but doesn't
+redo the job for that version.
 
 A collection's artifacts are fetched and worked 50 at a time (`BATCH`), and
-each batch is deleted before the next is fetched. A collection with many
+each batch is deleted before the next is fetched. That's for jobs and for a
+reconcile extracting out-of-date plugins again. A collection with many
 large artifacts then still fits in the runner's temporary space, which the
 sync workflow puts in RAM (`/dev/shm`).
 
@@ -262,7 +266,11 @@ alai-index command for a collection with nothing out of date.
 A failure never stops a run. It's recorded in the ledger in `state.json`,
 retried by every `sync`, and cleared once it succeeds. An `extract_error` is
 the exception, as reconciling the collection again doesn't extract the
-version again. Each `sync` starts by
+version again, and so is an `artifact_lost`, which needs a person. Neither
+they nor `artifact_missing` are cleared by a reconcile that checks the
+version without a failure: only extracting it again, or putting the
+artifact back, does. A collection is still reconciled for other reasons,
+and each reconcile tries to restore its missing artifacts. Each `sync` starts by
 listing the outstanding failures, so a run's log shows what it will retry.
 Recorded failures exit 0; `--strict` exits 1.
 
@@ -275,7 +283,8 @@ Recorded failures exit 0; `--strict` exits 1.
 | `bad_detail` | Galaxy's page for the version has no download URL or sha256 |
 | `extract_error` | Extraction failed. The version is still mirrored, and the plugin index has none of its plugins until it's extracted again. When the extractor is fixed, a `generate-plugins` request for the collection tries again, and so does a sync once alai-index's extraction number changes |
 | `alai_index` | alai-index refused a command, which leaves the tree as it was |
-| `artifact_missing` | A version's artifact isn't in the artifact bucket, so its plugins can't be extracted again |
+| `artifact_missing` | A version's artifact isn't in the artifact bucket, so it can't be installed or extracted again. The next reconcile downloads it from Galaxy again, writing it only if its sha256 is the index line's |
+| `artifact_lost` | An `artifact_missing` Galaxy can't give back: it deleted the version or serves other bytes. Not retried on its own; a person puts the artifact back |
 | `deletions_suspected` | Galaxy publishes fewer versions than the mirror last saw |
 | `unexpected` | Any other exception while reconciling a collection |
 

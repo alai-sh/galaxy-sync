@@ -217,7 +217,7 @@ def test_check_count(galaxy, client, store, tree):
     assert check_count(client, store) is None
     assert {f["kind"] for f in store.state["failures"].values()} == {"deletions_suspected", "galaxy_unavailable"}
 
-    # A refresh yanks them and the counts match again.
+    # A sweep request yanks them and the counts match again.
     galaxy.add_collection("ns", "a", ["1.0.0", "2.0.0"])
     galaxy.remove_collection("ns", "gone")
     for name in ("a", "gone"):
