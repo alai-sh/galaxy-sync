@@ -294,7 +294,7 @@ def test_changed_contents_are_a_conflict(galaxy, client, store, tree):
     assert conflict["opened"] == observed["seen"]
     assert store.state["failures"] == {}  # reported as a conflict, not retried as a failure
     report = store.failure_report()
-    assert "### Open conflicts" in report.markdown
+    assert "### Artifact conflicts" in report.markdown
     assert f"| ns.coll | 1.0.0 | {original['sha256'][:12]} | {upstream[:12]} |" in report.markdown
     assert observed["saved"] not in report.markdown  # the state bucket key stays private
     assert report.summary.alerts.conflicts == [conflict]

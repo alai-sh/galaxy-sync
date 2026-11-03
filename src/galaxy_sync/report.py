@@ -38,6 +38,75 @@ def _message(e: Failure) -> str:
     return _cell(message)
 
 
+# Every problem the report counts, in order, as its heading, the failure kinds it holds and what it means. A kind
+# ending in "_" is a prefix. Conflicts aren't failures, so they hold no kinds.
+SECTIONS: list[tuple[str, tuple[str, ...], str]] = [
+    (
+        "Extraction failures",
+        ("extract_error",),
+        "alai-index couldn't read the plugins of these versions. Each version is still mirrored, but plugins.jsonl "
+        + "has none of its plugins until a generate-plugins request extracts it again.",
+    ),
+    (
+        "Artifact conflicts",
+        (),
+        "Galaxy serves another artifact for these versions than the one the mirror has, and the mirror keeps its "
+        + "own. Galaxy's artifacts are saved in the state bucket, and the changes are from the latest one it served.",
+    ),
+    (
+        "Galaxy unavailable",
+        ("galaxy_unavailable",),
+        "Galaxy timed out or answered with a 429 or 5xx, so these are tried again on the next run.",
+    ),
+    ("Galaxy HTTP errors", ("galaxy_http_",), "Galaxy answered with another HTTP error, such as a 403."),
+    (
+        "Checksum mismatches",
+        ("sha256_mismatch",),
+        "The artifact downloaded from Galaxy doesn't match the sha256 Galaxy gives for it.",
+    ),
+    (
+        "Invalid artifacts",
+        ("bad_artifact", "manifest_mismatch"),
+        "The artifact Galaxy serves can't be read, or its MANIFEST.json is for another collection or version.",
+    ),
+    ("Invalid version details", ("bad_detail",), "Galaxy's page for the version has no download URL or sha256."),
+    (
+        "Missing artifacts",
+        ("artifact_missing",),
+        "The version's artifact isn't in the artifact bucket, so its plugins can't be extracted again.",
+    ),
+    (
+        "alai-index refusals",
+        ("alai_index",),
+        "alai-index refused a command for the collection, which leaves the index as it was.",
+    ),
+    (
+        "Suspected deletions",
+        ("deletions_suspected",),
+        "Galaxy publishes fewer versions than the mirror last saw, so the next sweep looks for them to yank.",
+    ),
+    (
+        "Unexpected errors",
+        ("unexpected",),
+        "Something failed in galaxy-sync itself while reconciling the collection.",
+    ),
+    ("Other failures", (), "A failure of a kind this report doesn't know yet."),
+]
+
+
+def _section(kind: str) -> str:
+    """The heading of the section a failure kind is listed in."""
+    for heading, kinds, _ in SECTIONS:
+        if any(kind == k or (k.endswith("_") and kind.startswith(k)) for k in kinds):
+            return heading
+    return "Other failures"
+
+
+def _anchor(heading: str) -> str:
+    """The id GitHub gives a heading, so the count table can link to it."""
+    return re.sub(r"[^a-z0-9 _-]", "", heading.lower()).replace(" ", "-")
+
+
 def _failure_rows(failures: list[Failure], *, attempts: bool) -> list[str]:
     columns = ["Collection", "Version", "Kind"] + (["Attempts"] if attempts else []) + ["First seen", "Message"]
     rows = [f"| {' | '.join(columns)} |", "|" + "---|" * len(columns)]
@@ -156,25 +225,37 @@ def render(
     conflicts = _sorted_conflicts(conflicts)
     summary = Summary(len(failures), len(new), len(resolved), len(conflicts), alerts)
 
-    # No timestamp or attempt counts: the block only changes when what's
-    # outstanding does, so the issue isn't edited every run.
-    lines = [REPORT_START, "## galaxy-sync report", ""]
-    if not outstanding and not conflicts:
-        lines.append("No outstanding failures or open conflicts.")
-    else:
-        lines.append(f"{_n(len(outstanding), 'failure')} outstanding, {_n(len(conflicts), 'open conflict')}.")
-    if outstanding:
-        lines += ["", *_failure_rows(outstanding, attempts=False)]
+    # No timestamp or attempt counts, so the block only changes when what's
+    # outstanding does, and the issue isn't edited every run.
+    listed: dict[str, list[str]] = {heading: [] for heading, _, _ in SECTIONS}
+    by_section: dict[str, list[Failure]] = {}
+    for e in outstanding:
+        by_section.setdefault(_section(e["kind"]), []).append(e)
+    for heading, rows in by_section.items():
+        listed[heading] = _failure_rows(rows, attempts=False)
     if conflicts:
-        lines += [
-            "",
-            "### Open conflicts",
-            "",
-            "Galaxy now serves another artifact for these versions, and the mirror keeps its",
-            "original. Galaxy's artifacts are saved in the state bucket. Changes are from the",
-            "latest build Galaxy served.",
-            "",
-            *_conflict_rows(conflicts),
-        ]
+        listed["Artifact conflicts"] = _conflict_rows(conflicts)
+    counts = {heading: len(by_section.get(heading, [])) for heading, _, _ in SECTIONS}
+    counts["Artifact conflicts"] = len(conflicts)
+
+    lines = [REPORT_START, "## galaxy-sync report", ""]
+    if any(counts.values()):
+        lines += ["| Error | Count |", "|---|---|"]
+        lines += [f"| [{h}](#{_anchor(h)}) | {n} |" for h, n in counts.items() if n]
+    else:
+        lines.append("No outstanding failures or open conflicts.")
+    for heading, _, meaning in SECTIONS:
+        if rows := listed[heading]:
+            noun = "conflict" if heading == "Artifact conflicts" else "failure"
+            lines += [
+                "",
+                f"### {heading}",
+                "",
+                meaning,
+                "",
+                "<details>",
+                f"<summary>{_n(counts[heading], noun)}, click to expand</summary>",
+            ]
+            lines += ["", *rows, "", "</details>"]
     lines.append(REPORT_END)
     return Report("\n".join(lines) + "\n", summary)

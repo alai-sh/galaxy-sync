@@ -75,7 +75,9 @@ class Store:
         self._saved = self.state_bucket.read("state.json")
         if self._saved is not None:
             self.state.update(json.loads(self._saved))
-            _drop_old_state(self.state)
+            # shortcut: drops the markers older migrations left, remove once a sync has saved state.json without them.
+            for key in set(self.state) - SyncState.__required_keys__ - SyncState.__optional_keys__:
+                del cast(dict[str, object], cast(object, self.state))[key]
         # Ledger keys that appeared or cleared during this run, for the report.
         self._new_failures: set[str] = set()
         self._resolved_failures: set[str] = set()
@@ -396,29 +398,3 @@ class Store:
         if deleted:
             log.info("deleted %d retired index files", deleted)
         return deleted
-
-
-def _drop_old_state(state: SyncState) -> None:
-    """Drop what state.json held before alai-index kept the index, which alai-index's private state now holds.
-
-    The versions are counted until the sweep counts them again. A comparison
-    of Galaxy's artifact with ours is dropped, as every artifact Galaxy serves
-    for a version that isn't ours is a conflict. The sweep then finds each
-    version again, and its reconcile opens the conflict.
-    A failure of the ansible-core check, which is gone, would never clear, so
-    it's dropped. So is an extraction failure from galaxy-sync's own
-    extractor, which alai-index's doesn't share.
-    """
-    # Only from before, as an extraction failure from alai-index is kept.
-    if "builtin" in state or any("versions" in c for c in state["collections"].values()):
-        for key in [k for k, f in state["failures"].items() if f["kind"] == "extract_error"]:
-            del state["failures"][key]
-    for key in ("builtin", "plugins_pending", "rebuild", "reextract"):
-        _ = cast(dict[str, object], cast(object, state)).pop(key, None)
-    for key in [k for k, f in state["failures"].items() if (f["collection"], f["version"]) == (GLOBAL, "builtin")]:
-        del state["failures"][key]
-    for cstate in state["collections"].values():
-        old = cast(dict[str, object], cast(object, cstate))
-        _ = old.pop("sha256", None), old.pop("updated", None), old.pop("verdicts", None)
-        if "versions" in old:
-            _ = old.setdefault("mirrored", len(cast(dict[str, object], old.pop("versions") or {})))

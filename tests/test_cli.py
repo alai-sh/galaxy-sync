@@ -111,7 +111,7 @@ def test_plugins_jsonl_is_patched(galaxy, tmp_path, run, ask):
     assert run("sync") == 0
     assert _plugin_collections(tmp_path) == ["ns.one", "ns.two"]
 
-    # A rebuild works every collection's plugin lines out again from its plugin cache.
+    # generate-plugins works every collection's plugin lines out again from its plugin cache.
     _ = one.write_bytes(saved)
     (tmp_path / "index-root" / "plugins.jsonl").unlink()
     assert ask("generate-plugins", "--from-plugin-cache") == 0
@@ -624,7 +624,7 @@ def test_conflicts(galaxy, run, tmp_path, ask):
     report = tmp_path / "report.md"
     assert run("sync", "--strict", "--report", str(report)) == 1
     text = report.read_text()
-    assert "1 open conflict.\n" in text
+    assert "| [Artifact conflicts](#artifact-conflicts) | 1 |\n" in text
     assert "\n| ns.coll | 1.0.0 | " in text
     assert "conflicts/" not in text  # the state bucket key stays private
     (conflict,) = state(tmp_path)["conflicts"]
@@ -721,10 +721,17 @@ def test_report(galaxy, run, tmp_path):
     assert run("request", "mirror", "--revalidate", "ns.coll") == 0
     assert run("sync", "--report", str(report)) == 0
     text = report.read_text()
-    assert "\n1 failure outstanding, 1 open conflict.\n" in text
-    assert "\n| Collection | Version | Kind | First seen | Message |\n|---|---|---|---|---|\n" in text
+    assert "| Error | Count |\n|---|---|\n| [Artifact conflicts](#artifact-conflicts) | 1 |\n" in text
+    assert "| [Galaxy HTTP errors](#galaxy-http-errors) | 1 |\n" in text
+    assert "| 0 |" not in text
+    assert "\n### Galaxy HTTP errors\n\nGalaxy answered with another HTTP error, such as a 403.\n\n<details>\n" in text
+    assert (
+        "<summary>1 failure, click to expand</summary>\n\n| Collection | Version | Kind | First seen | Message |\n|---|---|---|---|---|\n"
+        in text
+    )
     assert "\n| ns.other | 1.0.0 | galaxy_http_403 | 20" in text
-    assert "\n### Open conflicts\n" in text
+    assert "\n### Artifact conflicts\n" in text
+    assert "<summary>1 conflict, click to expand</summary>" in text
     assert "\n| ns.coll | 1.0.0 | " in text
     assert "conflicts/" not in text
     report.unlink()

@@ -273,6 +273,7 @@ Recorded failures exit 0; `--strict` exits 1.
 | `galaxy_http_<code>` | Any other HTTP error |
 | `sha256_mismatch` | Downloaded bytes don't match Galaxy's sha256 |
 | `manifest_mismatch`, `bad_artifact` | The tarball's `MANIFEST.json` is wrong or unreadable |
+| `bad_detail` | Galaxy's page for the version has no download URL or sha256 |
 | `extract_error` | Extraction failed. The version is still mirrored, and the plugin index has none of its plugins until it's extracted again. When the extractor is fixed, a `generate-plugins` request for the collection tries again, and so does a sync once alai-index's extraction number changes |
 | `alai_index` | alai-index refused a command, which leaves the tree as it was |
 | `artifact_missing` | A version's artifact isn't in the artifact bucket, so its plugins can't be extracted again |
@@ -292,7 +293,10 @@ Galaxy serves our artifact again. Both are kept in `state.json`.
 tracking issue instead:
 
 - `sync --report FILE` writes the outstanding failures and the open
-  conflicts as a Markdown block, between `<!-- galaxy-sync:report -->` and
+  conflicts as a Markdown block. It starts with a count of each kind of
+  problem there is (`report.SECTIONS`), linking to its heading. Each heading
+  has a sentence on what the problem means, and its table in a collapsed
+  section. The block goes between `<!-- galaxy-sync:report -->` and
   `<!-- /galaxy-sync:report -->` markers. The scheduled workflow keeps the
   block at the top of the issue's description (`.github/scripts/issue_body.py`
   replaces the previous block, or puts the first one above whatever is

@@ -95,49 +95,6 @@ def test_prune_forgets_a_file_named_again(tmp_path):
     assert "index/aa/first.jsonl" not in store.state.get("retired_index_files", {})
 
 
-def test_state_from_before_alai_index_is_dropped(tmp_path):
-    verdict = {"sha256": "b" * 64, "same_contents": True}
-    old = {
-        "collections": {
-            "ns.coll": {
-                "versions": {"1.0.0": {"created_at": "2026-01-01T00:00:00Z", "upstream": verdict}, "1.1.0": {}},
-                "sha256": "a" * 64,
-                "updated": "2026-01-01T00:00:00Z",
-                "upstream_count": 2,
-            },
-            "ns.plain": {"versions": {}, "upstream_count": 1},
-        },
-        "conflicts": [],
-        "failures": {
-            "*@builtin#pypi_unavailable": {"collection": "*", "version": "builtin", "kind": "pypi_unavailable"},
-            "*@feed#galaxy_unavailable": {"collection": "*", "version": "feed", "kind": "galaxy_unavailable"},
-            "ns.coll@1.0.0#extract_error": {"collection": "ns.coll", "version": "1.0.0", "kind": "extract_error"},
-        },
-        "pending": {},
-        "builtin": {"checked": "2026-01-01T00:00:00Z"},
-        "rebuild": {"requested": "2026-01-01T00:00:00Z", "after": "ns.a"},
-    }
-    store = Store(Buckets.local(tmp_path))
-    store.state_bucket.write("state.json", json.dumps(old).encode())
-
-    state = Store(Buckets.local(tmp_path)).state
-    # The count of versions is kept, and the comparison is dropped, as the sweep finds the version again.
-    assert state["collections"] == {
-        "ns.coll": {"upstream_count": 2, "mirrored": 2},
-        "ns.plain": {"upstream_count": 1, "mirrored": 0},
-    }
-    # The ansible-core check is gone, and galaxy-sync's extractor with it, so their failures would never clear.
-    assert list(state["failures"]) == ["*@feed#galaxy_unavailable"]
-
-    # Once converted, an extraction failure from alai-index is kept.
-    store = Store(Buckets.local(tmp_path))
-    store.record_failure("ns.coll", "1.0.0", "extract_error", "from alai-index")
-    store.save_state()
-    assert "ns.coll@1.0.0#extract_error" in Store(Buckets.local(tmp_path)).state["failures"]
-    assert "builtin" not in state
-    assert "rebuild" not in state
-
-
 def test_failed_collections_skip_extraction_failures(tmp_path):
     store = Store(Buckets.local(tmp_path))
     store.record_failure("ns.extract", "1.0.0", "extract_error", "bad manifest")
@@ -148,13 +105,20 @@ def test_failed_collections_skip_extraction_failures(tmp_path):
     assert store.failed_collections() == [("ns", "both")]
 
 
-def test_verdicts_are_dropped(tmp_path):
-    current = {
-        "collections": {"ns.coll": {"mirrored": 1, "verdicts": {"1.0.0": {"sha256": "b" * 64, "same_contents": True}}}},
+def test_keys_from_older_migrations_are_dropped(tmp_path):
+    old = {
+        "collections": {},
         "conflicts": [],
         "failures": {},
         "pending": {},
+        "feed_cursor": "a",
+        "migration": {"done": True},
     }
-    Store(Buckets.local(tmp_path)).state_bucket.write("state.json", json.dumps(current).encode())
-    # Every artifact Galaxy serves that isn't ours is a conflict, which the sweep finds again.
-    assert Store(Buckets.local(tmp_path)).state["collections"] == {"ns.coll": {"mirrored": 1}}
+    Store(Buckets.local(tmp_path)).state_bucket.write("state.json", json.dumps(old).encode())
+    assert Store(Buckets.local(tmp_path)).state == {
+        "collections": {},
+        "conflicts": [],
+        "failures": {},
+        "pending": {},
+        "feed_cursor": "a",
+    }
