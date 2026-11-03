@@ -137,6 +137,9 @@ class Buckets:
 # docs/storage.md, "Caching".
 # The state bucket isn't public; no-store keeps it that way if it ever is.
 INDEX_CACHE = "public, max-age=600"
+
+# Connections kept open to R2, more than tree.FETCHERS, so none is opened only to be thrown away.
+MAX_CONNECTIONS = 32
 IMMUTABLE = "public, max-age=31536000, immutable"
 PRIVATE = "private, no-store"
 # The index bucket's prefix for index files, which get IMMUTABLE.
@@ -259,5 +262,7 @@ class R2Config:
                 retries={"mode": "standard", "max_attempts": 5},
                 connect_timeout=10,
                 read_timeout=60,
+                # One client serves every bucket, and a run fetches tree.FETCHERS objects at once.
+                max_pool_connections=MAX_CONNECTIONS,
             ),
         )

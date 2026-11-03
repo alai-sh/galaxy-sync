@@ -375,6 +375,15 @@ def _fetch(store: Store, tree: Tree, fqcn: str, wanted: list[dict[str, str]]) ->
     return [entry["version"] for entry in wanted if entry not in missing]
 
 
+def _targets(tree: Tree, fqcn: str, versions: list[str], every: int) -> str:
+    """The collection, when it's every version, or else an @FILE of each version, as a collection can have thousands."""
+    if len(versions) == every:
+        return fqcn
+    path = tree.root.parent / "targets.txt"
+    _ = path.write_text("".join(f"{fqcn}:{vers}\n" for vers in versions))
+    return f"@{path}"
+
+
 def generate_plugins(store: Store, tree: Tree, fqcn: str, *, from_plugin_cache: bool = False) -> list[str]:
     """Extract a collection's plugins again from its artifacts, fetched from the dl bucket, and publish the result.
 
@@ -404,8 +413,11 @@ def generate_plugins(store: Store, tree: Tree, fqcn: str, *, from_plugin_cache: 
         else:
             wanted = _all_artifacts(tree, fqcn)
         if fetched := _fetch(store, tree, fqcn, wanted):
-            targets = [f"{fqcn}:{vers}" for vers in fetched]
-            publish(tree.run("generate-plugins", *targets, *(["--from-plugin-cache"] if from_plugin_cache else [])))
+            if from_plugin_cache:
+                # Every out of date version whose artifact is now on disk is extracted again.
+                publish(tree.run("generate-plugins", fqcn, "--from-plugin-cache"))
+            else:
+                publish(tree.run("generate-plugins", _targets(tree, fqcn, fetched, len(wanted))))
     finally:
         tree.drop_artifacts()
     return extracted
@@ -420,7 +432,7 @@ def generate_indexes(store: Store, tree: Tree, fqcn: str) -> list[str]:
         fetched = _fetch(store, tree, fqcn, _all_artifacts(tree, fqcn))
         if not fetched:
             return []
-        out = tree.run("generate-indexes", *(f"{fqcn}:{vers}" for vers in fetched))
+        out = tree.run("generate-indexes", _targets(tree, fqcn, fetched, len(tree.lines(fqcn))))
         tree.publish(out)
     finally:
         tree.drop_artifacts()

@@ -196,3 +196,10 @@ def test_r2_buckets():
     assert (buckets.dl.bucket, buckets.dl.cache_control) == ("alai-dl", "public, max-age=31536000, immutable")
     assert isinstance(buckets.state, R2Backend)
     assert (buckets.state.bucket, buckets.state.cache_control) == ("alai-sync-state", "private, no-store")
+
+
+def test_r2_connections_cover_the_fetchers():
+    from galaxy_sync.tree import FETCHERS
+
+    client = R2Config.from_env(R2_ENVIRON).client()
+    assert client.meta.config.max_pool_connections > FETCHERS

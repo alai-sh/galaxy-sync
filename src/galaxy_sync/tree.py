@@ -46,7 +46,8 @@ PLUGIN_CACHE = "plugin-cache/"
 # community.general's 243 versions, 41 MB of JSON becomes 0.27 MB in 0.04 s.
 ZSTD_LEVEL = 10
 
-# Objects fetched at once when a step needs many collections' files.
+# Objects fetched at once when a step needs many collections' files. Keep it below
+# storage.MAX_CONNECTIONS, the R2 client's connection pool.
 FETCHERS = 16
 
 # The files alai-index rewrites on every change, published when the run says.
