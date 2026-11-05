@@ -22,7 +22,7 @@ def test_resolve_targets(galaxy, client):
         resolve_targets(client, ["Bad.name"])
 
 
-def test_discover_first_run_lists_everything(galaxy, client, store, tree):
+def test_discover_first_run_lists_everything(galaxy, client, store):
     galaxy.add_collection("ns", "a", ["1.0.0"])
     galaxy.add_collection("ns", "b", ["1.0.0"])
     res = discover(client, store)
@@ -79,8 +79,6 @@ def test_discover_feed_stops_at_the_cursor(galaxy, client, store):
     store.state["feed_cursor"] = "2026-03-01T12:30:00Z"
     res = discover(client, store)
     assert (res.collections, res.cursor) == ([("ns", "new")], "2026-03-02T00:00:00Z")
-    store.state["feed_cursor"] = "2026-03-01T00:00:00Z"
-    assert "/feed3" not in galaxy.requests
     assert "/feed3" not in galaxy.requests
 
     # Nothing newer, and the cursor's own version is gone: the cursor stays.
@@ -204,7 +202,7 @@ def test_check_count(galaxy, client, store, tree):
     mirror(galaxy, client, store, tree, "a", "gone")
     assert check_count(client, store) == 0
 
-    # Deleting a version below the highest changes nothing tier 2 can see.
+    # Deleting a version below the highest changes nothing discover can see.
     galaxy.add_collection("ns", "a", ["1.0.0", "2.0.0"])
     galaxy.remove_collection("ns", "gone")
     assert check_count(client, store) == 2
@@ -217,7 +215,7 @@ def test_check_count(galaxy, client, store, tree):
     assert check_count(client, store) is None
     assert {f["kind"] for f in store.state["failures"].values()} == {"deletions_suspected", "galaxy_unavailable"}
 
-    # A sweep request yanks them and the counts match again.
+    # Reconciling yanks them and the counts match again.
     galaxy.add_collection("ns", "a", ["1.0.0", "2.0.0"])
     galaxy.remove_collection("ns", "gone")
     for name in ("a", "gone"):
@@ -250,7 +248,7 @@ def test_sweep(galaxy, client, store, tree):
         reconcile(client, store, tree, ns, name)
     assert sweep(client, store, tree).collections == []
 
-    # A count left from an older state is set again from the index.
+    # A stale count is set again from the index.
     store.collection_state("ns.c")["mirrored"] = 1
     _ = sweep(client, store, tree)
     assert store.collection_state("ns.c")["mirrored"] == 0

@@ -10,34 +10,12 @@ is in [galaxy-api.md](galaxy-api.md), and where the results go is in
 ## reconcile
 
 `reconcile(ns, name)` (`reconcile.py`) brings one collection's index file in
-line with Galaxy. The mirroring itself is done by
-[alai-index](https://github.com/alai-sh/alai-index)'s `galaxy-mirror`, which
-uses only the contract endpoints `ansible-galaxy` itself uses:
-
-1. **Collection:** a 404 yanks every version. Nothing else counts as a
-   deletion, so a flaky or truncated listing can never remove anything.
-2. **Versions Galaxy lists that the index doesn't:** fetch the version
-   detail, download the artifact, and check it against Galaxy's sha256 and
-   its own `MANIFEST.json`. Then store it by sha256, extract its plugins, and
-   add an index line made from the artifact's `MANIFEST.json` and
-   `meta/runtime.yml`. Only `published` comes from Galaxy.
-3. **Versions the index has:** the sha256 of the artifact Galaxy publishes
-   now is compared with the mirrored artifact's, but only when the version
-   is yanked, when `--revalidate` asks, or when Galaxy's `created_at`
-   differs from the line's `published` (see [Artifact checks](#artifact-checks)).
-4. **Versions the index has that Galaxy no longer lists:** yanked, once
-   the version's own detail page returns 404. A delete while a long listing
-   is paged can shift another version past the reader, so the listing alone
-   is never enough. A version whose page is still there is kept, and one
-   Galaxy can't answer for is kept and retried as a failure.
-5. **Deprecation** is copied from the collection onto every line.
-
-Reconcile runs `galaxy-mirror` on a local copy of the files it reads, then
-publishes what it wrote ([storage](storage.md#the-alai-index-tree)). The
-artifacts go first, then the plugin cache, then the index file. So the index
-never points at an artifact that isn't there. `plugins.jsonl` and
-`collections.json` are published at the end of the run and before each save
-of `state.json`.
+line with Galaxy by running alai-index's
+[`galaxy-mirror`](https://alai.sh/alai-index/mirroring/), which uses only
+the contract endpoints `ansible-galaxy` itself uses. That page describes
+what it adds, yanks, checks and never overwrites. galaxy-sync runs it on a
+local copy of the files it reads, then publishes what it wrote
+([storage](storage.md#the-alai-index-tree)).
 
 When alai-index lists a version's plugin extraction as out of date, reconcile
 fetches its artifact from the artifact bucket and extracts its plugins again.
@@ -85,8 +63,9 @@ same work, so it doesn't matter which run picks it up. Each `sync`:
    `plugins.jsonl` and `collections.json`, and writes the failure report.
 
 `state.json` is saved after every 100 units of work (each version mirrored
-counts one, and so does each collection reconciled), at the end of the run,
-and whenever something is queued. It isn't saved after every collection, as
+counts one, and so does each collection reconciled or worked by a job), at
+the end of the run, and after finding changes, taking each request and the
+sweep. It isn't saved after every collection, as
 once the mirror is full it's several MB. If a run stops between saves, the
 collections finished since stay queued and are reconciled again. Their
 index files are published already, but the published `collections.json` may
@@ -96,7 +75,8 @@ in the published `collections.json`.
 
 The initial import is just a sync with no saved state. Its listing queues
 every collection, and runs work through the backlog 45 minutes at a time,
-with new uploads going ahead of it.
+with new uploads going ahead of it. The first sweep is a day after it starts,
+as the listing already covered everything.
 
 ## Finding what changed
 
@@ -118,8 +98,9 @@ possible:
    highest version, or a namespace edit. It compares each collection's
    `updated_at` and `deprecated` flag with what the last reconcile saw.
 4. **Queue** what was found, then save the cursor and repo timestamp.
-5. **Version count**, after reconciling. Galaxy's published count is compared with the total
-   the mirror last saw. Deleting a version below a collection's highest
+5. **Version count**, after reconciling, when the repo changed or a sweep
+   ran. Galaxy's published count is compared with the total the mirror last
+   saw. Deleting a version below a collection's highest
    changes nothing else `sync` can see, but lowers the count; a shortfall is
    recorded as `deletions_suspected`. Versions known to be missing from
    Galaxy's search index (below) aren't in its count, so they aren't
@@ -137,7 +118,8 @@ for one, `changes.sweep` compares everything:
    rows) and compare every published version with the index: versions
    deleted on Galaxy but not yet yanked, versions published but not mirrored,
    and versions whose upload time changed since the last reconcile.
-2. Read the collection listing for deprecation changes.
+2. Read the collection listing, queueing what it finds as on every run.
+   If only the listing fails, the rest still stands.
 3. Queue what differs, then check the version count again after
    reconciling.
 
@@ -170,14 +152,6 @@ The walk takes 30-40 minutes, so new uploads wait for that run to finish.
 "Next `sync`" means queued by it. While a backlog is being worked through,
 new uploads go ahead of it, but a requested collection goes ahead of both.
 
-### Why not Pulp's repository diffs
-
-Galaxy's Pulp API lists exactly what each repository version added and
-removed, which would make deletions immediate. It was dropped: Galaxy keeps
-only the newest one or two repository versions, so a burst of uploads
-between runs loses them; its deprecation diffs can't say which collection
-changed; and it's the API most likely to be locked down.
-
 ## Artifact checks
 
 The mirror never overwrites, so a version's `sha256` never changes. When
@@ -197,8 +171,7 @@ Reconcile gives the latest upload time of each open conflict's artifacts to
 `galaxy-mirror` as `--checked`, so it doesn't check the version again until
 Galaxy's `created_at` changes. The sweep reads them too, so it doesn't queue
 the version again as re-uploaded. A conflict whose artifacts have no upload
-time, as one from before upload times were kept, is checked on every
-reconcile until the next sighting fills it in.
+time is checked on every reconcile until the next sighting fills it in.
 
 ### Conflicts
 
@@ -264,14 +237,16 @@ alai-index command for a collection with nothing out of date.
 ## Failures and conflicts
 
 A failure never stops a run. It's recorded in the ledger in `state.json`,
-retried by every `sync`, and cleared once it succeeds. An `extract_error` is
+retried by every `sync` (in its place if the collection is queued, otherwise
+after the queue if there's time left), and cleared once it succeeds. An `extract_error` is
 the exception, as reconciling the collection again doesn't extract the
 version again, and so is an `artifact_lost`, which needs a person. Neither
 they nor `artifact_missing` are cleared by a reconcile that checks the
 version without a failure: only extracting it again, or putting the
 artifact back, does. A collection is still reconciled for other reasons,
-and each reconcile tries to restore its missing artifacts. Each `sync` starts by
-listing the outstanding failures, so a run's log shows what it will retry.
+and each reconcile tries to restore its missing artifacts. Before working,
+each `sync` lists the outstanding failures, so a run's log shows what it
+will retry.
 Recorded failures exit 0; `--strict` exits 1.
 
 | Kind | Meaning |
@@ -281,7 +256,7 @@ Recorded failures exit 0; `--strict` exits 1.
 | `sha256_mismatch` | Downloaded bytes don't match Galaxy's sha256 |
 | `manifest_mismatch`, `bad_artifact` | The tarball's `MANIFEST.json` is wrong or unreadable |
 | `bad_detail` | Galaxy's page for the version has no download URL or sha256 |
-| `extract_error` | Extraction failed. The version is still mirrored, and the plugin index has none of its plugins until it's extracted again. When the extractor is fixed, a `generate-plugins` request for the collection tries again, and so does a sync once alai-index's extraction number changes |
+| `extract_error` | Extraction failed. The version is still mirrored, and the plugin index has none of its plugins until it's extracted again. When the extractor is fixed, a `generate-plugins` request for the collection tries again, and so does the collection's next reconcile once alai-index lists its extraction as out of date |
 | `alai_index` | alai-index refused a command, which leaves the tree as it was |
 | `artifact_missing` | A version's artifact isn't in the artifact bucket, so it can't be installed or extracted again. The next reconcile downloads it from Galaxy again, writing it only if its sha256 is the index line's |
 | `artifact_lost` | An `artifact_missing` Galaxy can't give back: it deleted the version or serves other bytes. Not retried on its own; a person puts the artifact back |
@@ -444,11 +419,3 @@ Only the code is pinned. The workflow files themselves always come from
 Rolling back past a change to `state.json`'s format can leave state the
 older code doesn't expect. Older code keeps fields it doesn't know without
 using them, but check what changed in between before going back.
-
-## Yanks and takedowns
-
-- **A Galaxy delete is a yank.** The line and artifact stay, with
-  `"yanked": true`. New resolutions skip it; lock files still install it. A
-  version that comes back on Galaxy with the same bytes is un-yanked.
-- **Takedowns** (malware, leaked secrets, legal requests) remove the line
-  and artifact with a recorded reason. They're manual, and not built yet.

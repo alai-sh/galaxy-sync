@@ -113,14 +113,6 @@ def test_r2_read(r2):
         backend.read("../escape")
 
 
-def test_r2_write_sets_headers(r2):
-    backend, stub = r2
-    stub.add_response("put_object", {}, _put("index/ns/coll.jsonl", b"x", "text/plain; charset=utf-8"))
-    stub.add_response("put_object", {}, _put("collections.json", b"{}", "application/json"))
-    backend.write("index/ns/coll.jsonl", b"x")
-    backend.write("collections.json", b"{}")
-
-
 def test_r2_replace_is_conditional(r2):
     backend, stub = r2
     stub.add_response("put_object", {}, _put("state.json", b"1", "application/json", IfNoneMatch="*"))
@@ -164,7 +156,7 @@ def test_r2_exists_delete_and_list(r2):
     ("key", "expected"),
     [
         ("sha256/aa/aa.tar.gz", "application/gzip"),
-        ("extract/ns/coll.json.zst", "application/zstd"),
+        ("plugin-cache/ns/coll.jsonl.zst", "application/zstd"),
         ("plugins.jsonl", "text/plain; charset=utf-8"),
         ("other.bin", "application/octet-stream"),
     ],

@@ -63,14 +63,14 @@ def test_requests(tmp_path):
 
 def test_prune(tmp_path, monkeypatch):
     store = Store(Buckets.local(tmp_path))
-    for key in ("index/aa/old.jsonl", "index/bb/current.jsonl", "index/ns/coll.jsonl"):
+    for key in ("index/aa/old.jsonl", "index/bb/current.jsonl", "index/cc/stray.jsonl"):
         store.index.write(key, b"x\n")
     assert store.prune_due()
 
     start = datetime.datetime(2026, 10, 1, tzinfo=datetime.UTC)
     monkeypatch.setattr(store_mod, "now", lambda: start.isoformat())
     assert store.prune_index_files({"index/bb/current.jsonl"}) == 0
-    assert set(store.state["retired_index_files"]) == {"index/aa/old.jsonl", "index/ns/coll.jsonl"}
+    assert set(store.state["retired_index_files"]) == {"index/aa/old.jsonl", "index/cc/stray.jsonl"}
     assert not store.prune_due()
 
     # Kept until no listing has named them for RETIRED_GRACE.

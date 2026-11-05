@@ -645,13 +645,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return _exit_code(store, args)
     _print_discovery(res, previous, initial)
 
-    if args.dry_run:
-        for ns, name in res.collections:
-            print(f"  {ns}.{name}")
-        print(f"{len(store.state['pending'])} collections already queued, {len(store.requests())} requests waiting")
-        store.save_state()
-        return _exit_code(store, args)
-
     # Queued before the cursor moves, so nothing found is lost if the run stops.
     for c in res.collections:
         reasons = [reason] if (reason := res.listing.get(c)) else []
@@ -751,7 +744,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     _ = p.add_argument("--galaxy-url", default=BASE_URL, help=f"Galaxy server (default: {BASE_URL})")
     _ = p.add_argument("--strict", action="store_true", help="exit 1 if any failure or conflict is outstanding")
-    _ = p.add_argument("--dry-run", action="store_true", help="only report what changed; queue nothing")
     p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser(

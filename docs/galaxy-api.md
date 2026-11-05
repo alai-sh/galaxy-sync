@@ -11,7 +11,10 @@ request, with timeouts and 502s.
 
 The endpoints `ansible-galaxy` itself uses (`lib/ansible/galaxy/api.py`,
 `collection/galaxy_api_proxy.py`). They're the only ones treated as
-guaranteed, and the only ones `reconcile` uses.
+guaranteed, and the only ones `reconcile` uses. galaxy-mirror makes most of
+these requests. galaxy-sync itself reads the collection page, a version's
+page and download to restore a missing artifact, and a conflict's artifact
+download.
 
 | Request | Fields used |
 |---|---|
@@ -33,7 +36,7 @@ Used only to decide which collections to reconcile. Base
 | Endpoint | Used by | Gives |
 |---|---|---|
 | `content/published/collections/` | `sync` | `{"published": ...}`, the creation time of the repo's newest version. Moves on any change. pulp_ansible's own sync uses it to skip unchanged remotes. ~1 s |
-| `search/collection-versions/?repository_name=published&order_by=-pulp_created&limit=100` | `sync` and its sweep | The upload feed: every published version, newest upload first, with `pulp_created`, `dependencies` and `requires_ansible`; `meta.count` is the published version count. Pages are capped at 100 rows, ~3.5-5 s each at any offset |
+| `search/collection-versions/?repository_name=published&order_by=-pulp_created&limit=100` | `sync`, its sweep and the count check (`limit=1`) | The upload feed: every published version, newest upload first, with `pulp_created`, `dependencies` and `requires_ansible`; `meta.count` is the published version count. Pages are capped at 100 rows, ~3.5-5 s each at any offset |
 | `content/published/collections/index/?limit=100` | `sync` and its sweep | The listing: every collection with `updated_at`, `highest_version` and `deprecated`. ~46 pages, not strictly ordered, so read it to the end |
 | `content/published/collections/index/?limit=100&namespace=<ns>` | `sync`, taking a `mirror <ns>` request | One namespace's collections |
 
@@ -63,8 +66,10 @@ Probed anonymously on 2026-10-13:
 The Pulp API (`/api/pulp/api/v3`) answers anonymously with repository-version
 diffs (`repositories/ansible/ansible/<id>/versions/<n>/` and
 `content/ansible/collection_versions/?repository_version_added=<href>`), and
-each content object's `sha256`, `manifest` and `files`. It isn't used: see
-[sync.md](sync.md#why-not-pulps-repository-diffs).
+each content object's `sha256`, `manifest` and `files`. It isn't used, as
+Galaxy keeps only the newest one or two repository versions (below), so a
+burst of uploads between runs loses them; its deprecation diffs don't say
+which collection changed.
 
 ## How Galaxy behaves
 
@@ -103,13 +108,7 @@ each content object's `sha256`, `manifest` and `files`. It isn't used: see
   is `waldur` (~3.2k dev builds in a year).
 - **Reconciling** `community.library_inventory_filtering_v1` and
   `ansible.utils` (73 versions, 14 MB, 2026-10-10) took 150 requests and
-  ~6.5 min, almost all waiting on Galaxy; ~40 s of that was a 0.25 s pause
-  per request the client no longer makes. Re-running with nothing changed
+  ~6 min, almost all waiting on Galaxy. Re-running with nothing changed
   took 2 requests.
-- **A full sweep** (2026-10-15): 533 requests, 1,856 s, 53,261
-  versions. That included a 0.25 s pause per request (~133 s) the client no
-  longer makes, so ~29 min without it.
-- **The plugin index** for the latest version of every collection: 13.6 MB
-  raw, 1.17 MB gzipped (57.5k modules, 17.5k roles, 5.4k playbooks, 1.3k
-  filters, 3.5k routing-only lines). Extraction findings are in
-  [alai-plugin-extractor's AGENTS.md](https://github.com/alai-sh/alai-plugin-extractor/blob/main/AGENTS.md).
+- **A full sweep** (2026-10-15): 533 requests and ~29 min for 53,261
+  versions.

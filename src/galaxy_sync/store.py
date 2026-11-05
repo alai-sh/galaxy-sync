@@ -32,8 +32,8 @@ ACTIONS = ("mirror", "sweep", "generate-plugins", "generate-indexes")
 # (which include the initial import's backlog).
 SOURCES = ("requested", "uploaded", "listed", "swept")
 
-# State is saved after this much work: each version mirrored or rechecked
-# counts one, and so does each collection reconciled.
+# State is saved after this much work: each version mirrored counts one, and
+# so does each collection reconciled or worked by a job.
 SAVE_EVERY = 100
 
 # Failure kinds a reconcile clears only by fixing them: the version extracted
@@ -50,8 +50,8 @@ PERSISTENT = datetime.timedelta(days=1)
 
 # A published index file no collections.json names is kept this long, for
 # clients and caches still holding an older listing, then deleted. Far longer
-# than any copy of collections.json lives (its max-age, 10 minutes);
-# docs/index-spec/README.md asks for at least 7 days.
+# than any copy of collections.json lives (its max-age, 10 minutes), which is
+# all the index format asks for.
 RETIRED_GRACE = datetime.timedelta(days=7)
 
 # How often retired index files are looked for, as listing the index bucket
@@ -335,9 +335,8 @@ class Store:
         for RETIRED_GRACE, returning how many.
 
         A file is retired from when a prune first finds it unnamed: one a
-        collection replaced, one left by a run that stopped between
-        publishing and saving state, and the old files by name in the index
-        bucket. One named again is no longer retired.
+        collection replaced, or one left by a run that stopped between
+        publishing and saving state. One named again is no longer retired.
         """
         live = set(listed)
         retired = self.state.setdefault("retired_index_files", {})

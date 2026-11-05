@@ -9,6 +9,7 @@ import pytest
 from helpers import DETAIL, artifact
 
 from galaxy_sync import reconcile as reconcile_mod
+from galaxy_sync import report
 from galaxy_sync.reconcile import ReconcileFailed, reconcile
 from galaxy_sync.report import Summary
 from galaxy_sync.storage import StorageError
@@ -170,6 +171,7 @@ def test_failure_report_counts(galaxy, client, store, tree, tmp_path):
 )
 def test_a_version_galaxy_serves_badly_is_recorded_not_mirrored(galaxy, client, store, tree, kind, breaks):
     # Each is a kind report.SECTIONS lists, so a kind alai-index renames fails here.
+    assert report._section(kind) != "Other failures"
     galaxy.add_collection("ns", "coll", ["1.0.0"])
     breaks(galaxy)
     assert run(client, store, tree).added == []

@@ -31,7 +31,7 @@ uv run galaxy-sync COMMAND [OPTIONS] ...
 
 | Command | Purpose |
 |---|---|
-| `sync [--budget MINUTES] [--dry-run]` | Find what changed on Galaxy and queue it, take requests and work them first, sweep once a day, then reconcile the rest of the queue until the budget (default 45 minutes) runs out. The rest stays queued for the next run, so the initial import is built up over many runs. `--dry-run` only reports what changed |
+| `sync [--budget MINUTES]` | Find what changed on Galaxy and queue it, take requests and work them first, sweep once a day, then reconcile the rest of the queue until the budget (default 45 minutes) runs out. The rest stays queued for the next run, so the initial import is built up over many runs |
 | `request mirror NS[.NAME]... [--revalidate]` | Ask the next `sync` to reconcile these collections, or every collection in these namespaces, ahead of everything else. `--revalidate` also checks every mirrored version's artifact against the one Galaxy publishes now |
 | `request sweep` | Ask the next `sync` to sweep, comparing every version Galaxy publishes with the index, rather than waiting for the daily one |
 | `request generate-plugins [NS[.NAME]...] [--from-plugin-cache]` | Ask the next `sync` to extract plugins again from the artifacts, for every collection when there are no targets. `--from-plugin-cache` only extracts what's missing or out of date, as after an alai-index upgrade |
@@ -71,12 +71,16 @@ heartbeat ping from every successful run catches the runs stopping.
 ## Documentation
 
 - [How a sync works](docs/sync.md): reconcile, the queue, change detection,
-  failures, notifications, scheduling, yanks and takedowns.
-- [Galaxy API](docs/galaxy-api.md): the endpoints used, how Galaxy behaves,
-  and measurements.
-- [Storage](docs/storage.md): the buckets, their layout, state and
+  failures, notifications and scheduling.
+- [Galaxy API](docs/galaxy-api.md): the endpoints used and how Galaxy
+  behaves.
+- [Storage](docs/storage.md): the buckets, state, publishing, caching and
   credentials.
-- [Index format](docs/index-spec/README.md) and [plugin index](docs/index-spec/plugins.md):
-  what clients read.
+
+What the index holds and how it's built is alai-index's:
+[index format](https://alai.sh/alai-index/index-format/),
+[plugin index](https://alai.sh/alai-index/plugin-index/),
+[the tree](https://alai.sh/alai-index/the-tree/) and
+[`galaxy-mirror`](https://alai.sh/alai-index/mirroring/).
 
 Development notes are in [AGENTS.md](AGENTS.md).

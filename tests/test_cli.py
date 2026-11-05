@@ -88,7 +88,6 @@ def test_sync_writes_the_index(galaxy, run, tmp_path, capsys, ask):
         "since": "1.0.0",
         "short_description": "A thing",
     }
-    assert not (tmp_path / "index-root" / "index" / "ns").exists()
     assert len(list((tmp_path / "dl-root" / "sha256").rglob("*.tar.gz"))) == 1
 
 
@@ -216,7 +215,7 @@ def test_sync_retries_failures_and_reads_nothing_on_failure(galaxy, run, tmp_pat
     assert "failures: 0 outstanding" in out
 
     # If neither the feed nor the listing can be read, nothing is reconciled
-    # and nothing is saved, so the next run looks again.
+    # and the cursor doesn't move, so the next run looks again.
     galaxy.add_collection("ns", "new", ["1.0.0"])
     galaxy.routes[FEED] = UNAVAILABLE
     galaxy.routes[LISTING] = UNAVAILABLE
@@ -242,8 +241,8 @@ def test_usage_errors(run, tmp_path, capsys, monkeypatch):
     assert "the following arguments are required: NS[.NAME]" in capsys.readouterr().err
 
     with pytest.raises(SystemExit):
-        run("request", "rebuild")
-    assert "invalid choice: 'rebuild'" in capsys.readouterr().err
+        run("request", "bogus")
+    assert "invalid choice: 'bogus'" in capsys.readouterr().err
 
     with pytest.raises(SystemExit):
         run("request", "mirror", "Bad.Name")
@@ -261,28 +260,25 @@ def test_usage_errors(run, tmp_path, capsys, monkeypatch):
 
 
 def test_verbose_logging(run):
-    assert run("sync", "--dry-run") == 0
+    assert run("request", "sweep") == 0
     assert logging.getLogger("galaxy_sync").level == logging.INFO
-    assert run("sync", "-v", "--dry-run") == 0
+    assert run("request", "sweep", "-v") == 0
     assert logging.getLogger("galaxy_sync").level == logging.DEBUG
 
 
 def test_sync(galaxy, run, tmp_path, capsys, ask):
     galaxy.add_collection("ns", "coll", ["1.0.0", "2.0.0"])
-    assert run("sync", "--dry-run") == 0
+    assert run("sync") == 0
+    out = capsys.readouterr().out
     assert (
         "galaxy: no feed cursor yet, so this is the initial import\n  current:  2026-04-01 00:00:01Z\n"
-        + "  listing: 1 collections new or changed\n  ns.coll\n"
-        in capsys.readouterr().out
+        + "  listing: 1 collections new or changed\n"
+        in out
     )
-    assert not (tmp_path / "index-root").exists()
-
-    assert run("sync") == 0
-    assert "ns.coll: +2" in capsys.readouterr().out
+    assert "ns.coll: +2" in out
     assert [line["vers"] for line in index_lines(tmp_path, "ns.coll")] == ["1.0.0", "2.0.0"]
     state = json.loads((tmp_path / "state" / "state.json").read_text())
     assert state["feed_cursor"] == galaxy.uploaded[("ns", "coll", "2.0.0")]
-
     assert state["repo_published"] == "2026-04-01T00:00:01.000000Z"
 
     # Nothing changed: one ask, and no count check.
@@ -755,7 +751,6 @@ def test_run_output_explains_itself(galaxy, run, capsys):
     assert "sweep: due now (requested)\nplan (budget 45m):\n  requests: 1 waiting\n" in out
     assert re.search(r"^      sweep\n  sweep: queues everything that differs from Galaxy$", out, re.MULTILINE)
     assert "ns.other: +0 deprecated\n" in out
-    assert "warnings:" not in out
 
     # Nothing to do.
     assert run("sync") == 0

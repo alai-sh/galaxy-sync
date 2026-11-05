@@ -127,7 +127,7 @@ class Buckets:
         )
 
 
-# Cache-Control, as docs/index-spec/README.md asks. Index files and artifacts
+# Cache-Control, as the index format advises. Index files and artifacts
 # are named by their sha256, so they never change and are cached for a year.
 # The rest of the index bucket changes on every publish, and isn't purged: 10
 # minutes matches the sync's schedule, `*/10` in scheduler/wrangler.toml, so a
