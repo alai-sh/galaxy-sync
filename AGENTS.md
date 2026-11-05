@@ -9,8 +9,8 @@ whose [docs](https://alai.sh/alai-index/) specify the format. galaxy-sync
 runs its command line and reads its JSON output, never imports it. Index
 files and versions are read with
 [alai-core](https://github.com/alai-sh/alai-core), never parsed by hand.
-alai-index is pinned as a git source in `pyproject.toml`: bump `rev` and
-run `uv lock` to update it, or `uv pip install -e ../alai-index` to try a
+alai-index is pinned in `pyproject.toml`: bump the version and run
+`uv lock` to update it, or `uv pip install -e ../alai-index` to try a
 local checkout (the next `uv sync` or `uv run` restores the pin).
 
 ## Commands

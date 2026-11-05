@@ -11,7 +11,7 @@ requires-python = ">=3.15"
 authors = [{ name = "Jordan Borean", email = "jborean93@gmail.com" }]
 dependencies = [
     "alai-core",  # the index format, as alai-index reads and writes it; the version alai-index needs
-    "alai-index",
+    "alai-index ~= 0.1.0",
     "boto3>=1.43.114",
 ]
 
@@ -32,11 +32,6 @@ dev = [
 
 [tool.uv.build-backend]
 module-name = "galaxy_sync"
-
-[tool.uv.sources]
-# Not on PyPI yet, so pinned to a commit. Bump `rev` to pick up alai-index
-# changes, and switch to a version pin once it's published.
-alai-index = { git = "https://github.com/alai-sh/alai-index", rev = "4e945fff4e6e447b940b9662764aaf0d71164a40" }
 
 [tool.uv]
 # Rebuild/reinstall the project when source files change (or are deleted),
